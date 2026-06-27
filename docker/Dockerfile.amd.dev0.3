@@ -1,0 +1,75 @@
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.9-rocm700-mi30x
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_NO_CACHE_DIR=1
+ENV LIQUID_ROCM_FORCE_SOCKET_NCCL=1
+
+# System tools needed for source builds.
+RUN if command -v apt-get >/dev/null 2>&1; then \
+      apt-get update && apt-get install -y --no-install-recommends git && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Python packaging base.
+RUN python3 -m pip install --upgrade pip setuptools wheel packaging
+
+# Runtime deps/pins needed by verl+sglang on this cluster.
+RUN python3 -m pip install \
+      accelerate \
+      cachetools \
+      codetiming \
+      datasets \
+      dill \
+      hydra-core \
+      numpy \
+      pandas \
+      peft \
+      "pyarrow>=19.0.0" \
+      pybind11 \
+      pylatexenc \
+      "ray>=2.41.0" \
+      tensorboard \
+      "tensordict!=0.9.0,<=0.10.0,>=0.8.0" \
+      torchdata \
+      transformers \
+      triton==3.5.1 \
+      "protobuf>=6.32.1" \
+      wandb \
+      click==8.1.8
+
+# Install torch_memory_saver from source so the active preload helper is
+# HIP-linked on ROCm instead of using the prebuilt CUDA wheel.
+RUN set -euxo pipefail; \
+    tmp_tms_dir="$(mktemp -d)"; \
+    git clone --depth 1 https://github.com/fzyzcjy/torch_memory_saver.git "${tmp_tms_dir}/torch_memory_saver"; \
+    cd "${tmp_tms_dir}/torch_memory_saver"; \
+    python3 -m pip install . --no-deps --no-build-isolation --force-reinstall; \
+    tms_preload_so="$(python3 -c "import importlib.util; spec = importlib.util.find_spec('torch_memory_saver_hook_mode_preload'); assert spec and spec.origin, 'not found'; print(spec.origin)")"; \
+    ldd "${tms_preload_so}"; \
+    ldd "${tms_preload_so}" | grep -q 'libamdhip64'; \
+    ! ldd "${tms_preload_so}" | grep -q 'libcuda\.so'; \
+    rm -rf "${tmp_tms_dir}"
+
+# Build/install FlashAttention for ROCm.
+RUN set -euxo pipefail; \
+    tmp_fa_dir="$(mktemp -d)"; \
+    git clone --depth 1 --branch v2.8.3 https://github.com/Dao-AILab/flash-attention.git "${tmp_fa_dir}/flash-attention"; \
+    ( \
+      cd "${tmp_fa_dir}/flash-attention"; \
+      FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE MAX_JOBS=8 python3 setup.py install; \
+    ); \
+    rm -rf "${tmp_fa_dir}"
+
+RUN python3 -m pip install transformers==5.2.0 && \
+    python3 -m pip install --no-deps click==8.1.8 && \
+    python3 -m pip install --force-reinstall --no-deps "peft==0.18.1"
+
+# Entrypoint: auto pip install -e sglang + verl from mounted PROJECT_ROOT.
+# Slurm scripts no longer need to call set_verl_sglang.sh manually.
+COPY docker/docker-entrypoint.sh /opt/docker-entrypoint.sh
+RUN chmod +x /opt/docker-entrypoint.sh
+ENTRYPOINT ["/opt/docker-entrypoint.sh"]
+CMD ["bash", "-l"]
