@@ -256,6 +256,14 @@ agent:
   #   max_terms: 6
   agent_loop_config_path: null
 
+  # Optional fully qualified function paths, called once per rollout wave on each AgentLoopWorker,
+  # to warm up / clean up external rollout resources (e.g. pre-spawn sandboxes for the upcoming
+  # batch). Signature: `fn(batch, config)`; may be sync or async. null disables (no behavior change).
+  #   warmup_rollout_resources_path: my_pkg.warmup.warmup_rollout_resources
+  #   cleanup_rollout_resources_path: my_pkg.warmup.cleanup_rollout_resources
+  warmup_rollout_resources_path: null
+  cleanup_rollout_resources_path: null
+
   # custom async server configs
   custom_async_server:
 

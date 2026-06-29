@@ -77,6 +77,13 @@ class AgentLoopConfig(BaseConfig):
     # Fully qualified class name for custom AgentLoopManager (e.g., "mypackage.module.MyManager").
     # Security: This class will be dynamically imported via importlib. Only use trusted class paths.
     agent_loop_manager_class: Optional[str] = None
+    # Optional fully qualified function paths called once per rollout wave on each AgentLoopWorker,
+    # to warm up / clean up external rollout resources (e.g. pre-spawn sandboxes for the upcoming
+    # batch). Signature: ``fn(batch: DataProto, config: DictConfig)``; may be sync or async.
+    # ``None`` disables the hook (default = no behavior change).
+    # Security: dynamically imported via importlib; only use trusted paths.
+    warmup_rollout_resources_path: Optional[str] = None
+    cleanup_rollout_resources_path: Optional[str] = None
 
 
 @dataclass

@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import random
@@ -51,6 +52,7 @@ from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await, get_event_loop
@@ -478,6 +480,46 @@ def register(agent_name: str):
     return decorator
 
 
+async def _maybe_await(value: Any) -> Any:
+    """Await ``value`` if it is awaitable, else return it as-is.
+
+    Lets rollout-resource hooks be written as either plain or ``async`` functions.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _resolve_rollout_resource_hook(path: Optional[str], description: str):
+    """Resolve a fully qualified function path to a callable, or ``None`` when unset.
+
+    Mirrors how custom agent loop / tool paths are loaded; the resolved object must be callable.
+    """
+    if not path:
+        return None
+    fn = load_class_from_fqn(path, description)
+    if not callable(fn):
+        raise TypeError(f"{description} '{path}' did not resolve to a callable, got {type(fn)}")
+    return fn
+
+
+async def _with_rollout_resource_hooks(warmup, cleanup, batch: DataProto, config: DictConfig, impl):
+    """Run ``impl()`` between optional per-wave warmup / cleanup hooks.
+
+    ``warmup(batch, config)`` is awaited before ``impl`` so external rollout resources
+    (e.g. sandboxes) can be pre-spawned for the upcoming batch; ``cleanup(batch, config)``
+    runs in ``finally`` so the wave's resources are released even if rollout raises. Both
+    hooks are optional (``None`` skips) and may be sync or async.
+    """
+    if warmup is not None:
+        await _maybe_await(warmup(batch, config))
+    try:
+        return await impl()
+    finally:
+        if cleanup is not None:
+            await _maybe_await(cleanup(batch, config))
+
+
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop.
 
@@ -535,6 +577,16 @@ class AgentLoopWorker:
             agent_loop_configs = OmegaConf.load(resolved_path)
             for agent_loop_config in agent_loop_configs:
                 _agent_loop_registry[agent_loop_config.name] = agent_loop_config
+
+        # Optional per-wave rollout resource warm-up / cleanup hooks (e.g. pre-spawn sandboxes).
+        # Resolved once per worker; called in generate_sequences (see _with_rollout_resource_hooks).
+        self._warmup_rollout_resources = _resolve_rollout_resource_hook(
+            self.rollout_config.agent.warmup_rollout_resources_path, "warmup_rollout_resources_path"
+        )
+        self._cleanup_rollout_resources = _resolve_rollout_resource_hook(
+            self.rollout_config.agent.cleanup_rollout_resources_path, "cleanup_rollout_resources_path"
+        )
+
         if self.model_config.get("custom_chat_template", None) is not None:
             if self.model_config.processor is not None:
                 self.model_config.processor.chat_template = self.model_config.custom_chat_template
@@ -559,6 +611,21 @@ class AgentLoopWorker:
         return mm_processor_kwargs
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
+        """Generate sequences for a rollout wave, wrapped by optional resource warmup/cleanup hooks.
+
+        ``warmup_rollout_resources_path`` / ``cleanup_rollout_resources_path`` (if configured) run
+        once per wave around the whole batch so external resources (e.g. sandboxes) can be
+        pre-spawned for ``len(batch)`` rollouts and released afterwards. Default = no-op.
+        """
+        return await _with_rollout_resource_hooks(
+            self._warmup_rollout_resources,
+            self._cleanup_rollout_resources,
+            batch,
+            self.config,
+            lambda: self._generate_sequences_impl(batch),
+        )
+
+    async def _generate_sequences_impl(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
 
         Args:
