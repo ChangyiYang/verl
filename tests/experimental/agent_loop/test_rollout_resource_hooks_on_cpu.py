@@ -106,7 +106,9 @@ def test_cleanup_runs_even_on_impl_error():
     assert cleaned == [True]
 
 
-def test_warmup_failure_skips_impl_and_cleanup():
+def test_warmup_failure_skips_impl_but_runs_cleanup():
+    """A partial/failed warmup must still trigger cleanup so partially-allocated resources
+    (e.g. some spawned sandboxes) are released rather than leaked; impl is skipped."""
     ran = {"impl": False, "cleanup": False}
 
     def warmup(batch, config):
@@ -120,8 +122,8 @@ def test_warmup_failure_skips_impl_and_cleanup():
 
     with pytest.raises(RuntimeError, match="warmup failed"):
         asyncio.run(_with_rollout_resource_hooks(warmup, cleanup, "B", "C", impl))
-    # impl never ran (warmup raised before try); cleanup not reached either.
-    assert ran == {"impl": False, "cleanup": False}
+    # impl never ran (warmup raised first); cleanup still runs to release partial resources.
+    assert ran == {"impl": False, "cleanup": True}
 
 
 if __name__ == "__main__":

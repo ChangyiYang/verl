@@ -510,10 +510,15 @@ async def _with_rollout_resource_hooks(warmup, cleanup, batch: DataProto, config
     (e.g. sandboxes) can be pre-spawned for the upcoming batch; ``cleanup(batch, config)``
     runs in ``finally`` so the wave's resources are released even if rollout raises. Both
     hooks are optional (``None`` skips) and may be sync or async.
+
+    ``warmup`` runs inside the ``try`` so a partial warmup (e.g. some sandboxes spawned
+    before it raised) is still followed by ``cleanup`` rather than leaking. Consequently
+    ``cleanup`` must tolerate being called after a failed or partial warmup (i.e. when only
+    some, or none, of the resources were set up).
     """
-    if warmup is not None:
-        await _maybe_await(warmup(batch, config))
     try:
+        if warmup is not None:
+            await _maybe_await(warmup(batch, config))
         return await impl()
     finally:
         if cleanup is not None:
