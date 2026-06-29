@@ -5,6 +5,7 @@ SHELL ["/bin/bash", "-lc"]
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_NO_CACHE_DIR=1
+ENV LIQUID_ROCM_FORCE_SOCKET_NCCL=1
 
 # System tools needed for source builds.
 RUN if command -v apt-get >/dev/null 2>&1; then \

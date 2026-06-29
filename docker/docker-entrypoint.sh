@@ -9,9 +9,9 @@ set -euo pipefail
 # provider first. On the Liquid TensorWave AMD nodes, libibverbs reports a
 # bnxt_re kernel ABI mismatch, and RCCL aborts with "network IB not found"
 # even for single-node 8-GPU collectives. Prefer socket bootstrap/net by
-# default; set LIQUID_ROCM_FORCE_SOCKET_NCCL=0 to opt out for clusters with
-# working RDMA.
-if [[ "${LIQUID_ROCM_FORCE_SOCKET_NCCL:-1}" == "1" ]]; then
+# default in the socket Dockerfile variant; set LIQUID_ROCM_FORCE_SOCKET_NCCL=1
+# to opt in from other images, or 0 to keep the image defaults.
+if [[ "${LIQUID_ROCM_FORCE_SOCKET_NCCL:-0}" == "1" ]]; then
   export NCCL_NET="${NCCL_NET:-Socket}"
   export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
   export RCCL_IB_DISABLE="${RCCL_IB_DISABLE:-1}"
