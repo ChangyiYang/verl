@@ -95,6 +95,13 @@ class AgentLoopConfig(BaseConfig):
     # Fully qualified class name for custom AgentLoopManager (e.g., "mypackage.module.MyManager").
     # Security: This class will be dynamically imported via importlib. Only use trusted class paths.
     agent_loop_manager_class: Optional[str] = None
+    # Optional fully qualified class name of a verl.experimental.sandbox_warmup.SandboxWarmupPlugin
+    # subclass. When set, each rollout's env (e.g. a Modal sandbox) is pre-warmed per rollout and
+    # matched back via a minted `_warm_key`. None disables warm-up (default = no behavior change).
+    # Security: dynamically imported via importlib; only use trusted class paths.
+    warmup_plugin_path: Optional[str] = None
+    # Max concurrent in-flight warm-ups per rollout worker.
+    warmup_max_concurrency: int = 8
 
 
 @dataclass

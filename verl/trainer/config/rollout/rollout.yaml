@@ -248,6 +248,16 @@ agent:
   #   max_terms: 6
   agent_loop_config_path: null
 
+  # Optional per-rollout sandbox warm-up. Fully qualified class name of a
+  # verl.experimental.sandbox_warmup.SandboxWarmupPlugin subclass; when set, each rollout's env
+  # (e.g. a Modal sandbox) is pre-warmed and matched back to its rollout via a minted `_warm_key`.
+  # null disables warm-up (no behavior change). See verl/experimental/sandbox_warmup/README.md.
+  #   warmup_plugin_path: my_pkg.my_modal_plugin.MyModalWarmupPlugin
+  warmup_plugin_path: null
+
+  # Max concurrent in-flight warm-ups per rollout worker.
+  warmup_max_concurrency: 8
+
   # custom async server configs
   custom_async_server:
 

@@ -52,6 +52,7 @@ from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await, get_event_loop
@@ -447,6 +448,23 @@ class AgentLoopWorker:
             agent_loop_configs = OmegaConf.load(resolved_path)
             for agent_loop_config in agent_loop_configs:
                 _agent_loop_registry[agent_loop_config.name] = agent_loop_config
+
+        # Optional per-rollout sandbox warm-up: load the user plugin and create a
+        # per-worker registry (see verl/experimental/sandbox_warmup). None = disabled.
+        self._warmup_registry = None
+        warmup_plugin_path = self.rollout_config.agent.get("warmup_plugin_path", None)
+        if warmup_plugin_path:
+            from verl.experimental.sandbox_warmup import WarmupRegistry, set_current_registry
+
+            plugin_cls = load_class_from_fqn(warmup_plugin_path, "warmup_plugin_path")
+            self._warmup_registry = WarmupRegistry(
+                plugin_cls(),
+                self.config,
+                max_concurrency=self.rollout_config.agent.get("warmup_max_concurrency", 8),
+            )
+            set_current_registry(self._warmup_registry)
+            logger.info("sandbox warm-up enabled via plugin: %s", warmup_plugin_path)
+
         if self.model_config.get("custom_chat_template", None) is not None:
             if self.model_config.processor is not None:
                 self.model_config.processor.chat_template = self.model_config.custom_chat_template
@@ -542,27 +560,47 @@ class AgentLoopWorker:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
+        # Per-rollout sandbox warm-up: stamp a unique _warm_key on each row and kick off a
+        # background warm. The row's _warm_key flows into the agent loop's run kwargs (it is a
+        # non-tensor column), and the matching rollout pops its env via acquire_warm_env(_warm_key).
+        if self._warmup_registry is not None:
+            from verl.experimental.sandbox_warmup import WARM_KEY
+
+            warm_keys = np.array([uuid4().hex for _ in range(len(batch))], dtype=object)
+            batch.non_tensor_batch[WARM_KEY] = warm_keys
+            for i in range(len(batch)):
+                self._warmup_registry.start_warm(
+                    warm_keys[i], {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                )
+
         # NOTE: __do_sample__ is an internal per-sample override used by REMAX combined rollout.
         # Do not forward it to concrete agent loops, which may reject unknown kwargs.
         per_sample_do_sample = batch.non_tensor_batch.get("__do_sample__")
-        tasks = []
-        for i in range(len(batch)):
-            trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
-            sample_sampling_params = dict(sampling_params)
-            if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
-                apply_greedy_sampling_params(sample_sampling_params)
-            tasks.append(
-                asyncio.create_task(
-                    self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+        try:
+            tasks = []
+            for i in range(len(batch)):
+                trace_this_sample = i in traced_indices
+                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
+                sample_sampling_params = dict(sampling_params)
+                if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
+                    apply_greedy_sampling_params(sample_sampling_params)
+                tasks.append(
+                    asyncio.create_task(
+                        self._run_agent_loop(
+                            sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs
+                        )
+                    )
                 )
-            )
-        outputs = await asyncio.gather(*tasks)
+            outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
-        )
-        return output
+            output = self._postprocess(
+                outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            )
+            return output
+        finally:
+            # Backstop: release any warmed-but-unconsumed env (the normal path releases per rollout).
+            if self._warmup_registry is not None:
+                await self._warmup_registry.drain()
 
     async def _run_agent_loop(
         self,
