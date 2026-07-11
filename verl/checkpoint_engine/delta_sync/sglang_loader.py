@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from contextlib import contextmanager
 
 import torch
@@ -98,17 +99,59 @@ def apply_delta(model, named_tensors) -> None:
             nbytes = t.numel() * t.element_size()
             if chunk and chunk_bytes + nbytes > CHUNK_BYTES:
                 _t0 = _now()
-                model.load_weights(chunk)
+                _load_weights_fast(model, chunk)
                 _apply += _now() - _t0
                 chunk, chunk_bytes = [], 0
             chunk.append((p["name"], t))
             chunk_bytes += nbytes
         if chunk:
             _t0 = _now()
-            model.load_weights(chunk)
+            _load_weights_fast(model, chunk)
             _apply += _now() - _t0
     if _prof:
         print(f"[loader-profile] decode={_decode:.3f}s apply(masked load_weights)={_apply:.3f}s", flush=True)
+
+
+_EXPERT_KEY_RE = re.compile(r"experts\.\d+\.\w+\.")
+
+
+def _load_weights_fast(model, chunk) -> None:
+    """``model.load_weights`` with an O(1) fast path for fused-MoE expert weights.
+
+    SGLang's generic ``load_weights`` linearly scans the ``num_experts x 3`` expert
+    mapping for every incoming tensor and rebuilds ``params_dict`` on every call --
+    quadratic on MoE checkpoints (~60 s per full pass on a 30B-A3B). Expert names are
+    fully determined (``experts.{E}.{proj}.``), so resolve them with one dict lookup
+    and call the param's own ``weight_loader`` (keeps TP slicing and, under
+    ``_masked_copy``, the sparse masked-apply semantics). Non-expert tensors and
+    models without an ``expert_params_mapping`` fall back to the stock path.
+    """
+    mapping = getattr(model, "expert_params_mapping", None)
+    if not mapping:
+        model.load_weights(chunk)
+        return
+    cache = getattr(model, "_verl_delta_expert_cache", None)
+    if cache is None:
+        by_key = {w: (p, e, s) for p, w, e, s in mapping}
+        cache = (by_key, dict(model.named_parameters()))
+        model._verl_delta_expert_cache = cache
+    by_key, params_dict = cache
+
+    slow_chunk = []
+    for name, tensor in chunk:
+        m = _EXPERT_KEY_RE.search(name)
+        hit = by_key.get(m.group(0)) if m else None
+        if hit is None:
+            slow_chunk.append((name, tensor))
+            continue
+        param_name, expert_id, shard_id = hit
+        resolved = name.replace(m.group(0), param_name)
+        param = params_dict.get(resolved)
+        if param is None:  # expert not resident on this rank (expert parallelism)
+            continue
+        param.weight_loader(param, tensor, resolved, shard_id=shard_id, expert_id=expert_id)
+    if slow_chunk:
+        model.load_weights(slow_chunk)
 
 
 def _apply_dense(model, params: list[dict], values: torch.Tensor) -> None:
@@ -120,12 +163,12 @@ def _apply_dense(model, params: list[dict], values: torch.Tensor) -> None:
         t = values[p["val_start"] : p["val_end"]].to(dtype).view(p["shape"])
         nbytes = t.numel() * t.element_size()
         if chunk and chunk_bytes + nbytes > CHUNK_BYTES:
-            model.load_weights(chunk)
+            _load_weights_fast(model, chunk)
             chunk, chunk_bytes = [], 0
         chunk.append((p["name"], t))
         chunk_bytes += nbytes
     if chunk:
-        model.load_weights(chunk)
+        _load_weights_fast(model, chunk)
 
 
 def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p: dict) -> torch.Tensor:
