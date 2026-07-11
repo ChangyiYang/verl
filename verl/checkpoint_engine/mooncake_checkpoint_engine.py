@@ -53,6 +53,7 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         device_name: str = "",
         is_master: bool = False,
         rebuild_group: bool = False,
+        protocol: str = "",
     ):
         self.bucket_size = bucket_size
         self.device = device
@@ -70,7 +71,7 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         ret = self.engine.initialize(
             hostname,
             "P2PHANDSHAKE",
-            "ascend_direct" if self.device == "npu" else "rdma",
+            protocol or ("ascend_direct" if self.device == "npu" else "rdma"),
             device_name,
         )
         assert ret == 0, f"TransferEngine initialize failed ret={ret}"
