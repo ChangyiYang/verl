@@ -137,13 +137,19 @@ class _DirectWriteMixin:
 
             if meta.get("direct_init"):
                 if is_leader and not self._direct_inited_engine:
-                    mesh = server_adapter.device_mesh["infer_tp"]
-                    tp_size = int(mesh.mesh.size()[0])
-                    replica_rank = int(server_adapter.replica_rank)
+                    # The leader CE worker is TP0 of its replica and CE worker
+                    # verl-ranks (1..N) map 1:1 onto rollout GPUs in order, so
+                    # this worker's own rank IS the replica's rank offset in
+                    # the direct group. (replica_rank is global across hybrid +
+                    # standalone replicas and must not be used here.)
+                    logger.warning(
+                        "direct init: leader verl-rank=%s -> rank_offset=%s world=%s",
+                        self.rank, self.rank, meta["world_size"],
+                    )
                     await engine._make_async_request("init_weights_update_group", {
                         "master_address": meta["master_address"],
                         "master_port": meta["master_port"],
-                        "rank_offset": 1 + replica_rank * tp_size,
+                        "rank_offset": self.rank,
                         "world_size": meta["world_size"],
                         "group_name": DIRECT_GROUP_NAME,
                         "backend": "nccl",
