@@ -37,9 +37,18 @@ from verl.checkpoint_engine.delta_checkpoint_engine import (
     DeltaCheckpointEngine,
     DeltaShardedCheckpointEngine,
 )
+from dataclasses import dataclass
+
+from verl.checkpoint_engine.nccl_checkpoint_engine import MasterMetadata
 from verl.utils.net_utils import get_free_port
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DirectMasterMetadata(MasterMetadata):
+    direct_ip: str = ""
+    direct_port: int = 0
 
 DIRECT_GROUP_NAME = "verl_direct_weights"
 
@@ -51,32 +60,45 @@ class _DirectWriteMixin:
     direct_write = True
 
     def _direct_state_init(self):
-        self._direct_group = None          # rank0's handle
-        self._direct_port = None
-        self._direct_inited_engine = False # CE-worker side: HTTP init done
+        self._direct_group = None            # rank0's handle
+        self._direct_rendezvous = None       # (ip, port) shared via prepare metadata
+        self._direct_inited_engine = False   # CE-worker side: HTTP init done
+
+    def prepare(self):
+        meta = super().prepare()
+        if self.is_master:
+            # Allocate the direct-group rendezvous up front and ship it through
+            # the prepare/topology metadata (NOT a zmq message: the first PUB is
+            # subject to the slow-joiner race and can be silently dropped).
+            port, _ = get_free_port(self.ip)
+            self._direct_rendezvous = (self.ip, port)
+            meta = DirectMasterMetadata(
+                zmq_ip=meta.zmq_ip, zmq_port=meta.zmq_port,
+                direct_ip=self.ip, direct_port=port,
+            )
+        return meta
+
+    def init_process_group(self, **kwargs):
+        super().init_process_group(**kwargs)
+        mm = kwargs.get("master_metadata")
+        if mm is not None and getattr(mm, "direct_port", 0):
+            self._direct_rendezvous = (mm.direct_ip, mm.direct_port)
 
     # ---------------- sender (actor rank 0) ----------------
 
     def _direct_handshake_and_group(self):
-        """First sync only: publish the torch-group rendezvous via zmq, then
-        block joining it (SGLang TP workers join via the HTTP-triggered init)."""
+        """First sync only: join the persistent direct group (the SGLang TP
+        workers join via the HTTP init the CE leaders fire at receive start)."""
         if self._direct_group is not None:
             return
         from sglang.srt.utils.common import init_custom_process_group
 
-        self._direct_port, _ = get_free_port(self.ip)
+        ip, port = self._direct_rendezvous
         world = self.world_size  # 1 + number of rollout CE workers == 1 + total TP workers
-        self.socket.send_string(self.topic, flags=zmq.SNDMORE)
-        self.socket.send_pyobj({
-            "direct_init": True,
-            "master_address": self.ip,
-            "master_port": self._direct_port,
-            "world_size": world,
-        })
         t0 = time.perf_counter()
         self._direct_group = init_custom_process_group(
             backend="nccl",
-            init_method=f"tcp://{self.ip}:{self._direct_port}",
+            init_method=f"tcp://{ip}:{port}",
             world_size=world,
             rank=0,
             group_name=DIRECT_GROUP_NAME,
@@ -131,31 +153,26 @@ class _DirectWriteMixin:
         engine = getattr(server_adapter, "_engine", None)
         is_leader = server_adapter._is_server_tp_leader()
 
+        if is_leader and not self._direct_inited_engine:
+            # The leader CE worker is TP0 of its replica and CE worker verl-ranks
+            # (1..N) map 1:1 onto rollout GPUs in order, so this worker's own rank
+            # IS the replica's rank offset in the direct group. (replica_rank is
+            # global across hybrid + standalone replicas and must not be used.)
+            ip, port = self._direct_rendezvous
+            logger.info("direct init: leader verl-rank=%s world=%s", self.rank, self.world_size)
+            await engine._make_async_request("init_weights_update_group", {
+                "master_address": ip,
+                "master_port": port,
+                "rank_offset": self.rank,
+                "world_size": self.world_size,
+                "group_name": DIRECT_GROUP_NAME,
+                "backend": "nccl",
+            })
+            self._direct_inited_engine = True
+
         while True:
             self.socket.recv_string()
             meta = self.socket.recv_pyobj()
-
-            if meta.get("direct_init"):
-                if is_leader and not self._direct_inited_engine:
-                    # The leader CE worker is TP0 of its replica and CE worker
-                    # verl-ranks (1..N) map 1:1 onto rollout GPUs in order, so
-                    # this worker's own rank IS the replica's rank offset in
-                    # the direct group. (replica_rank is global across hybrid +
-                    # standalone replicas and must not be used here.)
-                    logger.warning(
-                        "direct init: leader verl-rank=%s -> rank_offset=%s world=%s",
-                        self.rank, self.rank, meta["world_size"],
-                    )
-                    await engine._make_async_request("init_weights_update_group", {
-                        "master_address": meta["master_address"],
-                        "master_port": meta["master_port"],
-                        "rank_offset": self.rank,
-                        "world_size": meta["world_size"],
-                        "group_name": DIRECT_GROUP_NAME,
-                        "backend": "nccl",
-                    })
-                    self._direct_inited_engine = True
-                continue
 
             if meta.get("mode") == "terminal":
                 break
