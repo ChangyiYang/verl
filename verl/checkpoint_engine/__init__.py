@@ -72,3 +72,16 @@ try:
 except ImportError:
     DeltaCheckpointEngine = None
     DeltaShardedCheckpointEngine = None
+
+try:
+    from .direct_checkpoint_engine import (
+        DeltaDirectEngine,
+        DeltaShardedDirectEngine,
+        NCCLDirectEngine,
+    )
+
+    __all__ += ["DeltaDirectEngine", "DeltaShardedDirectEngine", "NCCLDirectEngine"]
+except ImportError:
+    DeltaDirectEngine = None
+    DeltaShardedDirectEngine = None
+    NCCLDirectEngine = None

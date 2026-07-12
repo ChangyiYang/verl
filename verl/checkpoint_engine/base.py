@@ -523,8 +523,12 @@ class CheckpointEngineManager:
         actor_wg = self.actor_wg
         _mark("build_wg")
 
-        # 3. release kv_cache before weight sync (weights stay in place)
-        await self.release_kv_cache_replicas()
+        # 3. release kv_cache before weight sync (weights stay in place).
+        # Direct-write backends broadcast straight into the engine's weight
+        # tensors (no CE-worker buckets), so no KV headroom is needed.
+        _direct = self.backend.endswith("_direct")
+        if not _direct:
+            await self.release_kv_cache_replicas()
         _mark("release_kv")
 
         # 4. build process group
@@ -545,15 +549,17 @@ class CheckpointEngineManager:
                 sync_metrics.update(result)
 
         # 6. finalize all workers
-        ray.get(
-            actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
-            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
-        )
+        if not _direct:
+            ray.get(
+                actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
+                + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+            )
 
         _mark("finalize")
 
         # 7. restore kv_cache after weight sync
-        await self.resume_kv_cache_replicas()
+        if not _direct:
+            await self.resume_kv_cache_replicas()
         _mark("resume_kv")
 
         # 8. resume all unfinished requests for partial rollout
