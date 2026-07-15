@@ -838,6 +838,106 @@ class MegatronEngine(BaseEngine):
 
         return per_tensor_param, peft_config
 
+    def get_per_tensor_param_shard(self, **kwargs):
+        """Sharded export for the ``delta_sharded`` checkpoint engine on Megatron-core.
+
+        Yields ``(mcore_name, local_shard_flat_bf16, ShardSpec)`` for every local mcore
+        parameter, in an order identical on all ranks. The spec describes the mcore
+        tensor's TP distribution declaratively (a 1-D DeviceMesh over the TP group +
+        ``Shard(dim)``) and carries ``to_hf`` -- a closure over the NATIVE mcore->HF
+        conversion (``default_tp_concat_fn`` + ``McoreToHFWeightConverter.convert_param``).
+        Both are pure permutations, so NaN-sentinel shards pass through with sentinel
+        positions preserved: the engine diffs local shards and still emits deltas in HF
+        coordinates without any per-layout index math.
+
+        Scope (asserted): dense models, PP=1, VPP=1, no EP, no LoRA.
+        """
+        from megatron.core import parallel_state as mpu
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor import Shard
+
+        import verl.utils.megatron.tensor_parallel as tp_utils
+        from verl.models.mcore.registry import get_mcore_weight_converter
+        from verl.utils.megatron_utils import default_tp_concat_fn
+        from verl.utils.model import normalize_model_name
+        from verl.workers.engine.spec import ShardSpec
+
+        assert mpu.get_pipeline_model_parallel_world_size() == 1, (
+            "megatron delta_sharded does not support pipeline parallelism yet"
+        )
+        assert mpu.get_expert_model_parallel_world_size() <= 1, "megatron delta_sharded does not support EP yet"
+        assert len(self.module) == 1, "megatron delta_sharded does not support VPP>1 yet"
+        assert self.peft_cls is None, "megatron delta_sharded does not support LoRA"
+
+        load_megatron_model_to_gpu(self.module, load_grad=False)
+        weight_converter = self.weight_converter or get_mcore_weight_converter(
+            self.model_config.hf_config, self.param_dtype
+        )
+        hf_config = self.model_config.hf_config
+        layer_name_mapping = self.layer_name_mapping
+        tf_config = self.tf_config
+        tp_group = mpu.get_tensor_model_parallel_group()
+        tp_world = torch.distributed.get_world_size(group=tp_group)
+        from verl.utils.device import get_device_name
+
+        tp_mesh = DeviceMesh.from_group(tp_group, get_device_name()) if tp_world > 1 else None
+
+        def _make_to_hf(cur_name, param, local_shape):
+            is_tp = tp_utils.is_tensor_parallel_param(param)
+
+            def _to_hf(shard_list, _name=cur_name, _shape=tuple(local_shape)):
+                shard_list = [sh.view(_shape) for sh in shard_list]
+                merged = (
+                    default_tp_concat_fn(
+                        layer_name_mapping,
+                        _name,
+                        param,
+                        shard_list,
+                        hf_config,
+                        hf_config,
+                        convert_qkv_gate_up_by_simple_split=True,
+                    )
+                    if is_tp and len(shard_list) > 1
+                    else shard_list[0]
+                )
+                if not isinstance(merged, list):
+                    merged = [merged]
+                names, tensors = weight_converter.convert_param(_name, merged)
+                return list(zip(names, tensors, strict=True))
+
+            return _to_hf
+
+        def _gen():
+            model = unwrap_model(self.module[0])
+            for name, param in model.named_parameters():
+                cur_name = normalize_model_name(name, 0, 0, tf_config)
+                while cur_name.startswith("module."):
+                    cur_name = cur_name[len("module.") :]
+                if getattr(hf_config, "tie_word_embeddings", False) and "output_layers" in cur_name:
+                    continue
+                is_tp = tp_utils.is_tensor_parallel_param(param)
+                local = param.data
+                if local.is_floating_point() and local.dtype != torch.bfloat16:
+                    local = local.to(torch.bfloat16)
+                if is_tp and tp_mesh is not None:
+                    dim = tp_utils.get_tensor_parallel_partition_dim(param)
+                    full = list(local.shape)
+                    full[dim] *= tp_world
+                    spec = ShardSpec(
+                        full_shape=tuple(full),
+                        mesh=tp_mesh,
+                        placements=(Shard(dim),),
+                        to_hf=_make_to_hf(cur_name, param, local.shape),
+                    )
+                else:
+                    spec = ShardSpec(
+                        full_shape=tuple(local.shape),
+                        to_hf=_make_to_hf(cur_name, param, local.shape),
+                    )
+                yield cur_name, local.reshape(-1), spec
+
+        return _gen(), None
+
     def disable_adapter(self) -> ContextManager:
         return self.peft_cls.disable_adapter(self.module)
 

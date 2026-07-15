@@ -95,32 +95,26 @@ Other shard dimensions than ``Shard(0)`` are not supported and raise.
 > **Config note**: the training engine reads the **top-level** ``actor_rollout_ref.actor.strategy``;
 > setting only ``actor.fsdp_config.strategy`` does *not* select FSDP2.
 
-## Measured results
+### Megatron-core trainers
 
-All numbers: H100 nodes, GSM8K GRPO, verl V1 ``separate_async`` (disaggregated trainer/rollout),
-FSDP2 + param/optimizer offload, SGLang rollout, per-step steady-state weight sync.
+The same ``delta_sharded`` backend serves Megatron trainers -- no separate backend
+name. The Megatron engine's ``get_per_tensor_param_shard`` yields specs whose
+``mesh``/``placements`` describe the mcore tensor's TP distribution and whose
+``to_hf`` carries the native mcore→HF conversion (``default_tp_concat_fn`` +
+``McoreToHFWeightConverter.convert_param``) as a pure-permutation closure. The
+engine gathers the changed elements per TP rank, rebuilds NaN-sentinel shards,
+runs the converter, and reads the non-NaN entries as the HF-coordinate delta --
+bit-identical to full-convert-then-diff, wire and receiver unchanged.
 
-| model (placement) | ``delta_sharded`` | ``nccl`` (full broadcast) | speedup | saved / step |
-|---|---|---|---|---|
-| Qwen2.5-7B (1+1 nodes, sustained over 200 steps) | **3.8 s** | 9.1 s | 2.4x | 5.2 s |
-| Qwen2.5-32B (2+2 nodes) | **12.5 s** | 23.2 s | 1.9x | 10.7 s |
-| Qwen2.5-72B (4+4 nodes, TP8) | **12.0 s** | 36.9 s | **3.1x** | **24.9 s** |
+The first sync gathers the dense shards and converts them directly (values-only
+wire, no positions overhead).
 
-The delta sync time stays essentially flat from 32B to 72B -- the sharded sparse gather amortizes
-over the larger trainer world -- while the full broadcast grows linearly with parameter bytes, so
-the advantage widens with scale. The per-step changed ratio is stable at ~1-3% of parameter bytes
-across sizes and stays there over long runs.
-
-Correctness evidence (details in the PR):
-
-- **200-step GRPO equivalence at 7B** (delta vs nccl, 400 syncs): reward trajectories track
-  phase-for-phase, final rewards within sampling noise, zero receiver checksum failures.
-- **Bit-exact round-trip**: perturb -> apply as delta -> revert -> apply as delta reproduces
-  greedy generations byte-identically on every prompt.
+**Scope**: dense models, bf16, TP×DP placements (PP=1, VPP=1, no EP, no LoRA --
+asserted at export).
 
 ## Usage
 
-A runnable example is ``verl/experimental/one_step_off_policy/shell/grpo_0.6b_gsm8k_fsdp2_sglang_delta_sharded_2_6.sh`` —
+A runnable example is ``verl/experimental/one_step_off_policy/shell/grpo_0.6b_gsm8k_fsdp2_sglang_delta_2_6.sh`` —
 the SGLang 2+6 disaggregated GRPO recipe with ``backend=delta_sharded``.
 
 Current scope: disaggregated (``hybrid_engine=False``) + SGLang rollout in BF16, FSDP1/FSDP2 training engines.

@@ -179,6 +179,11 @@ def derive_placement(spec: ShardSpec):
 
     if len(shard_dims) == 1:
         group = spec.mesh.get_group(mesh_dim=shard_dims[0])
+        if spec.to_hf is not None:
+            # converter shard-list profile (e.g. Megatron TP): the gather keeps
+            # per-rank boundaries and to_hf receives the shard list, so no flat
+            # offset is needed and any shard dim is fine.
+            return 0, contributes, group
         tdim = placements[shard_dims[0]].dim
         if tdim == 0:
             # flat-contiguous: rows [o0, o0+l0) of the flat tensor

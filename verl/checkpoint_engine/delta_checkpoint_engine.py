@@ -380,7 +380,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                         _bucket_dense(hf_name, hf_tensor)
             else:
                 # converter profile (e.g. Megatron): rebuild dense shards via to_hf
-                shards = gather_shards_to_rank0(shard, group=pg)
+                if pg is None:
+                    shards = [local] if (is_r0 and contributes) else None
+                else:
+                    shards = gather_shards_to_rank0(shard, group=pg)
                 if is_r0 and shards is not None:
                     for hf_name, hf_tensor in spec.to_hf(shards):
                         _bucket_dense(hf_name, hf_tensor)
@@ -514,29 +517,35 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             assert all(isinstance(g[7], BlockPlacement) == is_block for g in nan_group), (
                 "a converter gather group must be uniformly block- or flat-placed"
             )
-            idx_concat = torch.cat([g[5] for g in nan_group])
-            val_concat = torch.cat([g[6] for g in nan_group])
-            counts = torch.tensor([int(g[5].numel()) for g in nan_group], dtype=torch.int64, device=dev)
-            gathered = gather_v_batched_to_rank0(idx_concat, val_concat, counts, group=pg, grouped=True)
-
             blocks = None
-            if is_block:
-                # every rank ships its per-param (local_shape, global_offset); rank 0
-                # needs them to place each rank's NaN-rebuilt block into the full tensor.
-                import torch.distributed as dist
+            if pg is None:
+                # unsharded converter param: this rank's copy is the whole logical
+                # tensor -- no collective, single-shard list on rank 0.
+                assert not is_block, "block placements always carry a gather group"
+                gathered = [[(g[5], g[6])] for g in nan_group] if is_r0 else None
+            else:
+                idx_concat = torch.cat([g[5] for g in nan_group])
+                val_concat = torch.cat([g[6] for g in nan_group])
+                counts = torch.tensor([int(g[5].numel()) for g in nan_group], dtype=torch.int64, device=dev)
+                gathered = gather_v_batched_to_rank0(idx_concat, val_concat, counts, group=pg, grouped=True)
 
-                maxd = max(len(g[7].full_shape) for g in nan_group)
-                meta = torch.zeros(len(nan_group), 1 + 2 * maxd, dtype=torch.int64, device=dev)
-                for i, g in enumerate(nan_group):
-                    pl = g[7]
-                    d = len(pl.full_shape)
-                    meta[i, 0] = d
-                    meta[i, 1 : 1 + d] = torch.tensor(pl.local_shape, dtype=torch.int64)
-                    meta[i, 1 + d : 1 + 2 * d] = torch.tensor(pl.global_offset, dtype=torch.int64)
-                world = dist.get_world_size(pg)
-                metas = [torch.zeros_like(meta) for _ in range(world)]
-                dist.all_gather(metas, meta, group=pg)
-                blocks = [m.cpu().tolist() for m in metas]  # [world][K][1+2*maxd]
+                if is_block:
+                    # every rank ships its per-param (local_shape, global_offset); rank 0
+                    # needs them to place each rank's NaN-rebuilt block into the full tensor.
+                    import torch.distributed as dist
+
+                    maxd = max(len(g[7].full_shape) for g in nan_group)
+                    meta = torch.zeros(len(nan_group), 1 + 2 * maxd, dtype=torch.int64, device=dev)
+                    for i, g in enumerate(nan_group):
+                        pl = g[7]
+                        d = len(pl.full_shape)
+                        meta[i, 0] = d
+                        meta[i, 1 : 1 + d] = torch.tensor(pl.local_shape, dtype=torch.int64)
+                        meta[i, 1 + d : 1 + 2 * d] = torch.tensor(pl.global_offset, dtype=torch.int64)
+                    world = dist.get_world_size(pg)
+                    metas = [torch.zeros_like(meta) for _ in range(world)]
+                    dist.all_gather(metas, meta, group=pg)
+                    blocks = [m.cpu().tolist() for m in metas]  # [world][K][1+2*maxd]
 
             if is_r0 and gathered is not None:
                 for k, ((name, local_dtype, _pg, spec, shard_shape, _gi, _gv, place), per_rank) in enumerate(
