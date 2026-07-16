@@ -23,6 +23,10 @@ positions), so the receiver never stages a full-model mirror anywhere —
 peak memory is one decode chunk, independent of model size — and no SGLang
 fork or patch is required.
 
+Enabling the ``delta_sharded`` checkpoint-engine backend registers this loader
+automatically (the SGLang server adapter appends :data:`LOADER_FQN` to the
+server's ``custom_weight_loader`` list); no manual configuration is needed.
+
 Wire contract (what the delta checkpoint engine sends per flush):
 
 * ``__delta_spec__`` — uint8 tensor holding a JSON manifest
@@ -33,7 +37,7 @@ Wire contract (what the delta checkpoint engine sends per flush):
 * ``__values__``  — the changed values in the flush's (uniform) dtype;
   per-param slices are element offsets ``val_start:val_end``.
 
-Register at server launch (verl config)::
+To register manually instead (verl config)::
 
     +actor_rollout_ref.rollout.engine_kwargs.sglang.custom_weight_loader='["verl.workers.rollout.sglang_rollout.delta_loader.apply_delta"]'
 """
