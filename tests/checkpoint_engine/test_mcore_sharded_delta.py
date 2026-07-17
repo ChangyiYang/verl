@@ -105,3 +105,60 @@ def test_converter_spec_shape():
     assert set(out) == {"model.q_proj.weight", "model.k_proj.weight", "model.v_proj.weight"}
     parts = [out["model.q_proj.weight"], out["model.k_proj.weight"], out["model.v_proj.weight"]]
     assert torch.equal(torch.cat(parts), full)
+
+
+def test_expert_virtual_stack_rebuild_matches_reference():
+    """mcore EP: each rank holds one LOCAL expert tensor per name (same name, different
+    global expert). The exporter describes it as one block of the virtual
+    [ep_size, *full_etp_shape] tensor. Verify the block NaN rebuild -> per-global-expert
+    conversion equals converting full tensors first and diffing after."""
+    torch.manual_seed(4)
+    ep, etp = 4, 2
+    n_per_rank = 2  # local experts per ep rank -> 8 global experts
+    rows, cols = 6, 4  # per-expert fc weight [rows, cols], ETP shards rows
+    full_etp = (rows, cols)
+
+    def convert(gname, tensor):
+        # stand-in for weight_converter.convert_param: rename to HF per-expert
+        gid = int(gname.split(".weight")[-1])
+        return [(f"model.experts.{gid}.up.weight", tensor)]
+
+    for local_id in range(n_per_rank):
+        # reference: global tensors per ep rank for THIS local slot
+        olds = [torch.randn(full_etp, dtype=torch.bfloat16) for _ in range(ep)]
+        news = [t.clone() for t in olds]
+        news[1][2, 3] += 1.0
+        news[3][0, 0] -= 0.5
+
+        # engine-style: rebuild virtual [ep, rows, cols] from per-(ep, etp) blocks
+        virtual_nan = torch.full((ep, rows, cols), float("nan"), dtype=torch.bfloat16)
+        for ep_rank in range(ep):
+            for etp_rank in range(etp):
+                r0 = etp_rank * (rows // etp)
+                lo = olds[ep_rank][r0 : r0 + rows // etp].contiguous().reshape(-1)
+                ln = news[ep_rank][r0 : r0 + rows // etp].contiguous().reshape(-1)
+                changed = (lo.view(torch.uint8).view(lo.numel(), -1) != ln.view(torch.uint8).view(ln.numel(), -1)).any(
+                    dim=-1
+                )
+                lidx = changed.nonzero(as_tuple=False).view(-1)
+                buf = torch.full((lo.numel(),), float("nan"), dtype=torch.bfloat16)
+                buf[lidx] = ln[lidx]
+                virtual_nan[ep_rank, r0 : r0 + rows // etp] = buf.view(rows // etp, cols)
+
+        seen = 0
+        for k in range(ep):
+            gname = f"decoder.layers.0.mlp.experts.linear_fc1.weight{n_per_rank * k + local_id}"
+            for hf_name, hf_tensor in convert(gname, virtual_nan[k]):
+                fl = hf_tensor.reshape(-1)
+                pos = (~torch.isnan(fl)).nonzero(as_tuple=False).view(-1)
+                rn, ro = news[k].reshape(-1), olds[k].reshape(-1)
+                ref = (
+                    (rn.view(torch.uint8).view(rn.numel(), -1) != ro.view(torch.uint8).view(ro.numel(), -1))
+                    .any(dim=-1)
+                    .nonzero(as_tuple=False)
+                    .view(-1)
+                )
+                assert torch.equal(pos, ref), f"{hf_name}: positions diverge"
+                assert torch.equal(fl[pos], rn[pos]), f"{hf_name}: values diverge"
+                seen += int(pos.numel())
+        assert seen == 2

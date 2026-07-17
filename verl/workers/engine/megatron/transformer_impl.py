@@ -850,7 +850,7 @@ class MegatronEngine(BaseEngine):
         positions preserved: the engine diffs local shards and still emits deltas in HF
         coordinates without any per-layout index math.
 
-        Scope (asserted): dense models, PP=1, VPP=1, no EP, no LoRA.
+        Scope (asserted): PP=1, VPP=1, no LoRA. Dense and MoE (EP x ETP) models.
         """
         from megatron.core import parallel_state as mpu
         from torch.distributed.device_mesh import DeviceMesh
@@ -865,7 +865,6 @@ class MegatronEngine(BaseEngine):
         assert mpu.get_pipeline_model_parallel_world_size() == 1, (
             "megatron delta_sharded does not support pipeline parallelism yet"
         )
-        assert mpu.get_expert_model_parallel_world_size() <= 1, "megatron delta_sharded does not support EP yet"
         assert len(self.module) == 1, "megatron delta_sharded does not support VPP>1 yet"
         assert self.peft_cls is None, "megatron delta_sharded does not support LoRA"
 
@@ -878,6 +877,14 @@ class MegatronEngine(BaseEngine):
         tf_config = self.tf_config
         tp_group = mpu.get_tensor_model_parallel_group()
         tp_world = torch.distributed.get_world_size(group=tp_group)
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        ep_rank = mpu.get_expert_model_parallel_rank() if ep_size > 1 else 0
+        etp_size = mpu.get_expert_tensor_parallel_world_size() if ep_size > 1 else 1
+        etp_rank = mpu.get_expert_tensor_parallel_rank() if ep_size > 1 else 0
+        # etp x ep combined group: every rank holding a block of the virtual
+        # all-experts tensor within this rank's (expert-)data-parallel replica.
+        etp_ep_group = mpu.get_expert_tensor_and_model_parallel_group() if ep_size > 1 else None
+        num_experts_per_rank = (tf_config.num_moe_experts // ep_size) if ep_size > 1 else 0
         from verl.utils.device import get_device_name
 
         tp_mesh = DeviceMesh.from_group(tp_group, get_device_name()) if tp_world > 1 else None
@@ -907,7 +914,39 @@ class MegatronEngine(BaseEngine):
 
             return _to_hf
 
+        def _make_expert_to_hf(name_prefix, local_expert_id, param, full_etp_shape):
+            """Convert the virtual all-experts tensor (one mcore expert param name,
+            stacked over ep ranks) to per-global-expert HF tensors. Slice k of dim 0
+            is global expert ``num_experts_per_rank * k + local_expert_id``; each
+            slice is already ETP-assembled by the block placement, so the concat fn
+            sees a single full shard (gate/up splitting still applies)."""
+
+            def _to_hf(shards, _shape=tuple(full_etp_shape)):
+                full_flat = shards[0] if len(shards) == 1 else torch.cat([sh.reshape(-1) for sh in shards])
+                virtual = full_flat.view((ep_size, *_shape))
+                out = []
+                for k in range(ep_size):
+                    gname = f"{name_prefix}.weight{num_experts_per_rank * k + local_expert_id}"
+                    merged = default_tp_concat_fn(
+                        layer_name_mapping,
+                        gname,
+                        param,
+                        [virtual[k]],
+                        hf_config,
+                        hf_config,
+                        convert_qkv_gate_up_by_simple_split=True,
+                    )
+                    if not isinstance(merged, list):
+                        merged = [merged]
+                    names, tensors = weight_converter.convert_param(gname, merged)
+                    out.extend(zip(names, tensors, strict=True))
+                return out
+
+            return _to_hf
+
         def _gen():
+            from verl.workers.engine.spec import BlockPlacement
+
             model = unwrap_model(self.module[0])
             for name, param in model.named_parameters():
                 cur_name = normalize_model_name(name, 0, 0, tf_config)
@@ -919,6 +958,40 @@ class MegatronEngine(BaseEngine):
                 local = param.data
                 if local.is_floating_point() and local.dtype != torch.bfloat16:
                     local = local.to(torch.bfloat16)
+
+                if ep_size > 1 and ".mlp.experts.linear_fc" in cur_name:
+                    # expert param: one tensor per LOCAL expert (same name on every ep
+                    # rank, holding a DIFFERENT global expert). Describe it as one block
+                    # of the virtual [ep_size, *full_etp_shape] tensor: dim 0 = ep rank,
+                    # inner dims = the ETP shard's block.
+                    name_prefix, local_id = cur_name.split(".weight")
+                    local_id = int(local_id)
+                    full_etp = list(local.shape)
+                    inner_off = [0] * local.dim()
+                    if etp_size > 1:
+                        # mcore expert weights do not always carry the standard
+                        # tensor_model_parallel attribute; fall back to the layout
+                        # rule (fc1 = column-parallel dim 0, fc2 = row-parallel dim 1).
+                        if is_tp:
+                            pdim = tp_utils.get_tensor_parallel_partition_dim(param)
+                        else:
+                            pdim = 0 if "linear_fc1" in cur_name else 1
+                        full_etp[pdim] *= etp_size
+                        inner_off[pdim] = etp_rank * local.shape[pdim]
+                    block = BlockPlacement(
+                        (1, *local.shape),
+                        (ep_rank, *inner_off),
+                        (ep_size, *full_etp),
+                    )
+                    spec = ShardSpec(
+                        full_shape=(ep_size, *full_etp),
+                        to_hf=_make_expert_to_hf(name_prefix, local_id, param, full_etp),
+                        place=block,
+                        gather_group=etp_ep_group,
+                    )
+                    yield cur_name, local.reshape(-1), spec
+                    continue
+
                 if is_tp and tp_mesh is not None:
                     dim = tp_utils.get_tensor_parallel_partition_dim(param)
                     full = list(local.shape)
