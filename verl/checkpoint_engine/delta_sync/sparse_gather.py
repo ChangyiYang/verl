@@ -232,6 +232,9 @@ def gather_v_grouped_to_rank0(
     """
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)
+    # ``dst`` must be a GLOBAL rank: for a subgroup (e.g. a Megatron TP group that
+    # does not contain global rank 0), group-rank 0 is not global rank 0.
+    dst = dist.get_global_rank(group, 0) if group is not None else 0
     dev = local_idx.device
 
     n = int(local_idx.numel())
@@ -258,8 +261,8 @@ def gather_v_grouped_to_rank0(
 
     idx_list = [torch.zeros(max_n, dtype=idx_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
     val_list = [torch.zeros(max_n, dtype=local_val.dtype, device=dev) for _ in range(world)] if rank == 0 else None
-    dist.gather(idx_pad, idx_list, dst=0, group=group)
-    dist.gather(val_pad, val_list, dst=0, group=group)
+    dist.gather(idx_pad, idx_list, dst=dst, group=group)
+    dist.gather(val_pad, val_list, dst=dst, group=group)
 
     if rank != 0:
         return None
