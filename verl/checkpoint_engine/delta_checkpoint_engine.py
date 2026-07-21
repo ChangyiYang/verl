@@ -580,6 +580,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             group = []
 
         nan_group: list[_RebuildEntry] = []  # rebuild-profile params batched per gather_group
+        nan_bytes = 0  # queued payload bytes; bounds rank-0's padded gather buffers at high density
 
         def _consume_hf(hf_name: str, hf_tensor: torch.Tensor) -> None:
             nonlocal total_elems
@@ -599,7 +600,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 )
 
         def _flush_nan_group() -> None:
-            nonlocal nan_group, total_elems
+            nonlocal nan_group, nan_bytes, total_elems
+            nan_bytes = 0
             if not nan_group:
                 return
             pg = nan_group[0].pg
@@ -736,7 +738,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 nan_group.append(
                     _RebuildEntry(name, local.dtype, pg, spec, tuple(local.shape), lidx.to(torch.int32), lval, place)
                 )
-                if len(nan_group) >= max(batch_k, 1):
+                nan_bytes += int(lidx.numel()) * 4 + int(lval.nbytes)
+                # flush on param count OR payload bytes: near-dense high-density deltas
+                # would otherwise blow up rank-0's padded gather buffers (world x blob)
+                if len(nan_group) >= max(batch_k, 1) or nan_bytes >= self.bucket_size:
                     _flush_nan_group()
                 continue
 
