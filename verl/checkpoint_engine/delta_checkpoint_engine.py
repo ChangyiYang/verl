@@ -739,9 +739,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     _RebuildEntry(name, local.dtype, pg, spec, tuple(local.shape), lidx.to(torch.int32), lval, place)
                 )
                 nan_bytes += int(lidx.numel()) * 4 + int(lval.nbytes)
-                # flush on param count OR payload bytes: near-dense high-density deltas
-                # would otherwise blow up rank-0's padded gather buffers (world x blob)
-                if len(nan_group) >= max(batch_k, 1) or nan_bytes >= self.bucket_size:
+                # flush on param count OR payload bytes. Rank 0's padded gather buffers
+                # are world x the LARGEST rank blob, so the per-rank threshold must be
+                # divided by the group size to bound the rank-0 transient by bucket_size.
+                if len(nan_group) >= max(batch_k, 1) or nan_bytes >= self.bucket_size // max(
+                    torch.distributed.get_world_size(pg), 1
+                ):
                     _flush_nan_group()
                 continue
 
