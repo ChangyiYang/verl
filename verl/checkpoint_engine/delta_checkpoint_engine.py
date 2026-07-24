@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from unittest.mock import patch
@@ -451,6 +452,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         generator (the per-tensor assembly is collective); rank 0 buckets. Resume
         works by construction: whatever the trainer restored is what ships."""
         is_r0 = self.is_master
+        t0 = time.time()
         n_flushes = 0
         total_elems = 0
         wire_bytes = 0
@@ -503,7 +505,16 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             bkt.emit(is_last=True)
         else:
             self._publish_terminal(True)
-        logger.info("delta-sharded send v=%s FULL-SEED flushes=%d elems=%d", global_steps, n_flushes, total_elems)
+        # warning level on purpose: worker default log level swallows info, and the
+        # one-off seed cost is the number people ask for when sizing a run.
+        logger.warning(
+            "delta-sharded FULL-SEED v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
+            global_steps,
+            time.time() - t0,
+            n_flushes,
+            total_elems,
+            wire_bytes / (1 << 30),
+        )
         if not total_elems:
             return None
         return {
