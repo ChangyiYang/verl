@@ -319,6 +319,26 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         val_cp[:] = cp.asarray(val_u8)
         collective.broadcast(val_cp, src_rank=0, group_name=self.group_name)
 
+    def _release_staging_pool(self, phase: str) -> None:
+        """Return the cupy staging pool's blocks to CUDA and log the evidence:
+        ``held`` is what the pool would have kept from the device without this
+        release, and the device-free delta shows the memory actually coming
+        back (warning level so the default worker log level records it)."""
+        from verl.utils.device import get_torch_device
+
+        pool = cp.get_default_memory_pool()
+        held = pool.total_bytes()
+        free_before, _ = get_torch_device().mem_get_info()
+        pool.free_all_blocks()
+        free_after, _ = get_torch_device().mem_get_info()
+        logger.warning(
+            "cupy staging pool after %s send: held %.2fGB; device free %.2f->%.2fGB on release",
+            phase,
+            held / (1 << 30),
+            free_before / (1 << 30),
+            free_after / (1 << 30),
+        )
+
     def _publish_terminal(self, first: bool) -> None:
         """End-of-stream marker when zero flushes were produced (no broadcast, just a signal)."""
         meta = {"is_full": first, "encoding": self.encoding, "is_last": True, "terminal_empty": True}
@@ -505,7 +525,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # after streaming up to 2x bucket_size through it, give the memory back
         # so the trainer's next optimizer/forward pass can use it (raw cudaMalloc
         # OOMs on tight mcore shapes otherwise).
-        cp.get_default_memory_pool().free_all_blocks()
+        self._release_staging_pool("seed")
         logger.warning(
             "delta-sharded FULL-SEED v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
             global_steps,
@@ -597,7 +617,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             bkt.emit(is_last=True)
         else:
             self._publish_terminal(False)
-        cp.get_default_memory_pool().free_all_blocks()  # return staging blocks to CUDA between syncs
+        self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
         logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
         if not total_elems:
             return None
