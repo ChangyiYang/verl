@@ -170,12 +170,13 @@ def build_export_index(bridge, megatron_model, hf_path: Optional[str] = None) ->
             continue
         module = task.megatron_module
 
-        is_expert = bool(getattr(mapping, "is_expert", False)) or ".mlp.experts." in name
+        is_expert = mapping.is_expert
         pdim = _mapping_partition_dim(mapping, param)
         if is_expert and pdim is None and etp_size > 1:
-            # mcore expert weights do not always carry the standard
-            # tensor_model_parallel attribute; fall back to the layout rule
-            # (fc1 = column-parallel dim 0, fc2 = row-parallel dim 1).
+            # mcore deliberately withholds tensor_model_parallel on expert
+            # weights (grouped-linear attr stamping in mcore's TE extensions),
+            # so for experts the layout rule is the primary source, not a
+            # fallback: fc1 = column-parallel dim 0, fc2 = row-parallel dim 1.
             pdim = 0 if "linear_fc1" in name else 1
         local_shape = tuple(int(x) for x in param.shape)
 
