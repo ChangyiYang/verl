@@ -501,6 +501,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             self._publish_terminal(True)
         # warning level on purpose: worker default log level swallows info, and the
         # one-off seed cost is the number people ask for when sizing a run.
+        # the cupy staging pool does not return its blocks to CUDA on its own;
+        # after streaming up to 2x bucket_size through it, give the memory back
+        # so the trainer's next optimizer/forward pass can use it (raw cudaMalloc
+        # OOMs on tight mcore shapes otherwise).
+        cp.get_default_memory_pool().free_all_blocks()
         logger.warning(
             "delta-sharded FULL-SEED v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
             global_steps,
@@ -592,6 +597,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             bkt.emit(is_last=True)
         else:
             self._publish_terminal(False)
+        cp.get_default_memory_pool().free_all_blocks()  # return staging blocks to CUDA between syncs
         logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
         if not total_elems:
             return None
