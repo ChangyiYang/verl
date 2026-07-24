@@ -67,23 +67,44 @@ def single_rank_pg_collection() -> SimpleNamespace:
     return _SINGLE_RANK_PGS
 
 
-def make_probe(mapping):
+def _warm_lazy_mappings(mapping, module) -> None:
+    """Force AutoMapping's lazy inner mapping into existence BEFORE the probe is
+    copied: AutoMapping resolves its concrete Column/Row/Replicated delegate on
+    first use, snapshotting whatever process groups exist at that moment -- if
+    that first use happened inside the probe, the delegate would be born with
+    the REAL groups and gather for real (the qkv-bias double-size bug)."""
+    for obj in [mapping, *[v for v in vars(mapping).values() if hasattr(v, "megatron_to_hf")]]:
+        if hasattr(obj, "_detect_parallelism_type") and getattr(obj, "_mapping", None) is None and module is not None:
+            try:
+                t = obj._detect_parallelism_type(module)
+                obj._mapping = obj._get_or_create_mapping(t)
+                obj._detected_type = t
+            except Exception as e:  # pragma: no cover - defensive; probe falls back to real groups
+                logger.warning("could not warm lazy mapping %s: %s", type(obj).__name__, e)
+
+
+def make_probe(mapping, module=None):
     """Copy a Megatron-Bridge param mapping and install degenerate single-rank
-    process groups on it AND on any nested mapping (composite mappings like
-    QKVMapping delegate their TP gather to an inner ``_tp_mapping`` that does
-    not receive the outer injection), turning ``megatron_to_hf`` into a pure
-    transform with zero collectives."""
+    process groups on it and on EVERY nested mapping, recursively (composite
+    mappings delegate to inner mappings -- QKVMapping._tp_mapping is an
+    AutoMapping which itself delegates to a lazily-created concrete mapping;
+    none of these receive the outer injection on their own). The result's
+    ``megatron_to_hf`` is a pure transform with zero collectives."""
     from megatron.bridge.models.conversion.param_mapping import MegatronParamMapping
 
+    _warm_lazy_mappings(mapping, module)
     pgs = single_rank_pg_collection()
-    probe = copy.copy(mapping)
-    probe.set_process_groups_from_pg_collection(pgs)
-    for attr, value in list(vars(probe).items()):
-        if isinstance(value, MegatronParamMapping):
-            inner = copy.copy(value)
-            inner.set_process_groups_from_pg_collection(pgs)
-            setattr(probe, attr, inner)
-    return probe
+
+    def _inject(m):
+        c = copy.copy(m)
+        c.set_process_groups_from_pg_collection(pgs)
+        for attr, value in list(vars(c).items()):
+            if isinstance(value, MegatronParamMapping):
+                _warm_lazy_mappings(value, module)
+                setattr(c, attr, _inject(value))
+        return c
+
+    return _inject(mapping)
 
 
 @dataclass
@@ -190,7 +211,7 @@ def build_export_index(bridge, megatron_model, hf_path: Optional[str] = None) ->
                 megatron_name=name,
                 param=param,
                 spec=spec,
-                probe=make_probe(mapping),
+                probe=make_probe(mapping, module),
                 module=module,
                 buffer_offset=buffer_offset,
             )
