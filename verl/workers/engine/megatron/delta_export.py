@@ -129,7 +129,7 @@ def _mapping_partition_dim(mapping, param) -> Optional[int]:
     return None
 
 
-def build_export_index(bridge, megatron_model, hf_path: Optional[str] = None) -> list[McoreParamExport]:
+def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
     """Enumerate every local mcore parameter through the bridge's conversion
     tasks and precompute its geometry declaration + form-B probe.
 
@@ -153,13 +153,7 @@ def build_export_index(bridge, megatron_model, hf_path: Optional[str] = None) ->
     etp_rank = mpu.get_expert_tensor_parallel_rank() if ep_size > 1 else 0
     etp_ep_group = mpu.get_expert_tensor_and_model_parallel_group() if ep_size > 1 else None
 
-    # hf_path is only needed when the bridge was built from a bare config (tests);
-    # the production engine builds it from_hf_pretrained and passes None.
-    tasks = (
-        bridge.get_conversion_tasks(megatron_model, hf_path=hf_path)
-        if hf_path
-        else bridge.get_conversion_tasks(megatron_model)
-    )
+    tasks = bridge.get_conversion_tasks(megatron_model)
     index: list[McoreParamExport] = []
     for task in tasks:
         mapping = task.mapping
