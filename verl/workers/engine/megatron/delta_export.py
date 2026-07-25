@@ -28,6 +28,14 @@ into its TP slice yields HF tensors whose non-NaN survivors are exactly this
 rank's contributions in final HF coordinates.
 
 Scope (asserted in the exporter): TP + EP, PP=1, VPP=1, no LoRA.
+
+Safety boundary of the degenerate-PG trick: it relies on ``megatron_to_hf``
+using group state for COMMUNICATION only (gathers/broadcasts, and the ep-name
+fan-out that its ``ep_size == 1`` fast path bypasses); the post-gather
+transform is a pure permutation. A future mapping that let ``tp_size`` or
+``ep_rank`` into VALUE math would skew the probe silently -- rerun the D1
+bitwise probe (probe output vs real ``megatron_to_hf``, single GPU) as the
+regression oracle whenever Megatron-Bridge is upgraded.
 """
 
 from __future__ import annotations
@@ -68,19 +76,20 @@ def single_rank_pg_collection() -> SimpleNamespace:
 
 
 def _warm_lazy_mappings(mapping, module) -> None:
-    """Force AutoMapping's lazy inner mapping into existence BEFORE the probe is
-    copied: AutoMapping resolves its concrete Column/Row/Replicated delegate on
-    first use, snapshotting whatever process groups exist at that moment -- if
-    that first use happened inside the probe, the delegate would be born with
-    the REAL groups and gather for real (the qkv-bias double-size bug)."""
-    for obj in [mapping, *[v for v in vars(mapping).values() if hasattr(v, "megatron_to_hf")]]:
-        if hasattr(obj, "_detect_parallelism_type") and getattr(obj, "_mapping", None) is None and module is not None:
-            try:
-                t = obj._detect_parallelism_type(module)
-                obj._mapping = obj._get_or_create_mapping(t)
-                obj._detected_type = t
-            except Exception as e:  # pragma: no cover - defensive; probe falls back to real groups
-                logger.warning("could not warm lazy mapping %s: %s", type(obj).__name__, e)
+    """Force AutoMapping's lazy concrete delegate into existence: AutoMapping
+    resolves its Column/Row/Replicated delegate on first use, snapshotting
+    whatever process groups exist at that moment -- if that first use happened
+    inside the probe, the delegate would be born with the REAL groups and
+    gather for real (the qkv-bias double-size bug). Self-only on purpose:
+    ``_inject`` warms every child right before copying it, so each node of the
+    mapping tree is warmed exactly once."""
+    if hasattr(mapping, "_detect_parallelism_type") and getattr(mapping, "_mapping", None) is None and module is not None:
+        try:
+            t = mapping._detect_parallelism_type(module)
+            mapping._mapping = mapping._get_or_create_mapping(t)
+            mapping._detected_type = t
+        except Exception as e:  # pragma: no cover - defensive; probe falls back to real groups
+            logger.warning("could not warm lazy mapping %s: %s", type(mapping).__name__, e)
 
 
 def make_probe(mapping, module=None):
@@ -97,9 +106,11 @@ def make_probe(mapping, module=None):
 
     def _inject(m):
         c = copy.copy(m)
-        c.set_process_groups_from_pg_collection(pgs)
+        c.set_process_groups_from_pg_collection(pgs)  # sets only c's own groups
         for attr, value in list(vars(c).items()):
             if isinstance(value, MegatronParamMapping):
+                # warm BEFORE copying the child: the lazy delegate must exist so
+                # the child copy's vars() include it and the recursion reaches it.
                 _warm_lazy_mappings(value, module)
                 setattr(c, attr, _inject(value))
         return c
