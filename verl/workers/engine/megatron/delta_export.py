@@ -15,7 +15,7 @@
 
 The delta engine consumes final HF-coordinate entries; everything mcore-specific
 lives here: enumerating parameters through :meth:`AutoBridge.get_conversion_tasks`,
-declaring each parameter's geometry as a :class:`ShardSpec`, and probing the
+routing each parameter's entries to its wire merge group, and probing the
 bridge's own ``megatron_to_hf`` converters with NaN sentinels to translate a
 shard-local delta into HF coordinates.
 
@@ -49,11 +49,11 @@ from __future__ import annotations
 import copy
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
-from verl.workers.engine.spec import BlockPlacement, ShardSpec
+from verl.workers.engine.spec import ShardSpec
 
 logger = logging.getLogger(__name__)
 
@@ -132,9 +132,10 @@ def make_probe(mapping, module):
             return out
 
         c.gather_from_tp_ranks = _gather_tp
-        # the probe sees ONE expert (the engine's virtual-ep tensor handles the
-        # expert dim); the hf name was bound with the GLOBAL expert id at task
-        # construction, so the ep fan-out reduces to the bound name.
+        # each rank's probe emits only its own local experts, under the hf name
+        # bound with the GLOBAL expert id at task construction; the engine
+        # merges entries over the etp x ep group, so the ep fan-out reduces to
+        # the bound name.
         c.gather_from_ep_ranks = lambda w, mod, name: {str(name): w}
         # mirrors the real helper's tail (unsqueeze(0) ... squeeze().unsqueeze(-1))
         c.gather_from_ep_ranks_scale = lambda w, mod, name: {str(name): w.unsqueeze(0).squeeze().unsqueeze(-1)}
@@ -164,22 +165,18 @@ class McoreParamExport:
     module: Any  # module handle megatron_to_hf reads config from
 
 
-def _mapping_partition_dim(mapping, param) -> Optional[int]:
-    """TP partition dim of ``param`` under ``mapping``: mcore convention keeps
-    it on the parameter (``tensor_model_parallel``/``partition_dim``); mappings
-    that gather (Column/Row/QKV/GatedMLP inner AutoMapping) follow it."""
-    if getattr(param, "tensor_model_parallel", False):
-        return int(getattr(param, "partition_dim", 0))
-    return None
-
-
 def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
     """Enumerate every local mcore parameter through the bridge's conversion
-    tasks and precompute its geometry declaration + form-B probe.
+    tasks and precompute its probe + wire routing.
 
-    The index is built once (parameter sets are static) and reused by both the
-    shard export and the delta entry hook. Order follows the bridge's task
-    enumeration, identical on every rank (lockstep requirement).
+    No shard geometry is hand-computed here: the comm-stubbed probe emits final
+    HF coordinates straight from the local shard, so the engine only needs to
+    know WHICH group's entries to merge per parameter (the spec's
+    ``gather_group``; ``full_shape`` is the nominal local shape) and that
+    replicated params contribute from rank 0 only. The index is built once
+    (parameter sets are static) and reused by both the shard export and the
+    delta entry hook. Order follows the bridge's task enumeration, identical on
+    every rank (lockstep requirement).
     """
     from megatron.core import parallel_state as mpu
 
@@ -190,12 +187,7 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
 
     tp_group = mpu.get_tensor_model_parallel_group()
     tp_world = torch.distributed.get_world_size(group=tp_group)
-    tp_rank = torch.distributed.get_rank(group=tp_group)
     ep_size = mpu.get_expert_model_parallel_world_size()
-    ep_rank = mpu.get_expert_model_parallel_rank() if ep_size > 1 else 0
-    etp_size = mpu.get_expert_tensor_parallel_world_size() if ep_size > 1 else 1
-    etp_rank = mpu.get_expert_tensor_parallel_rank() if ep_size > 1 else 0
-    etp_ep_group = mpu.get_expert_tensor_and_model_parallel_group() if ep_size > 1 else None
 
     tasks = bridge.get_conversion_tasks(megatron_model)
     index: list[McoreParamExport] = []
@@ -207,44 +199,21 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
             # parameter not owned by this rank (pp scope guard keeps this rare)
             continue
         module = task.megatron_module
-
-        is_expert = mapping.is_expert
-        pdim = _mapping_partition_dim(mapping, param)
-        if is_expert and pdim is None and etp_size > 1:
-            # mcore deliberately withholds tensor_model_parallel on expert
-            # weights (grouped-linear attr stamping in mcore's TE extensions),
-            # so for experts the layout rule is the primary source, not a
-            # fallback: fc1 = column-parallel dim 0, fc2 = row-parallel dim 1.
-            pdim = 0 if "linear_fc1" in name else 1
         local_shape = tuple(int(x) for x in param.shape)
 
-        if is_expert and ep_size > 1:
-            # one LOCAL expert tensor; the virtual logical tensor stacks the ep
-            # dim in front: [ep_size, *etp_full_shape]. The probe consumes the
-            # ETP-full single-expert shape (its ep gather is short-circuited and
-            # handled by the engine gather over etp_ep_group instead).
-            etp_full = list(local_shape)
-            inner_off = [0] * len(local_shape)
-            if etp_size > 1 and pdim is not None:
-                etp_full[pdim] *= etp_size
-                inner_off[pdim] = etp_rank * local_shape[pdim]
-            block = BlockPlacement(
-                (1, *local_shape),
-                (ep_rank, *inner_off),
-                (ep_size, *etp_full),
+        if mapping.is_expert and (ep_size > 1 or tp_world > 1):
+            # every rank holding a piece of this expert set contributes; the
+            # engine merges their probe entries over the joint etp x ep group.
+            spec = ShardSpec(
+                full_shape=local_shape,
+                place=0,
+                gather_group=mpu.get_expert_tensor_and_model_parallel_group(),
             )
-            spec = ShardSpec(full_shape=(ep_size, *etp_full), place=block, gather_group=etp_ep_group)
-        elif pdim is not None and tp_world > 1:
-            full = list(local_shape)
-            full[pdim] *= tp_world
-            offset = [0] * len(local_shape)
-            offset[pdim] = tp_rank * local_shape[pdim]
-            block = BlockPlacement(tuple(local_shape), tuple(offset), tuple(full))
-            spec = ShardSpec(full_shape=tuple(full), place=block, gather_group=tp_group)
+        elif getattr(param, "tensor_model_parallel", False) and tp_world > 1:
+            spec = ShardSpec(full_shape=local_shape, place=0, gather_group=tp_group)
         else:
-            # replicated across TP: single-slot geometry, engine's pg=None path
-            # (rank 0 consumes its own entry directly, replicas contribute later
-            # via lockstep zero counts -- ReplicatedMapping itself dedups too).
+            # replicated: engine's pg=None path (rank 0 consumes its own entry
+            # directly, replicas stay in lockstep via zero counts).
             spec = ShardSpec(full_shape=local_shape)
 
         index.append(

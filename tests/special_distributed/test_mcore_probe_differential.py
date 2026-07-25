@@ -105,6 +105,21 @@ def _build_tiny_hf_dir(rank: int) -> str:
     else:
         raise ValueError(f"unknown MODEL_KIND {MODEL_KIND!r}")
 
+    if MODEL_KIND == "nemotron_h":
+        # NemotronH's mixer pulls causal-conv1d / mamba-ssm kernels from the hub
+        # at layer init; offline runs must fall back to the reference path.
+        try:
+            import transformers.integrations.hub_kernels as _hk
+
+            _hk.lazy_load_kernel = lambda *a, **k: None
+            import transformers.models.nemotron_h.modeling_nemotron_h as _mnh
+
+            for _sym in ("lazy_load_kernel", "get_kernel"):
+                if hasattr(_mnh, _sym):
+                    setattr(_mnh, _sym, lambda *a, **k: None)
+        except Exception as e:  # pragma: no cover
+            print(f"kernel stub patch failed: {e}")
+
     if rank == 0 and not pathlib.Path(cfg_dir, "model.safetensors").exists():
         from transformers import AutoModelForCausalLM
 
@@ -141,6 +156,10 @@ def main():
     provider.finalize()
     model = provider.provide_distributed_model(wrap_with_ddp=False)
     model = [m.cuda().to(torch.bfloat16) for m in (model if isinstance(model, list) else [model])]
+    # real HF weights, identically loaded on every rank: replicated params
+    # (layernorms, routers) must be bit-identical across TP ranks or the
+    # differential would flag test artifacts instead of probe bugs.
+    bridge.load_hf_weights(model)
 
     from verl.workers.engine.megatron.delta_export import make_probe
 
@@ -178,9 +197,13 @@ def main():
                         continue
                     part = d[name]
                     mask = ~torch.isnan(part)
-                    overlap = (covered[mask] > 0).any().item()
-                    if overlap:
-                        failures.append(f"{t.global_param_name}/{name}: rank contributions overlap")
+                    # replicated params legitimately arrive from every rank --
+                    # overlap only counts as failure when the values CONFLICT.
+                    both = mask & (covered > 0)
+                    if both.any() and not torch.equal(
+                        merged[both].view(torch.int16), part[both].view(torch.int16)
+                    ):
+                        failures.append(f"{t.global_param_name}/{name}: conflicting rank contributions")
                     merged[mask] = part[mask]
                     covered[mask] += 1
                 n_checked += 1
