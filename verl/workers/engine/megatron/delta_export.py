@@ -91,11 +91,7 @@ def _warm_lazy_mappings(mapping, module) -> None:
     gather for real (the qkv-bias double-size bug). Self-only on purpose:
     ``_inject`` warms every child right before copying it, so each node of the
     mapping tree is warmed exactly once."""
-    if (
-        hasattr(mapping, "_detect_parallelism_type")
-        and getattr(mapping, "_mapping", None) is None
-        and module is not None
-    ):
+    if hasattr(mapping, "_detect_parallelism_type") and getattr(mapping, "_mapping", None) is None:
         try:
             t = mapping._detect_parallelism_type(module)
             mapping._mapping = mapping._get_or_create_mapping(t)
@@ -104,7 +100,7 @@ def _warm_lazy_mappings(mapping, module) -> None:
             logger.warning("could not warm lazy mapping %s: %s", type(mapping).__name__, e)
 
 
-def make_probe(mapping, module=None):
+def make_probe(mapping, module):
     """Copy a Megatron-Bridge param mapping tree and turn ``megatron_to_hf``
     into a communication-free LOCAL transform that still runs the REAL
     (tp_size > 1) code paths: every copy's groups become size-faithful
