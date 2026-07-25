@@ -99,26 +99,32 @@ def test_gather_slot_entries_sub_rounds_world1():
 
     from verl.checkpoint_engine.delta_sync.sparse_gather import gather_slot_entries_to_rank0
 
-    if not dist.is_initialized():
+    owns_pg = not dist.is_initialized()
+    if owns_pg:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29512")
         dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        torch.manual_seed(7)
+        k = 9
+        counts = torch.tensor([5, 0, 3, 7, 1, 0, 4, 2, 6], dtype=torch.int64)
+        n = int(counts.sum())
+        idx = torch.randint(0, 1000, (n,), dtype=torch.int32)
+        val = torch.randn(n, dtype=torch.bfloat16)
 
-    torch.manual_seed(7)
-    k = 9
-    counts = torch.tensor([5, 0, 3, 7, 1, 0, 4, 2, 6], dtype=torch.int64)
-    n = int(counts.sum())
-    idx = torch.randint(0, 1000, (n,), dtype=torch.int32)
-    val = torch.randn(n, dtype=torch.bfloat16)
-
-    ref = gather_slot_entries_to_rank0(idx, val, counts)
-    per_elem = idx.element_size() + val.element_size()
-    for budget_elems in (1, 4, 8):
-        got = gather_slot_entries_to_rank0(idx, val, counts, max_round_bytes=budget_elems * per_elem)
-        assert len(got) == k
-        for (ri, rv), (gi, gv) in zip(ref, got, strict=True):
-            assert torch.equal(ri, gi)
-            assert torch.equal(rv, gv)
+        ref = gather_slot_entries_to_rank0(idx, val, counts)
+        per_elem = idx.element_size() + val.element_size()
+        for budget_elems in (1, 4, 8):
+            got = gather_slot_entries_to_rank0(idx, val, counts, max_round_bytes=budget_elems * per_elem)
+            assert len(got) == k
+            for (ri, rv), (gi, gv) in zip(ref, got, strict=True):
+                assert torch.equal(ri, gi)
+                assert torch.equal(rv, gv)
+    finally:
+        # leaving the default pg alive leaks into whatever test runs next in the
+        # same session (repo convention: init in the test -> destroy in finally)
+        if owns_pg:
+            dist.destroy_process_group()
 
 
 def test_prime_then_hf_delta_export_roundtrip():
