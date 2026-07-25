@@ -748,22 +748,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
-            # Sharded delta: the SEED sync streams the backend's full HF export
-            # (assembly/conversion is the backend's own full-export logic, so
-            # Megatron/veomni and trainer resume work by construction), then the
-            # backend pins its shards as the diff base; every later sync ships the
-            # BACKEND-computed HF-coordinate delta.
             if effective_mode == "delta_sharded":
-                if getattr(self.checkpoint_engine, "needs_seed", True):
-                    per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-                    metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
-                    # weights do not move during the sync, so the snapshots equal
-                    # exactly what the rollout just received.
-                    self.actor.engine.prime_delta_snapshots()
-                    return metrics or {}
-                per_tensor_param, _ = self.actor.engine.get_per_tensor_param_delta_shard()
-            else:
-                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                # the delta engine owns the sync state machine (seed vs steady,
+                # snapshot prime), so it drives the training engine itself.
+                metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+                return metrics or {}
+            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return metrics or {}
 

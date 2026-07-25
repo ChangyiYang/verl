@@ -224,8 +224,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
     are gathered to rank 0 and streamed to the rollout side -- no rank ever holds
     a full-model snapshot.
 
-    ``send_weights`` consumes the backend's HF delta export
-    ``get_per_tensor_param_delta_shard()``: per-parameter FINAL-HF-coordinate
+    ``send_weights`` takes the TRAINING ENGINE and drives the sync itself: the
+    seed (first sync) streams the backend's full ``get_per_tensor_param()``
+    export values-only and pins the diff base (``prime_delta_snapshots``); every
+    steady sync consumes the backend's HF delta export
+    ``get_per_tensor_param_delta_shard()`` — per-parameter FINAL-HF-coordinate
     entries ``(slots, dtype_str, counts, hf_idx, hf_val, gather_group)``. Naming,
     to-HF conversion, diff and snapshot all live on the backend side (see
     :mod:`verl.workers.engine.utils`); this engine only batches, gathers,
@@ -377,15 +380,6 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # three collectives per parameter).
         self.batch_gather = int(batch_gather)
 
-    @property
-    def needs_seed(self) -> bool:
-        """True until the first (seed) sync has run. The caller picks the export by
-        phase: seed consumes ``get_per_tensor_param()`` (full HF tensors, the
-        backend's own assembly/conversion) shipped values-only; steady syncs consume
-        ``get_per_tensor_param_delta_shard()`` (backend-computed HF deltas). After
-        the seed the caller must ``prime_delta_snapshots()`` on the training engine."""
-        return not self._shard_seeded
-
     def _assemble_flush(self, per_param: list[_FlushPiece]) -> DeltaFlush:
         """Build one DeltaFlush (indices encoding) from rank 0's gathered per-param deltas.
 
@@ -515,18 +509,30 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
     async def send_weights(
         self,
-        weights: Generator[tuple, None, None],
+        engine,
         global_steps: int | None = None,
     ) -> dict[str, float] | None:
+        """Drive one weight sync from the TRAINING ENGINE (unlike the full-sync
+        engines, which consume a weights iterator): the seed/steady phase choice
+        and the snapshot prime are this engine's own state machine, so the worker
+        stays delta-agnostic. The seed (first sync) streams the backend's full
+        ``get_per_tensor_param()`` export over the values-only wire, then pins the
+        diff base via ``engine.prime_delta_snapshots()``; every later sync consumes
+        ``get_per_tensor_param_delta_shard()`` (backend-computed final-HF deltas).
+        """
         # All actor ranks participate (gather-v is collective); only torch rank 0 broadcasts.
         # rank 0 accumulates the gathered per-param deltas into bucket_size-sized flushes and streams
         # each one as soon as it fills (then frees it), so peak memory is ~2 buckets rather than the
         # whole model.
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
         if not self._shard_seeded:
-            # seed consumes the FULL export (name, full_hf_tensor); the caller
-            # selects it via ``needs_seed``.
-            return self._send_full_seed(weights, global_steps)
+            full, _ = engine.get_per_tensor_param()
+            metrics = self._send_full_seed(full, global_steps)
+            # weights do not move during the sync, so the snapshots equal exactly
+            # what the rollout just received.
+            engine.prime_delta_snapshots()
+            return metrics
+        weights, _ = engine.get_per_tensor_param_delta_shard()
         is_r0 = self.is_master
         n_flushes = 0
         changed_elems = 0
