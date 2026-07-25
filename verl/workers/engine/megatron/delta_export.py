@@ -19,23 +19,29 @@ declaring each parameter's geometry as a :class:`ShardSpec`, and probing the
 bridge's own ``megatron_to_hf`` converters with NaN sentinels to translate a
 shard-local delta into HF coordinates.
 
-The probe (form B) never runs a collective: every mapping is (shallow-)copied and
-its process groups are replaced with this rank's single-rank groups, so
-``megatron_to_hf`` short-circuits its TP gather (``tp_size == 1``) and PP
-broadcast (``pp_size == 1``) and degrades into a pure permutation transform.
-Feeding it a full-logical-shape NaN buffer with the rank's own delta scattered
-into its TP slice yields HF tensors whose non-NaN survivors are exactly this
-rank's contributions in final HF coordinates.
+The probe never runs a collective, yet executes the mapping's REAL parallel
+code paths: a "group" carries two separable meanings -- its SIZE/RANK (which
+value math like Mamba's ``local_dim = global // tp_size`` consumes) and its
+COMMUNICATION. The probe copies keep the first faithful and replace only the
+second: groups become :class:`_ProbeGroup` (real size/rank, any actual use for
+communication raises), and the bridge's comm helpers are stubbed with local
+synthesis -- ``gather_from_tp_ranks`` returns this rank's shard at its true
+rank index with NaN placeholders for every other rank (their contributions are
+exported by those ranks' own probes). Feeding ``megatron_to_hf`` the LOCAL
+shard as a NaN buffer with the rank's own delta scattered in yields HF tensors
+whose non-NaN survivors are exactly this rank's contributions in final HF
+coordinates.
 
 Scope (asserted in the exporter): TP + EP, PP=1, VPP=1, no LoRA.
 
-Safety boundary of the degenerate-PG trick: it relies on ``megatron_to_hf``
-using group state for COMMUNICATION only (gathers/broadcasts, and the ep-name
-fan-out that its ``ep_size == 1`` fast path bypasses); the post-gather
-transform is a pure permutation. A future mapping that let ``tp_size`` or
-``ep_rank`` into VALUE math would skew the probe silently -- rerun the D1
-bitwise probe (probe output vs real ``megatron_to_hf``, single GPU) as the
-regression oracle whenever Megatron-Bridge is upgraded.
+Safety boundary: communication must stay confined to the four stubbed helpers
+(``gather_from_tp_ranks`` / ``gather_from_ep_ranks[_scale]`` / the PP
+broadcasts, whose ``pp_size == 1`` fast path the probe keeps) -- anything else
+touching a probe group raises instead of skewing silently. The remaining
+assumption is that transforms REARRANGE elements rather than arithmetically
+BLEND chunks (blending would eat the NaN sentinels); the TP>1 differential
+test (real ``megatron_to_hf`` vs probe assembly, bitwise) is the regression
+oracle for both assumptions on every Megatron-Bridge upgrade.
 """
 
 from __future__ import annotations
@@ -43,36 +49,38 @@ from __future__ import annotations
 import copy
 import logging
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
 
-from verl.workers.engine.spec import BlockPlacement, ShardSpec, translate_flat_indices
+from verl.workers.engine.spec import BlockPlacement, ShardSpec
 
 logger = logging.getLogger(__name__)
 
-_SINGLE_RANK_PGS: Optional[SimpleNamespace] = None
 
+class _ProbeGroup:
+    """Size/rank-faithful stand-in for a process group on probe copies: value
+    math inside ``megatron_to_hf`` (e.g. Mamba's per-rank de-interleave dims)
+    sees the REAL parallel sizes, while any attempt to actually communicate
+    through the group fails loud (the probe stubs the bridge's comm helpers;
+    anything else reaching a group is an unstubbed communication pattern)."""
 
-def single_rank_pg_collection() -> SimpleNamespace:
-    """This rank's degenerate ProcessGroupCollection: every parallel dim is a
-    single-rank group, so any mapping carrying it sees tp/pp/ep/etp size 1 and
-    short-circuits its collectives. ``dist.new_group`` must be called by every
-    rank in the same order, so ALL ranks build ALL single-rank groups once."""
-    global _SINGLE_RANK_PGS
-    if _SINGLE_RANK_PGS is None:
-        import torch.distributed as dist
+    def __init__(self, size: int, rank: int):
+        self._size = int(size)
+        self._rank = int(rank)
 
-        own = None
-        for r in range(dist.get_world_size()):
-            g = dist.new_group([r])
-            if r == dist.get_rank():
-                own = g
-        # field names are what set_process_groups_from_pg_collection reads:
-        # pp -> pp_group, ep -> ep_group, tp -> _tp_group, expt_tp -> _etp_group
-        _SINGLE_RANK_PGS = SimpleNamespace(pp=own, ep=own, tp=own, expt_tp=own)
-    return _SINGLE_RANK_PGS
+    def size(self) -> int:
+        return self._size
+
+    def rank(self) -> int:
+        return self._rank
+
+    def __getattr__(self, name):
+        raise RuntimeError(
+            f"probe process group asked for {name!r}: this mapping communicates outside "
+            "the stubbed helpers (gather_from_tp_ranks / gather_from_ep_ranks[_scale] / "
+            "pp broadcasts) -- extend make_probe's comm stubs before trusting its export"
+        )
 
 
 def _warm_lazy_mappings(mapping, module) -> None:
@@ -83,7 +91,11 @@ def _warm_lazy_mappings(mapping, module) -> None:
     gather for real (the qkv-bias double-size bug). Self-only on purpose:
     ``_inject`` warms every child right before copying it, so each node of the
     mapping tree is warmed exactly once."""
-    if hasattr(mapping, "_detect_parallelism_type") and getattr(mapping, "_mapping", None) is None and module is not None:
+    if (
+        hasattr(mapping, "_detect_parallelism_type")
+        and getattr(mapping, "_mapping", None) is None
+        and module is not None
+    ):
         try:
             t = mapping._detect_parallelism_type(module)
             mapping._mapping = mapping._get_or_create_mapping(t)
@@ -93,20 +105,47 @@ def _warm_lazy_mappings(mapping, module) -> None:
 
 
 def make_probe(mapping, module=None):
-    """Copy a Megatron-Bridge param mapping and install degenerate single-rank
-    process groups on it and on EVERY nested mapping, recursively (composite
-    mappings delegate to inner mappings -- QKVMapping._tp_mapping is an
-    AutoMapping which itself delegates to a lazily-created concrete mapping;
-    none of these receive the outer injection on their own). The result's
-    ``megatron_to_hf`` is a pure transform with zero collectives."""
+    """Copy a Megatron-Bridge param mapping tree and turn ``megatron_to_hf``
+    into a communication-free LOCAL transform that still runs the REAL
+    (tp_size > 1) code paths: every copy's groups become size-faithful
+    :class:`_ProbeGroup` stand-ins and the bridge's comm helpers are stubbed
+    with local synthesis. The copy is recursive (composite mappings delegate to
+    inner mappings -- QKVMapping._tp_mapping is an AutoMapping which itself
+    delegates to a lazily-created concrete mapping; none of these receive the
+    outer stubbing on their own)."""
     from megatron.bridge.models.conversion.param_mapping import MegatronParamMapping
+    from megatron.core.utils import get_pg_rank, get_pg_size
 
     _warm_lazy_mappings(mapping, module)
-    pgs = single_rank_pg_collection()
+
+    def _stub(c):
+        # size-faithful groups, sizes/ranks read from the ORIGINAL (real) groups
+        # BEFORE replacement. PP is asserted =1 in the exporter; a (1, 0) group
+        # keeps the pp broadcast helpers on their identity fast path.
+        c.pp_group = _ProbeGroup(1, 0)
+        for attr in ("ep_group", "_tp_group", "_etp_group"):
+            g = getattr(c, attr, None)
+            setattr(c, attr, _ProbeGroup(get_pg_size(g), get_pg_rank(g)))
+
+        def _gather_tp(tensor, _c=c):
+            # what a real all_gather over the tp group would produce, minus the
+            # other ranks' data: our shard rides at its true rank index, every
+            # other chunk is NaN (those ranks export their own contributions).
+            out = [torch.full_like(tensor, float("nan")) for _ in range(_c.tp_size)]
+            out[_c.tp_rank] = tensor
+            return out
+
+        c.gather_from_tp_ranks = _gather_tp
+        # the probe sees ONE expert (the engine's virtual-ep tensor handles the
+        # expert dim); the hf name was bound with the GLOBAL expert id at task
+        # construction, so the ep fan-out reduces to the bound name.
+        c.gather_from_ep_ranks = lambda w, mod, name: {str(name): w}
+        # mirrors the real helper's tail (unsqueeze(0) ... squeeze().unsqueeze(-1))
+        c.gather_from_ep_ranks_scale = lambda w, mod, name: {str(name): w.unsqueeze(0).squeeze().unsqueeze(-1)}
+        return c
 
     def _inject(m):
-        c = copy.copy(m)
-        c.set_process_groups_from_pg_collection(pgs)  # sets only c's own groups
+        c = _stub(copy.copy(m))
         for attr, value in list(vars(c).items()):
             if isinstance(value, MegatronParamMapping):
                 # warm BEFORE copying the child: the lazy delegate must exist so
@@ -125,10 +164,8 @@ class McoreParamExport:
     megatron_name: str
     param: torch.Tensor
     spec: ShardSpec
-    probe: Any  # degenerate-PG mapping copy (form-B evaluator)
+    probe: Any  # comm-stubbed mapping copy (local megatron_to_hf evaluator)
     module: Any  # module handle megatron_to_hf reads config from
-    # dim-0 offset of this rank's slice inside the probe's input buffer, per dim
-    buffer_offset: tuple
 
 
 def _mapping_partition_dim(mapping, param) -> Optional[int]:
@@ -201,7 +238,6 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
                 (ep_size, *etp_full),
             )
             spec = ShardSpec(full_shape=(ep_size, *etp_full), place=block, gather_group=etp_ep_group)
-            buffer_offset = (ep_rank, *inner_off)
         elif pdim is not None and tp_world > 1:
             full = list(local_shape)
             full[pdim] *= tp_world
@@ -209,13 +245,11 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
             offset[pdim] = tp_rank * local_shape[pdim]
             block = BlockPlacement(tuple(local_shape), tuple(offset), tuple(full))
             spec = ShardSpec(full_shape=tuple(full), place=block, gather_group=tp_group)
-            buffer_offset = tuple(offset)
         else:
             # replicated across TP: single-slot geometry, engine's pg=None path
             # (rank 0 consumes its own entry directly, replicas contribute later
             # via lockstep zero counts -- ReplicatedMapping itself dedups too).
             spec = ShardSpec(full_shape=local_shape)
-            buffer_offset = (0,) * len(local_shape)
 
         index.append(
             McoreParamExport(
@@ -224,42 +258,30 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
                 spec=spec,
                 probe=make_probe(mapping, module),
                 module=module,
-                buffer_offset=buffer_offset,
             )
         )
     return index
 
 
-def mcore_hf_delta_entry(rec: McoreParamExport, place, lidx: torch.Tensor, lval: torch.Tensor, slot_cache: dict):
-    """Form-B probe: translate one mcore param's shard-local delta into its
-    final HF-coordinate entry ``(slots, dtype_str, counts, hf_idx, hf_val)``.
+def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval: torch.Tensor, slot_cache: dict):
+    """Probe one mcore param's shard-local delta into its final HF-coordinate
+    entry ``(slots, dtype_str, counts, hf_idx, hf_val)``.
 
-    Scatters the delta into a NaN buffer of the probe's input shape (the LOCAL
-    mcore param shape for replicated/expert params, the TP-full shape for TP
-    params -- other ranks' slices stay NaN), runs the degenerate-PG
-    ``megatron_to_hf`` (pure permutation), and extracts each output slot's
-    surviving positions. The slot list is cached after the first call (the
-    converter's output names are deterministic, so every rank's cache agrees
-    and the batched gather stays aligned)."""
-    spec = rec.spec
+    Scatters the delta into a NaN buffer of the LOCAL shard shape (exactly what
+    the real ``megatron_to_hf`` receives), runs the comm-stubbed probe -- real
+    group sizes, gathers synthesized locally, so the mapping executes its real
+    TP>1 code paths -- and extracts each output slot's surviving positions.
+    The slot list is cached after the first call (the converter's output names
+    are deterministic, so every rank's cache agrees and the batched gather
+    stays aligned)."""
     dtype_str = str(lval.dtype).replace("torch.", "")
+    assert lval.numel() == 0 or lval.is_floating_point(), (
+        f"{rec.megatron_name}: NaN sentinels require a floating-point param, got {lval.dtype}"
+    )
 
-    # The probe consumes the mcore-logical single-param shape. For expert params
-    # the engine-facing logical tensor prepends the ep dim; strip it for the
-    # probe buffer (dim 0 of the virtual tensor selects the expert, the probe
-    # sees one expert's ETP-full tensor).
-    is_expert_virtual = isinstance(place, BlockPlacement) and len(place.full_shape) == len(rec.param.shape) + 1
-    probe_shape = tuple(spec.full_shape[1:]) if is_expert_virtual else tuple(spec.full_shape)
-
-    buf = torch.full(probe_shape, float("nan"), dtype=lval.dtype, device=lval.device)
+    buf = torch.full(tuple(rec.param.shape), float("nan"), dtype=lval.dtype, device=lval.device)
     if lidx.numel():
-        g = translate_flat_indices(lidx, place)
-        if is_expert_virtual:
-            inner = 1
-            for x in probe_shape:
-                inner *= int(x)
-            g = g - int(place.global_offset[0]) * inner  # drop the ep-dim offset
-        buf.view(-1)[g] = lval
+        buf.view(-1)[lidx] = lval
 
     outs = rec.probe.megatron_to_hf(buf, rec.module)
 
