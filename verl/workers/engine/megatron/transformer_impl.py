@@ -855,9 +855,9 @@ class MegatronEngine(BaseEngine):
 
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield each rank's *local* mcore shard ``(name, local_flat_bf16,
-        ShardSpec)`` -- the geometry comes from the Megatron-Bridge param
-        mappings (TP partition dims, EP virtual expert tensors). Pure export,
-        no side effects. TP+EP only (PP=1 asserted in the index builder)."""
+        ShardSpec)`` -- the spec carries only the wire merge group (the
+        comm-stubbed probe owns all shard geometry). Pure export, no side
+        effects. TP+EP only (PP=1 asserted in the index builder)."""
         load_megatron_model_to_gpu(self.module, load_grad=False)
         index = self._mcore_export_index()
 
@@ -872,7 +872,8 @@ class MegatronEngine(BaseEngine):
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
         """mcore's per-param entry builder: probe the bridge's own converter
-        (degenerate-PG copy, pure transform) with NaN sentinels -- see
+        (comm-stubbed copy -- real group sizes, gathers synthesized locally)
+        with NaN sentinels -- see
         :func:`verl.workers.engine.megatron.delta_export.mcore_hf_delta_entry`."""
         from .delta_export import mcore_hf_delta_entry
 
