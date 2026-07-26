@@ -139,7 +139,7 @@ def test_prime_then_hf_delta_export_roundtrip():
     spec = ShardSpec(full_shape=(12,))
     snaps: dict = {}
 
-    prime_delta_snapshots(iter([("w", w.clone(), spec)]), snaps)
+    prime_delta_snapshots(iter([("w", w.clone(), spec)]), snaps, pin=False)
     assert "w" in snaps and snaps["w"].numel() == 12
 
     w2 = w.clone()
@@ -191,7 +191,7 @@ def test_hf_delta_export_converter_param():
     )
     w = torch.arange(12, dtype=torch.float32)
     snaps: dict = {}
-    prime_delta_snapshots(iter([("w", w.clone(), spec)]), snaps)
+    prime_delta_snapshots(iter([("w", w.clone(), spec)]), snaps, pin=False)
 
     w2 = w.clone()
     w2[5] = -1.0  # row 1, col 1
