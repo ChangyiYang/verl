@@ -195,9 +195,8 @@ class BaseEngine:
         Concrete here: it only consumes :meth:`get_per_tensor_param_shard`, so any
         engine that implements the shard export gets it for free.
         """
-        from verl.workers.engine.utils import prime_delta_snapshots
-
         from verl.utils.device import is_cuda_available
+        from verl.workers.engine.utils import prime_delta_snapshots
 
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
         gen, _ = self.get_per_tensor_param_shard()
