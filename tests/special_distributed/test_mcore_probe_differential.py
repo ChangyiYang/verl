@@ -226,9 +226,7 @@ def main():
                     # replicated params legitimately arrive from every rank --
                     # overlap only counts as failure when the values CONFLICT.
                     both = mask & (covered > 0)
-                    if both.any() and not torch.equal(
-                        merged[both].view(torch.int16), part[both].view(torch.int16)
-                    ):
+                    if both.any() and not torch.equal(merged[both].view(torch.int16), part[both].view(torch.int16)):
                         failures.append(f"{t.global_param_name}/{name}: conflicting rank contributions")
                     merged[mask] = part[mask]
                     covered[mask] += 1

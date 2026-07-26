@@ -137,10 +137,10 @@ def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tens
     for p in params:
         touched: dict = {}
 
-        def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, _touched=touched, **kwargs) -> torch.Tensor:
             key = (self.data_ptr(), self.numel(), self.dtype)
-            if key not in touched:
-                touched[key] = (self, self.detach().clone())
+            if key not in _touched:
+                _touched[key] = (self, self.detach().clone())
             return orig_copy(self, src, *args, **kwargs)
 
         torch.Tensor.copy_ = snap_then_copy_
