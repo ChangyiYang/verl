@@ -83,6 +83,23 @@ class _ProbeGroup:
         )
 
 
+_NAN_POOL: dict = {}
+
+
+def _nan_block(shape, dtype, device) -> torch.Tensor:
+    """Read-only all-NaN placeholder for another rank's gather chunk, pooled by
+    (shape, dtype, device): the gather stub hands these out on every probe call
+    for every param, and they are only ever READ (the transforms are functional),
+    so one block per distinct shape serves the whole model for the run's
+    lifetime instead of a fresh cudaMalloc+fill per param per sync."""
+    key = (tuple(shape), dtype, str(device))
+    t = _NAN_POOL.get(key)
+    if t is None:
+        t = torch.full(tuple(shape), float("nan"), dtype=dtype, device=device)
+        _NAN_POOL[key] = t
+    return t
+
+
 def _warm_lazy_mappings(mapping, module) -> None:
     """Force AutoMapping's lazy concrete delegate into existence: AutoMapping
     resolves its Column/Row/Replicated delegate on first use, snapshotting
@@ -126,8 +143,11 @@ def make_probe(mapping, module):
         def _gather_tp(tensor, _c=c):
             # what a real all_gather over the tp group would produce, minus the
             # other ranks' data: our shard rides at its true rank index, every
-            # other chunk is NaN (those ranks export their own contributions).
-            out = [torch.full_like(tensor, float("nan")) for _ in range(_c.tp_size)]
+            # other chunk is a pooled read-only NaN block (those ranks export
+            # their own contributions; transforms never write into their inputs,
+            # which the TP>1 bitwise differential revalidates).
+            nan = _nan_block(tensor.shape, tensor.dtype, tensor.device)
+            out = [nan] * _c.tp_size
             out[_c.tp_rank] = tensor
             return out
 
