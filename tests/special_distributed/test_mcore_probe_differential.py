@@ -47,7 +47,7 @@ TP = int(os.environ.get("TP_SIZE", "2"))
 def _build_tiny_hf_dir(rank: int) -> str:
     from transformers import AutoConfig
 
-    cfg_dir = f"/tmp/tiny_{MODEL_KIND}_probe_diff"
+    cfg_dir = f"/tmp/tiny_{MODEL_KIND}_probe_diff_v2"
     if MODEL_KIND == "qwen2":
         hf_config = AutoConfig.for_model(
             "qwen2",
@@ -102,17 +102,43 @@ def _build_tiny_hf_dir(rank: int) -> str:
             tie_word_embeddings=False,
         )
         hf_config.architectures = ["NemotronHForCausalLM"]
+    elif MODEL_KIND == "falcon_h1":
+        # mamba2+attention parallel-hybrid; mamba_n_heads/n_groups TP=2 divisible
+        hf_config = AutoConfig.for_model(
+            "falcon_h1",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            mamba_d_ssm=64,
+            mamba_n_heads=8,
+            mamba_d_head=8,
+            mamba_n_groups=2,
+            mamba_d_state=16,
+            mamba_d_conv=4,
+            mamba_expand=2,
+            mamba_chunk_size=32,
+            mamba_norm_before_gate=False,
+            vocab_size=512,
+            max_position_embeddings=256,
+            tie_word_embeddings=False,
+        )
+        hf_config.architectures = ["FalconH1ForCausalLM"]
     else:
         raise ValueError(f"unknown MODEL_KIND {MODEL_KIND!r}")
 
-    if MODEL_KIND == "nemotron_h":
+    if MODEL_KIND in ("nemotron_h", "falcon_h1"):
         # NemotronH's mixer pulls causal-conv1d / mamba-ssm kernels from the hub
         # at layer init; offline runs must fall back to the reference path.
         try:
             import transformers.integrations.hub_kernels as _hk
 
             _hk.lazy_load_kernel = lambda *a, **k: None
-            import transformers.models.nemotron_h.modeling_nemotron_h as _mnh
+            import importlib
+
+            _mnh = importlib.import_module(f"transformers.models.{MODEL_KIND}.modeling_{MODEL_KIND}")
 
             for _sym in ("lazy_load_kernel", "get_kernel"):
                 if hasattr(_mnh, _sym):
