@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
@@ -291,7 +292,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         collective.broadcast(pos_cp, src_rank=0, group_name=self.group_name)
         collective.broadcast(val_cp, src_rank=0, group_name=self.group_name)
 
-    def _publish_values_flush(self, params: list[DeltaParam], values: torch.Tensor, is_last: bool) -> None:
+    def _publish_values_flush(
+        self, params: list[DeltaParam], values: torch.Tensor, is_last: bool, verify: bool = False
+    ) -> None:
         """Publish a values-only (full-coverage, positions-free) flush -- used by the first
         sync. The wire encoding tag stays ``"dense"`` -- it is protocol, shared with the
         receiver's delta_loader decode."""
@@ -307,6 +310,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "val_dtype": str(values.dtype).replace("torch.", ""),
             "spec": {
                 "encoding": "dense",
+                "verify": verify,
+                "is_last": is_last,
                 "params": [vars(p) for p in params],
                 "checksum": int(_checksum(empty_pos, values)),
             },
@@ -401,6 +406,14 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # three collectives per parameter).
         self.batch_gather = int(batch_gather)
 
+    def _verify_due(self) -> bool:
+        """True on every K-th steady sync when ``VERL_DELTA_VERIFY_EVERY=K``."""
+        every = int(os.getenv("VERL_DELTA_VERIFY_EVERY", "0") or 0)
+        if every <= 0:
+            return False
+        self._steady_count = getattr(self, "_steady_count", 0) + 1
+        return self._steady_count % every == 0
+
     def _assemble_flush(self, per_param: list[_FlushPiece]) -> DeltaFlush:
         """Build one DeltaFlush (indices encoding) from rank 0's gathered per-param deltas.
 
@@ -456,6 +469,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         self,
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
+        verify: bool = False,
     ) -> dict[str, float] | None:
         """First sync: stream the backend's FULL HF export over the values-only wire.
 
@@ -494,7 +508,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         def _publish_values(pending, is_last: bool) -> None:
             nonlocal n_flushes, wire_bytes
             params, values = pending
-            self._publish_values_flush(params, values, is_last=is_last)
+            self._publish_values_flush(params, values, is_last=is_last, verify=verify)
             n_flushes += 1
             wire_bytes += int(values.nbytes)
 
@@ -511,7 +525,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             total_elems += int(flat.numel())
             bkt.add(_ValuesPiece(name, str(flat.dtype).replace("torch.", ""), list(tensor.shape), flat), flat.nbytes)
 
-        self._shard_seeded = True
+        if not verify:
+            self._shard_seeded = True
         if not is_r0:
             return
         bkt.seal()
@@ -527,7 +542,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # OOMs on tight mcore shapes otherwise).
         self._release_staging_pool("seed")
         logger.warning(
-            "delta-sharded FULL-SEED v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
+            "delta-sharded FULL-%s v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
+            "VERIFY" if verify else "SEED",
             global_steps,
             time.time() - t0,
             n_flushes,
@@ -610,13 +626,24 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             gq.put(pg, slots, dtype_str, counts, hf_idx, hf_val)
         gq.flush_all()
 
+        # VERL_DELTA_VERIFY_EVERY=K appends a full state-verification sweep to
+        # every K-th steady sync, inside the SAME receive session: the steady
+        # bucket keeps is_last unset and the sweep's final flush carries it. The
+        # receiver bit-compares each copy_ destination before overwriting and
+        # fails loud on any mismatch (see delta_loader._verify_dense).
+        verify = self._verify_due()
+        if is_r0:
+            bkt.seal()  # seal the final partial bucket into the pending flush
+            if bkt.pending is not None:
+                bkt.emit(is_last=not verify)
+            elif not verify:
+                self._publish_terminal(False)
+        if verify:
+            # collective on every rank: the full export assembles per tensor.
+            full, _ = engine.get_per_tensor_param()
+            self._send_full_seed(full, global_steps, verify=True)
         if not is_r0:
             return
-        bkt.seal()  # seal the final partial bucket into the pending flush
-        if bkt.pending is not None:
-            bkt.emit(is_last=True)
-        else:
-            self._publish_terminal(False)
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
         logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
         if not total_elems:
