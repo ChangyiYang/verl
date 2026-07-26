@@ -41,11 +41,14 @@ Register at server launch (verl config)::
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # Cap on the densified tensors handed to one model.load_weights call, matching
 # SGLang's own delta-apply chunking default.
@@ -74,6 +77,9 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
         )
 
     if spec["encoding"] == "dense":
+        if spec.get("verify"):
+            _verify_dense(model, spec["params"], values, bool(spec.get("is_last")))
+            return
         _apply_dense(model, spec["params"], values)
         return
 
@@ -108,6 +114,49 @@ def _apply_dense(model: torch.nn.Module, params: list[dict], values: torch.Tenso
         chunk_bytes += nbytes
     if chunk:
         model.load_weights(chunk)
+
+
+_VERIFY_STATS: dict = {"params": 0, "pieces": []}
+
+
+def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tensor, is_last: bool) -> None:
+    """State-equivalence sweep: the trainer streams its FULL current weights and
+    every ``copy_`` destination (the exact internal slice sglang's own
+    ``load_weights`` name-mapping resolves) is bit-compared against what the
+    server already holds BEFORE being overwritten. Zero mismatched elements
+    proves the server's delta-accumulated state was bit-identical to the
+    trainer's -- end to end, through sglang's own fusion/sharding mapping,
+    independent of generation or log-probs. Mismatches fail loud."""
+    orig_copy = torch.Tensor.copy_
+
+    def compare_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if isinstance(src, torch.Tensor) and src.is_floating_point() and self.shape == src.shape:
+            cast = src.to(self.dtype)
+            if self.dtype.is_floating_point and self.element_size() == 2:
+                diff = (self.view(torch.int16) != cast.view(torch.int16)).sum()
+            else:
+                diff = (self != cast).sum()
+            _VERIFY_STATS["pieces"].append(diff)  # stays on device; one sync at sweep end
+            return orig_copy(self, cast)
+        return orig_copy(self, src, *args, **kwargs)
+
+    torch.Tensor.copy_ = compare_then_copy_
+    try:
+        _apply_dense(model, params, values)
+    finally:
+        torch.Tensor.copy_ = orig_copy
+    _VERIFY_STATS["params"] += len(params)
+    if is_last:
+        total = int(torch.stack([d.cpu() for d in _VERIFY_STATS["pieces"]]).sum()) if _VERIFY_STATS["pieces"] else 0
+        n = _VERIFY_STATS["params"]
+        _VERIFY_STATS["params"] = 0
+        _VERIFY_STATS["pieces"] = []
+        logger.warning("DELTA-VERIFY sweep: params=%d mismatch_elems=%d", n, total)
+        if total:
+            raise RuntimeError(
+                f"delta state verification FAILED: {total} elements differ between the "
+                f"server's delta-accumulated weights and the trainer's full export"
+            )
 
 
 def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p: dict) -> torch.Tensor:
