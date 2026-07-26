@@ -142,7 +142,16 @@ def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tens
 
     torch.Tensor.copy_ = compare_then_copy_
     try:
-        _apply_dense(model, params, values)
+        # one param at a time so mismatches attribute to a name (this is a
+        # diagnostic sweep; the extra per-param sync is irrelevant next to the
+        # wire transfer itself)
+        by_param = _VERIFY_STATS.setdefault("by_param", {})
+        for p in params:
+            start = len(_VERIFY_STATS["pieces"])
+            _apply_dense(model, [p], values)
+            bad = sum(int(d.cpu()) for d in _VERIFY_STATS["pieces"][start:])
+            if bad:
+                by_param[p["name"]] = by_param.get(p["name"], 0) + bad
     finally:
         torch.Tensor.copy_ = orig_copy
     _VERIFY_STATS["params"] += len(params)
@@ -151,11 +160,14 @@ def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tens
         n = _VERIFY_STATS["params"]
         _VERIFY_STATS["params"] = 0
         _VERIFY_STATS["pieces"] = []
-        logger.warning("DELTA-VERIFY sweep: params=%d mismatch_elems=%d", n, total)
+        offenders = _VERIFY_STATS.pop("by_param", {})
+        top = sorted(offenders.items(), key=lambda kv: -kv[1])[:12]
+        logger.warning("DELTA-VERIFY sweep: params=%d mismatch_elems=%d offenders=%s", n, total, top)
         if total:
             raise RuntimeError(
                 f"delta state verification FAILED: {total} elements differ between the "
-                f"server's delta-accumulated weights and the trainer's full export"
+                f"server's delta-accumulated weights and the trainer's full export; "
+                f"top offenders: {top}"
             )
 
 
