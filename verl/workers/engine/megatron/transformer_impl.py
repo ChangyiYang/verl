@@ -76,6 +76,13 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class MegatronEngine(BaseEngine):
+    # mcore keeps model-parallel-local params resident and moves large host
+    # buffers every step; pinning the whole delta snapshot set on top of that
+    # starves the node's cudaHostAlloc pool and surfaces as CUDA OOM in
+    # unrelated allocations (observed at 30B/235B) -- pageable is the safe
+    # default here.
+    delta_pin_snapshots = False
+
     def __init__(
         self,
         model_config: HFModelConfig,

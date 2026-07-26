@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
@@ -396,10 +395,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 break
         logger.info("delta recv v=%s flushes=%d (yielded to server adapter)", global_steps, applied)
 
-    def __init__(self, *args, encoding: str = "indices", batch_gather: int = 32, **kwargs) -> None:
+    def __init__(
+        self, *args, encoding: str = "indices", batch_gather: int = 32, verify_every: int = 0, **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         assert encoding == "indices", f"delta_sharded ships only the 'indices' position encoding; got {encoding!r}"
         self.encoding = encoding
+        # every K-th steady sync appends a full state-verification sweep
+        # (0 = off); see _verify_due / delta_loader._verify_dense.
+        self.verify_every = int(verify_every)
         self._shard_seeded = False
         # Gather the per-param sparse deltas in groups of this many parameters
         # (one count-matrix all_gather + two padded gathers per group instead of
@@ -407,12 +411,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         self.batch_gather = int(batch_gather)
 
     def _verify_due(self) -> bool:
-        """True on every K-th steady sync when ``VERL_DELTA_VERIFY_EVERY=K``."""
-        every = int(os.getenv("VERL_DELTA_VERIFY_EVERY", "0") or 0)
-        if every <= 0:
+        """True on every K-th steady sync when constructed with ``verify_every=K``."""
+        if self.verify_every <= 0:
             return False
         self._steady_count = getattr(self, "_steady_count", 0) + 1
-        return self._steady_count % every == 0
+        return self._steady_count % self.verify_every == 0
 
     def _assemble_flush(self, per_param: list[_FlushPiece]) -> DeltaFlush:
         """Build one DeltaFlush (indices encoding) from rank 0's gathered per-param deltas.
@@ -514,7 +517,14 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
         bkt = _FlushBucket(self.bucket_size, _assemble_values, _publish_values)
 
+        seen_names: set = set()
         for name, tensor in weights:
+            # duplicate names in a full export mean two source params mapped to
+            # the same HF tensor -- the receiver would apply whichever came last
+            # and the delta diff base would silently disagree with the trainer
+            # (observed: NemotronH A_log). Fail loud instead.
+            assert name not in seen_names, f"full export yields duplicate HF tensor {name!r}"
+            seen_names.add(name)
             tensor = tensor.detach()
             if tensor.is_floating_point() and tensor.dtype != self.rollout_dtype:
                 tensor = tensor.to(self.rollout_dtype)
@@ -626,7 +636,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             gq.put(pg, slots, dtype_str, counts, hf_idx, hf_val)
         gq.flush_all()
 
-        # VERL_DELTA_VERIFY_EVERY=K appends a full state-verification sweep to
+        # verify_every=K (engine kwarg) appends a full state-verification sweep to
         # every K-th steady sync, inside the SAME receive session: the steady
         # bucket keeps is_last unset and the sweep's final flush carries it. The
         # receiver bit-compares each copy_ destination before overwriting and

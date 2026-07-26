@@ -223,20 +223,16 @@ def hf_delta_export(gen, snaps: dict, entry_fn):
         yield (*entry_fn(name, spec, place, lidx, lval), pg)
 
 
-def prime_delta_snapshots(gen, snaps: dict) -> None:
-    """Pin each rank's current shards to CPU as the steady diff base. Run right
-    after the seed's full-weight sync: weights do not move during the sync, so
-    the snapshots equal exactly what the rollout side received.
+def prime_delta_snapshots(gen, snaps: dict, pin: bool) -> None:
+    """Snapshot each rank's current shards to CPU as the steady diff base. Run
+    right after the seed's full-weight sync: weights do not move during the
+    sync, so the snapshots equal exactly what the rollout side received.
 
-    ``VERL_DELTA_PIN=0`` keeps the snapshots in pageable host memory: pinning a
-    whole shard set (cudaHostAlloc) competes with everything else that pins on
-    the node and its failure surfaces as a CUDA out-of-memory; pageable costs a
-    slower H2D on the diff read-back but cannot OOM the device."""
-    import os
-
-    from verl.utils.device import is_cuda_available
-
-    pin = is_cuda_available and os.getenv("VERL_DELTA_PIN", "1") == "1"
+    ``pin`` selects pinned vs pageable host memory and is the ENGINE's call
+    (``BaseEngine.delta_pin_snapshots``): pinning a whole shard set
+    (cudaHostAlloc) competes with everything else that pins on the node and its
+    failure surfaces as a CUDA out-of-memory; pageable costs a slower H2D on
+    the diff read-back but cannot OOM the device."""
     for name, local, _spec in gen:
         local = local.detach().contiguous().view(-1)
         snap = snaps.get(name)
