@@ -120,43 +120,46 @@ _VERIFY_STATS: dict = {"params": 0, "pieces": []}
 
 
 def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tensor, is_last: bool) -> None:
-    """State-equivalence sweep: the trainer streams its FULL current weights and
-    every ``copy_`` destination (the exact internal slice sglang's own
-    ``load_weights`` name-mapping resolves) is bit-compared against what the
-    server already holds BEFORE being overwritten. Zero mismatched elements
-    proves the server's delta-accumulated state was bit-identical to the
-    trainer's -- end to end, through sglang's own fusion/sharding mapping,
-    independent of generation or log-probs. Mismatches fail loud."""
+    """State-equivalence sweep, phrased as an IDEMPOTENCE check: replaying the
+    trainer's FULL current weights onto an in-sync server must be a no-op. For
+    each parameter we snapshot every ``copy_`` destination (the exact internal
+    slices sglang's own ``load_weights`` name-mapping resolves) BEFORE the
+    load, run the real load path -- including multi-stage loaders that first
+    write raw values and then transform in place (e.g. mamba's
+    ``A = -exp(A_log)`` composed loader) -- and bit-compare the post-load state
+    against the snapshot. Any changed element means the server's
+    delta-accumulated state disagreed with the trainer's; that fails loud.
+    Comparing per copy_ call instead would false-positive on every
+    transform-loaded param (raw-vs-transformed at each stage)."""
     orig_copy = torch.Tensor.copy_
 
-    def compare_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        if isinstance(src, torch.Tensor) and src.is_floating_point() and self.shape == src.shape:
-            cast = src.to(self.dtype)
-            if self.dtype.is_floating_point and self.element_size() == 2:
-                diff = (self.view(torch.int16) != cast.view(torch.int16)).sum()
-            else:
-                diff = (self != cast).sum()
-            _VERIFY_STATS["pieces"].append(diff)  # stays on device; one sync at sweep end
-            return orig_copy(self, cast)
-        return orig_copy(self, src, *args, **kwargs)
+    by_param = _VERIFY_STATS.setdefault("by_param", {})
+    for p in params:
+        touched: dict = {}
 
-    torch.Tensor.copy_ = compare_then_copy_
-    try:
-        # one param at a time so mismatches attribute to a name (this is a
-        # diagnostic sweep; the extra per-param sync is irrelevant next to the
-        # wire transfer itself)
-        by_param = _VERIFY_STATS.setdefault("by_param", {})
-        for p in params:
-            start = len(_VERIFY_STATS["pieces"])
+        def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+            key = (self.data_ptr(), self.numel(), self.dtype)
+            if key not in touched:
+                touched[key] = (self, self.detach().clone())
+            return orig_copy(self, src, *args, **kwargs)
+
+        torch.Tensor.copy_ = snap_then_copy_
+        try:
             _apply_dense(model, [p], values)
-            bad = sum(int(d.cpu()) for d in _VERIFY_STATS["pieces"][start:])
-            if bad:
-                by_param[p["name"]] = by_param.get(p["name"], 0) + bad
-    finally:
-        torch.Tensor.copy_ = orig_copy
+        finally:
+            torch.Tensor.copy_ = orig_copy
+        bad = 0
+        for dst, pre in touched.values():
+            if dst.is_floating_point() and dst.element_size() == 2:
+                bad += int((dst.view(torch.int16) != pre.view(torch.int16)).sum())
+            else:
+                bad += int((dst != pre).sum())
+        if bad:
+            by_param[p["name"]] = by_param.get(p["name"], 0) + bad
+        _VERIFY_STATS["pieces"].append(bad)
     _VERIFY_STATS["params"] += len(params)
     if is_last:
-        total = int(torch.stack([d.cpu() for d in _VERIFY_STATS["pieces"]]).sum()) if _VERIFY_STATS["pieces"] else 0
+        total = sum(_VERIFY_STATS["pieces"])
         n = _VERIFY_STATS["params"]
         _VERIFY_STATS["params"] = 0
         _VERIFY_STATS["pieces"] = []
