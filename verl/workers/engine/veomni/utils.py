@@ -181,7 +181,12 @@ def convert_row_to_hf(name, spec, r: int, pos_in_row, vals, ref):
     ``to_hf_chunk`` on it, and extract each output slot's surviving positions and
     values (the converter is a pure permutation, so non-NaN survivors are exactly
     the input pairs in final HF coordinates). Returns
-    ``[(slot_offset_in_row, idx_int32, val), ...]``, skipping empty slots."""
+    ``[(slot_offset_in_row, idx_int32, val), ...]``, skipping empty slots.
+
+    NaN is the sentinel, so a delta whose NEW value is literally NaN is
+    indistinguishable from "untouched" and silently dropped -- acceptable
+    because NaN weights are already a fatal training failure, and the
+    idempotence verify sweep surfaces the divergence on its next pass."""
     full_shape = spec.full_shape
     inner = max(_prodshape(full_shape[1:]), 1)
     slots_per_row = len(spec.hf_slots) // int(full_shape[0])
@@ -194,6 +199,11 @@ def convert_row_to_hf(name, spec, r: int, pos_in_row, vals, ref):
     res = []
     for s_i, (_hf_name, hf_tensor) in enumerate(outs):
         fl = hf_tensor.reshape(-1)
+        if fl.device != ref.device:
+            # handlers move outputs to the accelerator; under CPUOffloadPolicy the
+            # shard (and the rest of this entry) lives on CPU -- normalize so the
+            # gather queue never cats mixed-device pieces.
+            fl = fl.to(ref.device)
         p_ = (~torch.isnan(fl)).nonzero(as_tuple=False).view(-1)
         if p_.numel():
             res.append((s_i, p_.to(torch.int32), fl[p_]))
