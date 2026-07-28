@@ -69,9 +69,11 @@ class ShardSpec:
     # int flat offset or a BlockPlacement in a *virtual* full tensor, and
     # ``gather_group`` is the ProcessGroup covering every rank that holds a block
     # (pass a real group object -- the engine treats ``None`` as "unsharded").
-    # Every rank is assumed to contribute.
+    # ``contributes=False`` marks a rank whose block is a replica owned by a
+    # peer (e.g. HSDP replicate dims): it keeps lockstep with an empty delta.
     place: Optional[int | BlockPlacement] = None
     gather_group: Optional[ProcessGroup] = None
+    contributes: bool = True
     # Optional dim-0-separable converter: ``to_hf_chunk(dim0_start, segment)`` converts a
     # contiguous dim-0 segment ``full[dim0_start : dim0_start + segment.shape[0]]`` of the
     # logical tensor to ``[(hf_name, hf_tensor)]``. When set on a block-converter spec the
@@ -176,7 +178,8 @@ def derive_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, bool, Optio
 
     * unsharded (``mesh is None``) or fully replicated: ``0``; no group (the local
       tensor is already the full parameter). Explicit exporter overrides
-      (``spec.place``) may also be plain ``int`` offsets.
+      (``spec.place``) may also be plain ``int`` offsets and carry their own
+      ``spec.contributes`` (the exporter knows its replica structure).
     * any sharded geometry: a :class:`BlockPlacement` computed from
       ``compute_local_shape_and_global_offset`` (pure math, no collective). For a
       single Shard dim, only ranks at coordinate 0 of every Replicate dim
@@ -193,7 +196,7 @@ def derive_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, bool, Optio
     import torch.distributed as dist
 
     if spec.place is not None:
-        return spec.place, True, spec.gather_group
+        return spec.place, spec.contributes, spec.gather_group
 
     if spec.mesh is None:
         return 0, (dist.get_rank() == 0 if dist.is_initialized() else True), None
