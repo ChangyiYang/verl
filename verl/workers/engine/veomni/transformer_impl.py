@@ -588,13 +588,25 @@ class VeOmniEngine(FSDPEngine):
 
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield each rank's *local* shard ``(name, local_shard, ShardSpec)`` -- the
-        DTensor export plus veomni's EP declarations. Pure export, no side effects;
-        the mechanics live in :func:`verl.workers.engine.veomni.utils.veomni_shard_export`.
+        DTensor export plus veomni's EP declarations. The mechanics live in
+        :func:`verl.workers.engine.veomni.utils.veomni_shard_export`; this wrapper
+        owns the offload dance (CPUOffloadPolicy manages placement itself -- see
+        #5995 -- and the delta path returns early in update_weights, so the
+        offload-back happens here, after the exporter is exhausted).
         """
         from .utils import veomni_shard_export
 
-        load_veomni_model_to_gpu(self.module)
-        return veomni_shard_export(self.module)
+        manual_offload = not getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
+        if manual_offload:
+            load_veomni_model_to_gpu(self.module)
+        gen, meta = veomni_shard_export(self.module)
+
+        def _with_offload_back():
+            yield from gen
+            if manual_offload and self._is_offload_param:
+                offload_veomni_model_to_cpu(self.module)
+
+        return _with_offload_back(), meta
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
         """veomni's per-param entry builder: EP/converter specs (fused expert

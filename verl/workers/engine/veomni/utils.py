@@ -153,19 +153,20 @@ NO_SLOTS_MSG = (
 _SLOT_TABLES: dict = {}
 
 
-def enumerate_hf_slots(process_func, fqn, full_shape, dtype) -> list:
+def enumerate_hf_slots(process_func, fqn, full_shape, dtype, device=None) -> list:
     """Let the handler itself reveal its slot table: run it once per expert row
-    on a zero dummy segment (CPU, one expert) and record the ``(hf_name,
-    hf_shape)`` sequence in the handler's own output order. Same philosophy as
-    the mcore probe -- the converter owns its output structure, nothing is
-    hand-copied -- so ANY handler following the ``(name, segment,
-    expert_id_base)`` contract is supported, not just the default one.
-    Cached per (handler, fqn, shape, dtype): the export runs every sync but the
-    table is static, and the handler moves each dummy row to the device."""
+    on a zero dummy segment (one expert) and record the ``(hf_name, hf_shape)``
+    sequence in the handler's own output order. Same philosophy as the mcore
+    probe -- the converter owns its output structure, nothing is hand-copied --
+    so ANY handler following the ``(name, segment, expert_id_base)`` contract
+    is supported, not just the default one. Cached per (handler, fqn, shape,
+    dtype): the export runs every sync but the table is static. Pass the
+    param's device: the handler moves its outputs to the accelerator, so an
+    on-device dummy makes that a no-op view instead of a per-row H2D copy."""
     key = (process_func, fqn, tuple(int(x) for x in full_shape), dtype)
     got = _SLOT_TABLES.get(key)
     if got is None:
-        dummy = torch.zeros((1, *key[2][1:]), dtype=dtype)
+        dummy = torch.zeros((1, *key[2][1:]), dtype=dtype, device=device)
         got = []
         for r in range(key[2][0]):
             for nm, t in process_func(fqn, dummy, expert_id_base=r):
@@ -250,7 +251,9 @@ def veomni_shard_export(module):
     (dim-0 offset = ``ep_rank * n_local_experts`` + the DTensor block offset)
     with the world group as the gather group, and a ``to_hf_chunk`` closure over
     the veomni MoE param handler (pure slice + rename: fused -> per-expert HF
-    names) plus its ``hf_slots`` output enumeration.
+    names) plus its ``hf_slots`` output enumeration. ``ep_size=1`` is the same
+    geometry with the manual split degenerate; Replicate dims on the block mesh
+    (newer veomni HSDPs the expert block) dedupe via ``spec.contributes``.
     """
     import torch.distributed as dist
     from veomni.distributed import parallel_state
@@ -269,20 +272,32 @@ def veomni_shard_export(module):
 
     from ..spec import BlockPlacement, ShardSpec
 
+    # Structural fact source: ParallelPlan.apply hangs fqn -> SpecInfo on the
+    # model itself (it survives state_dict, unlike per-param attributes). Every
+    # param gets an entry when EP is on -- non-sliced ones with
+    # placement=Replicate() and the SAME para_name -- so the discriminator is
+    # the placement type, never ``para_name`` (veomni's own DCP checkpointer
+    # keys off ``isinstance(placement, Shard)`` too).
+    fqn2si = getattr(module, "_fqn2spec_info", None) or getattr(
+        getattr(module, "_fsdp_wrapped_module", module), "_fqn2spec_info", None
+    )
+
     def _is_ep_param(name, param):
-        # Structural check first: veomni's ParallelPlan.apply attaches
-        # ``spec_info`` (para_name="ep") to every expert-parallel-sliced param
-        # -- the sharding fact itself, not a naming convention. Params can lose
-        # the attribute across state_dict/key conversion, so fall back to the
-        # historical name match.
-        si = getattr(param, "spec_info", None)
-        if si is not None:
-            return si.para_name == "ep"
+        if fqn2si is not None:
+            si = fqn2si.get(name)
+            if si is not None:
+                from torch.distributed.tensor import Shard
+
+                return isinstance(si.placement, Shard)
+        # fallback: key conversion may have renamed the fqn; historical name match.
         return "mlp.experts." in name and any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])
 
     def _gen():
         for name, param in params.items():
-            is_expert = ps.ep_enabled and _is_ep_param(name, param)
+            # NOT gated on ep_enabled: the fused expert stack exists (and needs
+            # the per-expert HF renaming, like the seed path does) even with
+            # ep_size=1 -- that is just the degenerate ep_rank=0 geometry.
+            is_expert = _is_ep_param(name, param)
             if param.is_floating_point() and param.dtype != torch.bfloat16:
                 # mixed-precision keeps fp32 master weights; the wire (and the
                 # rollout side) speak bf16, so cast before diffing.
@@ -294,37 +309,51 @@ def veomni_shard_export(module):
                 continue
 
             # local fused block: [n_local_experts, ...] (ep split already applied)
+            contributes = True
             if isinstance(param, DTensor):
                 lshape, goff = compute_local_shape_and_global_offset(
                     param.shape, param.device_mesh, list(param.placements)
                 )
                 local = param.to_local()
+                # Replicate mesh dims (newer veomni HSDPs the expert block:
+                # (ep_replicate, ep_fsdp) mesh) yield identical blocks on every
+                # replica -- offsets are already 0 there, so the block math is
+                # untouched; only coord-0 ranks contribute, the rest keep
+                # lockstep with an empty delta.
+                coord = param.device_mesh.get_coordinate()
+                rep_dims = [d for d, p in enumerate(param.placements) if p.is_replicate()]
+                if coord is not None:
+                    contributes = all(int(coord[d]) == 0 for d in rep_dims)
             else:
                 lshape, goff = tuple(param.shape), (0,) * param.ndim
                 local = param
+            ep_size = ps.ep_size if ps.ep_enabled else 1
+            ep_rank = ps.ep_rank if ps.ep_enabled else 0
             n_local = int(param.shape[0])
-            full_shape = (n_local * ps.ep_size,) + tuple(param.shape[1:])
-            offset = (ps.ep_rank * n_local + int(goff[0]),) + tuple(int(o) for o in goff[1:])
+            full_shape = (n_local * ep_size,) + tuple(param.shape[1:])
+            offset = (ep_rank * n_local + int(goff[0]),) + tuple(int(o) for o in goff[1:])
             block = BlockPlacement(tuple(int(x) for x in lshape), offset, full_shape)
 
-            # the blocks of one expert tensor are spread over ep x (block fsdp);
-            # v1 requires that to cover the whole trainer world so the world
-            # group doubles as the gather group (rank 0 == engine master).
+            # the blocks of one expert tensor are spread over ep x (block mesh,
+            # replicas included); v1 requires that to cover the whole trainer
+            # world so the world group doubles as the gather group (rank 0 ==
+            # engine master). Replicas are deduplicated via ``contributes``.
             mesh_world = param.device_mesh.size() if isinstance(param, DTensor) else 1
-            assert ps.ep_size * mesh_world == dist.get_world_size(), (
-                f"expert blocks must tile the trainer world: ep={ps.ep_size} x "
+            assert ep_size * mesh_world == dist.get_world_size(), (
+                f"expert blocks must cover the trainer world: ep={ep_size} x "
                 f"block mesh={mesh_world} != world={dist.get_world_size()}"
             )
             spec = ShardSpec(
                 full_shape=full_shape,
                 place=block,
                 gather_group=dist.group.WORLD,
+                contributes=contributes,
                 # dim-0-separable: a segment is a run of whole experts starting at
                 # global expert id ``start`` -- exactly the handler's contract.
                 to_hf_chunk=lambda start, seg, _f=process_func, _n=name: list(_f(_n, seg, expert_id_base=start)),
                 # slot table enables sender-side conversion; probed once from
                 # the handler itself, so any handler is supported.
-                hf_slots=enumerate_hf_slots(process_func, name, full_shape, torch.bfloat16),
+                hf_slots=enumerate_hf_slots(process_func, name, full_shape, torch.bfloat16, device=local.device),
             )
             yield name, local.reshape(-1), spec
 
