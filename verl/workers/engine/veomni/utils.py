@@ -150,6 +150,30 @@ NO_SLOTS_MSG = (
 )
 
 
+_SLOT_TABLES: dict = {}
+
+
+def enumerate_hf_slots(process_func, fqn, full_shape, dtype) -> list:
+    """Let the handler itself reveal its slot table: run it once per expert row
+    on a zero dummy segment (CPU, one expert) and record the ``(hf_name,
+    hf_shape)`` sequence in the handler's own output order. Same philosophy as
+    the mcore probe -- the converter owns its output structure, nothing is
+    hand-copied -- so ANY handler following the ``(name, segment,
+    expert_id_base)`` contract is supported, not just the default one.
+    Cached per (handler, fqn, shape, dtype): the export runs every sync but the
+    table is static, and the handler moves each dummy row to the device."""
+    key = (process_func, fqn, tuple(int(x) for x in full_shape), dtype)
+    got = _SLOT_TABLES.get(key)
+    if got is None:
+        dummy = torch.zeros((1, *key[2][1:]), dtype=dtype)
+        got = []
+        for r in range(key[2][0]):
+            for nm, t in process_func(fqn, dummy, expert_id_base=r):
+                got.append((nm, tuple(int(x) for x in t.shape)))
+        _SLOT_TABLES[key] = got
+    return got
+
+
 def convert_row_to_hf(name, spec, r: int, pos_in_row, vals, ref):
     """NaN-probe one dim-0 row through the spec's converter: scatter the row's
     (within-row position, value) pairs into a NaN-filled row buffer, run
@@ -245,26 +269,6 @@ def veomni_shard_export(module):
 
     from ..spec import BlockPlacement, ShardSpec
 
-    def _expert_hf_slots(fqn, full_shape):
-        """Full (hf_name, hf_shape) slot table for one fused expert param, in dim-0
-        order matching the default handler's per-segment output order. Only valid
-        for the default handler (custom MOE_PARAM_HANDERS may rename differently),
-        so the caller attaches it only when process_func is the default."""
-        n_experts = int(full_shape[0])
-        slots = []
-        if "gate_up_proj" in fqn:
-            inter = int(full_shape[1]) // 2
-            inner = (inter, *(int(x) for x in full_shape[2:]))
-            for i in range(n_experts):
-                for proj in ("gate_proj", "up_proj"):
-                    nm = fqn.replace("gate_up_proj", proj)
-                    slots.append((nm.replace("mlp.experts.", f"mlp.experts.{i}.") + ".weight", inner))
-        else:
-            inner = tuple(int(x) for x in full_shape[1:])
-            for i in range(n_experts):
-                slots.append((fqn.replace("mlp.experts.", f"mlp.experts.{i}.") + ".weight", inner))
-        return slots
-
     def _is_ep_param(name, param):
         # Structural check first: veomni's ParallelPlan.apply attaches
         # ``spec_info`` (para_name="ep") to every expert-parallel-sliced param
@@ -318,9 +322,9 @@ def veomni_shard_export(module):
                 # dim-0-separable: a segment is a run of whole experts starting at
                 # global expert id ``start`` -- exactly the handler's contract.
                 to_hf_chunk=lambda start, seg, _f=process_func, _n=name: list(_f(_n, seg, expert_id_base=start)),
-                # slot table enables sender-side conversion; only the default
-                # handler's naming is enumerable without running the converter.
-                hf_slots=(_expert_hf_slots(name, full_shape) if process_func is default_moe_param_handler else None),
+                # slot table enables sender-side conversion; probed once from
+                # the handler itself, so any handler is supported.
+                hf_slots=enumerate_hf_slots(process_func, name, full_shape, torch.bfloat16),
             )
             yield name, local.reshape(-1), spec
 
