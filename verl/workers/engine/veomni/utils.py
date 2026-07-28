@@ -183,39 +183,42 @@ def enumerate_hf_slots(process_func, fqn, full_shape, dtype, device=None) -> lis
     return slots
 
 
-def convert_row_to_hf(name, spec, r: int, pos_in_row, vals, ref):
+def convert_row_to_hf(name, spec, expert_id: int, pos_in_row, vals, like):
     """NaN-probe one dim-0 row through the spec's converter: scatter the row's
     (within-row position, value) pairs into a NaN-filled row buffer, run
     ``to_hf_chunk`` on it, and extract each output slot's surviving positions and
     values (the converter is a pure permutation, so non-NaN survivors are exactly
-    the input pairs in final HF coordinates). Returns
-    ``[(slot_offset_in_row, idx_int32, val), ...]``, skipping empty slots.
+    the input pairs in final HF coordinates). ``like`` only lends its
+    dtype/device to the buffer. Returns
+    ``[(slot_in_row, idx_int32, val), ...]``, skipping empty slots.
 
     NaN is the sentinel, so a delta whose NEW value is literally NaN is
     indistinguishable from "untouched" and silently dropped -- acceptable
     because NaN weights are already a fatal training failure, and the
     idempotence verify sweep surfaces the divergence on its next pass."""
-    full_shape = spec.full_shape
-    inner = max(_prodshape(full_shape[1:]), 1)
-    slots_per_row = len(spec.hf_slots) // int(full_shape[0])
-    buf = torch.full((inner,), float("nan"), dtype=ref.dtype, device=ref.device)
-    buf[pos_in_row] = vals
-    outs = spec.to_hf_chunk(int(r), buf.view(1, *full_shape[1:]))
-    assert len(outs) == slots_per_row, (
-        f"{name}: to_hf_chunk gave {len(outs)} outputs/row, slot table expects {slots_per_row}"
+    row_shape = spec.full_shape[1:]
+    row_numel = max(_prodshape(row_shape), 1)
+    slots_per_row = len(spec.hf_slots) // int(spec.full_shape[0])
+
+    row_buf = torch.full((row_numel,), float("nan"), dtype=like.dtype, device=like.device)
+    row_buf[pos_in_row] = vals
+    hf_outputs = spec.to_hf_chunk(int(expert_id), row_buf.view(1, *row_shape))
+    assert len(hf_outputs) == slots_per_row, (
+        f"{name}: to_hf_chunk gave {len(hf_outputs)} outputs/row, slot table expects {slots_per_row}"
     )
-    res = []
-    for s_i, (_hf_name, hf_tensor) in enumerate(outs):
-        fl = hf_tensor.reshape(-1)
-        if fl.device != ref.device:
+
+    converted = []
+    for slot_in_row, (_hf_name, hf_tensor) in enumerate(hf_outputs):
+        flat = hf_tensor.reshape(-1)
+        if flat.device != like.device:
             # handlers move outputs to the accelerator; under CPUOffloadPolicy the
             # shard (and the rest of this entry) lives on CPU -- normalize so the
             # gather queue never cats mixed-device pieces.
-            fl = fl.to(ref.device)
-        p_ = (~torch.isnan(fl)).nonzero(as_tuple=False).view(-1)
-        if p_.numel():
-            res.append((s_i, p_.to(torch.int32), fl[p_]))
-    return res
+            flat = flat.to(like.device)
+        survivor_pos = (~torch.isnan(flat)).nonzero(as_tuple=False).view(-1)
+        if survivor_pos.numel():
+            converted.append((slot_in_row, survivor_pos.to(torch.int32), flat[survivor_pos]))
+    return converted
 
 
 def hf_entry_converter(name, spec, place, lidx, lval):
@@ -225,35 +228,37 @@ def hf_entry_converter(name, spec, place, lidx, lval):
     (zero counts when untouched) so the engine's batched gather stays aligned."""
     from verl.workers.engine.spec import translate_flat_indices
 
-    full_shape = spec.full_shape
-    inner = max(_prodshape(full_shape[1:]), 1)
-    K = len(spec.hf_slots)
-    slots_per_row = K // int(full_shape[0])
-    counts = torch.zeros(K, dtype=torch.int64)
+    row_numel = max(_prodshape(spec.full_shape[1:]), 1)
+    n_slots = len(spec.hf_slots)
+    slots_per_row = n_slots // int(spec.full_shape[0])
+    counts = torch.zeros(n_slots, dtype=torch.int64)
     idx_pieces: list = []
     val_pieces: list = []
     if lidx.numel():
-        g = translate_flat_indices(lidx, place)
-        order = torch.argsort(g)
-        g, gv = g[order], lval[order]
-        rows = torch.div(g, inner, rounding_mode="floor")
-        urows, rcounts = torch.unique_consecutive(rows, return_counts=True)
-        pos = 0
-        for r, cnt in zip(urows.tolist(), rcounts.tolist(), strict=False):
-            sel_g = g[pos : pos + cnt]
-            sel_v = gv[pos : pos + cnt]
-            pos += cnt
-            for s_i, pidx, pval in convert_row_to_hf(name, spec, r, sel_g - r * inner, sel_v, lval):
-                counts[int(r) * slots_per_row + s_i] = pidx.numel()
-                idx_pieces.append(pidx)
-                val_pieces.append(pval)
+        # shard-local flat positions -> full-tensor flat positions, sorted so
+        # every touched expert row becomes one contiguous run
+        full_idx = translate_flat_indices(lidx, place)
+        order = torch.argsort(full_idx)
+        full_idx, full_val = full_idx[order], lval[order]
+        row_of = torch.div(full_idx, row_numel, rounding_mode="floor")
+        touched_rows, run_lengths = torch.unique_consecutive(row_of, return_counts=True)
+        cursor = 0
+        for expert_id, run_len in zip(touched_rows.tolist(), run_lengths.tolist(), strict=False):
+            run_idx = full_idx[cursor : cursor + run_len]
+            run_val = full_val[cursor : cursor + run_len]
+            cursor += run_len
+            pos_in_row = run_idx - expert_id * row_numel
+            for slot_in_row, hf_idx, hf_val in convert_row_to_hf(name, spec, expert_id, pos_in_row, run_val, lval):
+                counts[int(expert_id) * slots_per_row + slot_in_row] = hf_idx.numel()
+                idx_pieces.append(hf_idx)
+                val_pieces.append(hf_val)
     if idx_pieces:
-        my_idx = torch.cat(idx_pieces)
-        my_val = torch.cat(val_pieces)
+        entry_idx = torch.cat(idx_pieces)
+        entry_val = torch.cat(val_pieces)
     else:
-        my_idx = torch.empty(0, dtype=torch.int32, device=lval.device)
-        my_val = torch.empty(0, dtype=lval.dtype, device=lval.device)
-    return spec.hf_slots, str(lval.dtype).replace("torch.", ""), counts, my_idx, my_val
+        entry_idx = torch.empty(0, dtype=torch.int32, device=lval.device)
+        entry_val = torch.empty(0, dtype=lval.dtype, device=lval.device)
+    return spec.hf_slots, str(lval.dtype).replace("torch.", ""), counts, entry_idx, entry_val
 
 
 def veomni_shard_export(module):
