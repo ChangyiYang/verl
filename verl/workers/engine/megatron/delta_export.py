@@ -264,6 +264,19 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
         f"{rec.megatron_name}: NaN sentinels require a floating-point param, got {lval.dtype}"
     )
 
+    cached = slot_cache.get(rec.megatron_name)
+    if lidx.numel() == 0 and cached is not None:
+        # empty delta: the slot table froze after the first probe, so the
+        # zero-count lockstep entry needs no probe run at all -- skip the
+        # buffer build, the transform and the full-output NaN scan.
+        return (
+            cached,
+            dtype_str,
+            torch.zeros(len(cached), dtype=torch.int64),
+            torch.empty(0, dtype=torch.int32, device=lval.device),
+            torch.empty(0, dtype=lval.dtype, device=lval.device),
+        )
+
     buf = torch.full(tuple(rec.param.shape), float("nan"), dtype=lval.dtype, device=lval.device)
     if lidx.numel():
         buf.view(-1)[lidx] = lval
