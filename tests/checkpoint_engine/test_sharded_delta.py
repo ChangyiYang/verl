@@ -56,15 +56,15 @@ def test_shard_delta_indices_no_change_is_empty():
     assert gval.numel() == 0
 
 
-def test_derive_placement_unsharded():
+def test_derive_dtensor_placement_unsharded():
     # A non-DTensor (replicated / unsharded) param: offset 0, no gather group,
     # and outside a process group rank 0 is assumed -> contributes.
-    from verl.workers.engine.spec import ShardSpec, derive_placement
+    from verl.workers.engine.spec import ShardSpec, derive_dtensor_placement
 
     t = torch.randn(64, 8, dtype=torch.bfloat16)
     spec = ShardSpec.from_param(t)
     assert spec.mesh is None and spec.full_shape == (64, 8)
-    offset, contributes, group = derive_placement(spec)
+    offset, contributes, group = derive_dtensor_placement(spec)
     assert offset == 0 and contributes is True and group is None
 
 
