@@ -155,24 +155,32 @@ _SLOT_TABLES: dict = {}
 
 def enumerate_hf_slots(process_func, fqn, full_shape, dtype, device=None) -> list:
     """Let the handler itself reveal its slot table: run it once per expert row
-    on a zero dummy segment (one expert) and record the ``(hf_name, hf_shape)``
-    sequence in the handler's own output order. Same philosophy as the mcore
-    probe -- the converter owns its output structure, nothing is hand-copied --
-    so ANY handler following the ``(name, segment, expert_id_base)`` contract
-    is supported, not just the default one. Cached per (handler, fqn, shape,
-    dtype): the export runs every sync but the table is static. Pass the
-    param's device: the handler moves its outputs to the accelerator, so an
-    on-device dummy makes that a no-op view instead of a per-row H2D copy."""
-    key = (process_func, fqn, tuple(int(x) for x in full_shape), dtype)
-    got = _SLOT_TABLES.get(key)
-    if got is None:
-        dummy = torch.zeros((1, *key[2][1:]), dtype=dtype, device=device)
-        got = []
-        for r in range(key[2][0]):
-            for nm, t in process_func(fqn, dummy, expert_id_base=r):
-                got.append((nm, tuple(int(x) for x in t.shape)))
-        _SLOT_TABLES[key] = got
-    return got
+    on a zero dummy row and record the ``(hf_name, hf_shape)`` sequence in the
+    handler's own output order. Same philosophy as the mcore probe -- the
+    converter owns its output structure, nothing is hand-copied -- so ANY
+    handler following the ``(name, segment, expert_id_base)`` contract is
+    supported, not just the default one.
+
+    The table is static metadata (names/shapes depend on the arguments only,
+    never on weight values), so it is enumerated once per (handler, fqn, shape,
+    dtype) and cached for the process lifetime -- the export calls this every
+    sync. Pass the param's device: the handler moves its outputs to the
+    accelerator, so an on-device dummy makes that a no-op view instead of a
+    per-row H2D copy."""
+    n_experts = int(full_shape[0])
+    row_shape = tuple(int(dim) for dim in full_shape[1:])
+    cache_key = (process_func, fqn, (n_experts, *row_shape), dtype)
+    cached = _SLOT_TABLES.get(cache_key)
+    if cached is not None:
+        return cached
+
+    dummy_row = torch.zeros((1, *row_shape), dtype=dtype, device=device)
+    slots = []
+    for expert_id in range(n_experts):
+        for hf_name, hf_tensor in process_func(fqn, dummy_row, expert_id_base=expert_id):
+            slots.append((hf_name, tuple(hf_tensor.shape)))
+    _SLOT_TABLES[cache_key] = slots
+    return slots
 
 
 def convert_row_to_hf(name, spec, r: int, pos_in_row, vals, ref):
