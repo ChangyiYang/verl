@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
@@ -506,36 +507,55 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             snap.copy_(flat, non_blocking=True)
             return lidx, lval
 
+        prof = {"sf": 0, "st": 0, "cc": 0, "ct": 0}  # scale flips / code bytes, changed vs total
         for rec in index:
             outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
             pg = rec.spec.gather_group
             group_rank = dist.get_rank(pg) if pg is not None else dist.get_rank()
-            slots = slot_cache.get(rec.megatron_name)
+            # rec.slots is the row-keyed UNION table (identical on every rank of
+            # the merge group); the local probe only covers this rank's rows.
+            slots = rec.slots if rec.slots is not None else slot_cache.get(rec.megatron_name)
             if slots is None:
                 slots = [(n, tuple(int(x) for x in t.shape)) for n, t in outs.items()]
                 slot_cache[rec.megatron_name] = slots
             buckets: dict = {}  # dtype -> (slot list, counts list, idx pieces, val pieces)
 
-            def _emit(sname, sshape, flat, key, contributes=True, buckets=buckets):
+            def _emit(sname, sshape, flat, key, contributes=True, buckets=buckets, prof=prof):
                 got = _snap_diff(key, flat)
                 b = buckets.setdefault(flat.dtype, ([], [], [], []))
                 b[0].append((sname, tuple(sshape)))
+                kind = key[2]
+                if kind == "c":
+                    prof["ct"] += flat.numel()
+                elif kind == "s" and contributes:
+                    prof["st"] += flat.numel()
                 if got is None or not contributes:
                     b[1].append(0)
                     return
                 lidx, lval = got
+                if kind == "c":
+                    prof["cc"] += int(lidx.numel())
+                elif kind == "s":
+                    prof["sf"] += int(lidx.numel())
                 b[1].append(int(lidx.numel()))
                 if lidx.numel():
                     b[2].append(lidx.to(torch.int32))
                     b[3].append(lval)
 
-            for sname, _sshape in slots:
-                t = outs[sname]
-                if t.dim() == 2 and helper.should_quantize_param(sname):
-                    codes, descale = sharded_scaled_fp8_blockwise(
-                        t.to(torch.bfloat16), block, 0, tuple(t.shape), group=pg
+            for sname, sshape in slots:
+                t = outs.get(sname)
+                if len(sshape) == 2 and helper.should_quantize_param(sname):
+                    # union rows owned by other ranks still join the absmax
+                    # all_reduce (empty shard -> zero partial grid) so the
+                    # group's collectives stay in lockstep; their codes row
+                    # is empty and gathers as a zero-count entry.
+                    shard = (
+                        t.to(torch.bfloat16)
+                        if t is not None
+                        else torch.empty((0, sshape[1]), dtype=torch.bfloat16, device=rec.param.device)
                     )
-                    _emit(sname, codes.shape, codes.reshape(-1), (rec.megatron_name, sname, "c"))
+                    codes, descale = sharded_scaled_fp8_blockwise(shard, block, 0, tuple(sshape), group=pg)
+                    _emit(sname, sshape, codes.reshape(-1), (rec.megatron_name, sname, "c"))
                     _emit(
                         sname + "_scale_inv",
                         descale.shape,
@@ -544,8 +564,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                         contributes=(group_rank == 0),
                     )
                 else:
-                    flat = t.to(torch.bfloat16).reshape(-1)
-                    _emit(sname, t.shape, flat, (rec.megatron_name, sname, "b"))
+                    flat = (
+                        t.to(torch.bfloat16).reshape(-1)
+                        if t is not None
+                        else torch.empty(0, dtype=torch.bfloat16, device=rec.param.device)
+                    )
+                    _emit(sname, sshape, flat, (rec.megatron_name, sname, "b"))
 
             if prime_only:
                 continue
@@ -558,6 +582,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     hf_idx = torch.empty(0, dtype=torch.int32, device=rec.param.device)
                     hf_val = torch.empty(0, dtype=dtype, device=rec.param.device)
                 yield (slot_list, str(dtype).replace("torch.", ""), counts, hf_idx, hf_val, pg)
+
+        if not prime_only and os.environ.get("VERL_DELTA_PROFILE"):
+            logger.info(
+                "AMAX-PROFILE scale_flips=%d/%d blocks code_changed=%d/%d bytes",
+                prof["sf"],
+                prof["st"],
+                prof["cc"],
+                prof["ct"],
+            )
 
     def _quantized_stream(self, weights):
         """Wrap the full HF export with rollout-scheme fp8 quantization: for

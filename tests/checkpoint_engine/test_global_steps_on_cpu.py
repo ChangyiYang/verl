@@ -23,7 +23,7 @@ class _FakeTrainerEngine:
     def __init__(self):
         self.weights = [("w", object())]
 
-    def get_per_tensor_param(self):
+    def get_per_tensor_param(self, **kwargs):
         return iter(self.weights), None
 
 

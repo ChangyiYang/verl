@@ -756,7 +756,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # sglang's online fp8 path quantizes incoming bf16 itself; QAT's
             # exporter would hand it NVFP4-packed serving weights instead.
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
-                raw_master=self.config.rollout.get("quantization", None) == "fp8"
+                raw_master=getattr(self.config.rollout, "quantization", None) == "fp8"
             )
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return metrics or {}
@@ -773,7 +773,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # QAT's exporter emits the vLLM serving format (e.g. NVFP4-packed
         # codes); sglang's online fp8 path quantizes incoming bf16 itself, so
         # it must see the raw master weights instead.
-        raw_master = self.config.rollout.get("quantization", None) == "fp8"
+        raw_master = getattr(self.config.rollout, "quantization", None) == "fp8"
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=True, raw_master=raw_master
         )
