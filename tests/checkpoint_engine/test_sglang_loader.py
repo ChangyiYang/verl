@@ -41,6 +41,13 @@ class _FakeModel:
         for name, tensor in chunk:
             self.params[name].copy_(tensor)
 
+    # the storage-scoped masked copy consults these, like any nn.Module
+    def named_parameters(self):
+        return iter(self.params.items())
+
+    def named_buffers(self):
+        return iter(())
+
 
 def _make_named(dtype=torch.bfloat16) -> list[tuple[str, torch.Tensor]]:
     torch.manual_seed(0)
@@ -83,12 +90,14 @@ def _sparse_indices_flush(old_named, new_named):
     return params, positions, values
 
 
-def _named_tensors(params, positions, values, encoding="indices"):
+def _named_tensors(params, positions, values, encoding="indices", extra_spec=None):
     spec = {
         "encoding": encoding,
         "params": [vars(p) for p in params],
         "checksum": int(checksum(positions, values)),
     }
+    if extra_spec:
+        spec.update(extra_spec)
     spec_t = torch.frombuffer(bytearray(json.dumps(spec).encode()), dtype=torch.uint8)
     out = [("__delta_spec__", spec_t), ("__values__", values.clone())]
     if positions.numel():
@@ -227,3 +236,67 @@ def test_verify_sweep_fails_loud_on_divergence():
     model = _FakeModel(diverged)
     with pytest.raises(RuntimeError, match="verification FAILED"):
         apply_delta(model, _dense_verify_flush(named))
+
+
+class _ScratchCopyModel(_FakeModel):
+    """A loader that also copies the incoming (NaN-masked) tensor into a
+    scratch buffer on the way -- the exact pattern quant loaders use for
+    repacking. Scratch writes must keep VANILLA copy semantics (NaNs pass
+    through); only the param write is masked."""
+
+    def __init__(self, named):
+        super().__init__(named)
+        self.scratch = {n: torch.zeros_like(t) for n, t in named}
+
+    def load_weights(self, chunk):
+        for name, tensor in chunk:
+            self.scratch[name].copy_(tensor)  # NOT model state: no masking
+            self.params[name].copy_(tensor)
+
+
+def test_masked_copy_scoped_to_param_storage():
+    """NaN-masked overlay applies to param storages only: a scratch copy in the
+    same load path receives the NaN sentinels verbatim."""
+    named = _make_named()
+    model = _ScratchCopyModel(named)
+    new_named = [(n, t.clone()) for n, t in named]
+    new_named[0][1][3, 5] = 42.0
+    params, positions, values = _sparse_indices_flush(named, new_named)
+    apply_delta(model, _named_tensors(params, positions, values))
+
+    assert model.params["layer.0.weight"][3, 5] == 42.0
+    untouched = ~torch.isnan(model.params["layer.0.weight"])
+    assert untouched.all(), "param must never hold NaN after a masked apply"
+    scr = model.scratch["layer.0.weight"]
+    assert torch.isnan(scr).sum() == scr.numel() - 1, "scratch copy must receive the NaN mask verbatim"
+    assert scr[3, 5] == 42.0
+
+
+class _PostLoadModel(_FakeModel):
+    """Records that post_load_weights ran, and that it ran with VANILLA copy_
+    semantics (a NaN source must write through -- proving the masked patch is
+    off by the time derived tensors recompute)."""
+
+    def __init__(self, named):
+        super().__init__(named)
+        self.post_load_calls = 0
+        self.probe = torch.zeros(4)
+
+    def post_load_weights(self):
+        self.post_load_calls += 1
+        self.probe.copy_(torch.full((4,), float("nan")))
+
+
+def test_post_load_weights_runs_unpatched_on_last_flush():
+    named = _make_named()
+    model = _PostLoadModel(named)
+    new_named = [(n, t.clone()) for n, t in named]
+    new_named[0][1][0, 0] = 7.0
+    params, positions, values = _sparse_indices_flush(named, new_named)
+
+    apply_delta(model, _named_tensors(params, positions, values))
+    assert model.post_load_calls == 0, "non-final flush must not trigger post_load_weights"
+
+    apply_delta(model, _named_tensors(params, positions, values, extra_spec={"is_last": True}))
+    assert model.post_load_calls == 1
+    assert torch.isnan(model.probe).all(), "post_load_weights must run with vanilla copy_ semantics"

@@ -40,6 +40,8 @@ Register at server launch (verl config)::
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import json
 import logging
 import math
@@ -84,7 +86,7 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
         return
 
     encoding = spec["encoding"]
-    with _masked_copy():
+    with _masked_copy(_param_storage_index(model)):
         chunk: list[tuple[str, torch.Tensor]] = []
         chunk_bytes = 0
         for p in spec["params"]:
@@ -97,6 +99,15 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
             chunk_bytes += nbytes
         if chunk:
             model.load_weights(chunk)
+
+    # Derived tensors (fp8 scales after requant, MLA w_kc/w_vc, MoE biases)
+    # recompute from the now-final weights. Outside the masked-copy patch on
+    # purpose: their writes are wholesale transforms, not sparse overlays --
+    # sglang's own update_weights_from_tensor path does not trigger this hook,
+    # so the delta loader replicates the full-load semantics itself once per
+    # sync (the engine marks the sync's final flush with ``is_last``).
+    if spec.get("is_last") and hasattr(model, "post_load_weights"):
+        model.post_load_weights()
 
 
 def _apply_dense(model: torch.nn.Module, params: list[dict], values: torch.Tensor) -> None:
@@ -199,14 +210,45 @@ def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p:
     return flat.view(p["shape"])
 
 
+def _param_storage_index(model: torch.nn.Module) -> list[tuple[int, int]]:
+    """Sorted, merged ``(start, end)`` byte intervals of every parameter's and
+    persistent buffer's storage. The masked-copy patch consults this so its
+    skip-NaN semantics apply ONLY to writes that land in model state: any other
+    ``copy_`` a loader performs on the way (scratch buffers, repacking temps,
+    quant workspaces) must keep vanilla semantics, NaNs and all. Rebuilt per
+    flush -- a named_parameters walk, microseconds against a wire decode."""
+    spans = []
+    for _, t in itertools.chain(model.named_parameters(), model.named_buffers()):
+        if t.device.type == "meta" or t.numel() == 0:
+            continue
+        base = t.untyped_storage().data_ptr()
+        spans.append((base, base + t.untyped_storage().nbytes()))
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _in_param_storage(index: list[tuple[int, int]], t: torch.Tensor) -> bool:
+    ptr = t.data_ptr()
+    i = bisect.bisect_right(index, (ptr, float("inf"))) - 1
+    return i >= 0 and index[i][0] <= ptr < index[i][1]
+
+
 @contextmanager
-def _masked_copy() -> Iterator[None]:
+def _masked_copy(storage_index: list[tuple[int, int]]) -> Iterator[None]:
     """Temporarily make ``Tensor.copy_`` skip NaN positions in the source.
 
     SGLang's per-model ``load_weights`` ultimately lands on ``param.copy_(loaded)``
     (possibly on a narrowed TP slice). Under this context a NaN-masked source
     overwrites only the changed positions; fully dense sources (e.g. the first
-    full-seed flush) take the original fast path untouched.
+    full-seed flush) take the original fast path untouched. The masked
+    semantics are scoped to destinations inside ``storage_index`` (model
+    params/buffers): any other copy a loader performs passes through vanilla.
     """
     orig_copy = torch.Tensor.copy_
 
@@ -216,7 +258,12 @@ def _masked_copy() -> Iterator[None]:
         # parameter -- ruinous for MoE flushes carrying >10k per-expert
         # entries. ``torch.where`` keeps everything on-stream; a NaN-free
         # (dense) source degenerates to a plain copy.
-        if isinstance(src, torch.Tensor) and src.is_floating_point() and self.shape == src.shape:
+        if (
+            isinstance(src, torch.Tensor)
+            and src.is_floating_point()
+            and self.shape == src.shape
+            and _in_param_storage(storage_index, self)
+        ):
             cast = src.to(self.dtype)
             return orig_copy(self, torch.where(torch.isnan(cast), self, cast))
         return orig_copy(self, src, *args, **kwargs)
