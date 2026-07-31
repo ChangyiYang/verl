@@ -516,7 +516,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 slot_cache[rec.megatron_name] = slots
             buckets: dict = {}  # dtype -> (slot list, counts list, idx pieces, val pieces)
 
-            def _emit(sname, sshape, flat, key, contributes=True):
+            def _emit(sname, sshape, flat, key, contributes=True, buckets=buckets):
                 got = _snap_diff(key, flat)
                 b = buckets.setdefault(flat.dtype, ([], [], [], []))
                 b[0].append((sname, tuple(sshape)))

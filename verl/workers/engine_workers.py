@@ -766,8 +766,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. determine if we need a base weight sync (adapter path only)
+        # QAT's exporter emits the vLLM serving format (e.g. NVFP4-packed
+        # codes); sglang's online fp8 path quantizes incoming bf16 itself, so
+        # it must see the raw master weights instead.
+        raw_master = self.config.rollout.get("quantization", None) == "fp8"
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
+            layered_summon=self.layered_summon, base_sync_done=True, raw_master=raw_master
         )
 
         do_lora_base_sync = False
@@ -778,7 +782,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
             per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=False
+                layered_summon=self.layered_summon, base_sync_done=False, raw_master=raw_master
             )
             await self.rollout.update_weights(
                 per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
