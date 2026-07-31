@@ -846,6 +846,13 @@ class MegatronEngine(BaseEngine):
                     per_tensor_param, model_type=self.model_config.hf_config.model_type
                 )
 
+        # QAT injects observer params (*_quantizer.*) that have no HF mapping:
+        # the bridge leaves None rows in its task list and (as of 0.6.0) its
+        # export stream dereferences them. Prefilter and hand the tasks in.
+        if self._qat_enabled and not self.vanilla_bridge:
+            tasks = [t for t in self.bridge.get_conversion_tasks(self.module) if t is not None]
+            per_tensor_param = self.bridge.export_hf_weights(self.module, conversion_tasks=tasks)
+
         # QAT: process weights through QATWeightExporter for quantized weight sync to vLLM
         if self._qat_enabled:
             from verl.utils.modelopt import export_qat_weights

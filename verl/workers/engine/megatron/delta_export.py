@@ -212,6 +212,10 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
     tasks = bridge.get_conversion_tasks(megatron_model)
     index: list[McoreParamExport] = []
     for task in tasks:
+        if task is None:
+            # unmapped global name (e.g. QAT observer params): outside the
+            # bridge's export scope, nothing to ship
+            continue
         mapping = task.mapping
         param = task.param_weight
         name = task.global_param_name
