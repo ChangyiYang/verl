@@ -341,3 +341,52 @@ def test_dense_bytes_flush_mixed_dtypes():
 
     assert torch.equal(model.params["a.weight"].view(torch.int16), w_bf16.view(torch.int16))
     assert torch.equal(model.params["a.weight_scale_inv"], w_fp32)
+
+
+def test_sparse_bytes_flush_fp8_codes_and_scales():
+    """A3 wire: quant-domain sparse flush -- fp8 code delta + fp32 scale delta
+    in one byte-packed indices flush; masked apply touches only the changed
+    positions (fp8 NaN sentinel = all-ones magnitude byte)."""
+    codes = torch.randn(16, 8).to(torch.float8_e4m3fn)
+    scales = torch.rand(2, 1, dtype=torch.float32) + 0.5
+    model = _FakeModel([("w.weight", codes.clone()), ("w.weight_scale_inv", scales.clone())])
+
+    new_codes = codes.clone()
+    new_codes[3, 5] = torch.tensor(0.5).to(torch.float8_e4m3fn)
+    new_scales = scales.clone()
+    new_scales[1, 0] = 9.0
+
+    params, idx_pieces, val_pieces = [], [], []
+    pos_off = val_off = 0
+    for name, old, new in [("w.weight", codes, new_codes), ("w.weight_scale_inv", scales, new_scales)]:
+        fo, fn = old.reshape(-1).view(torch.uint8), new.reshape(-1).view(torch.uint8)
+        esz = old.element_size()
+        changed = (fo.view(-1, esz) != fn.view(-1, esz)).any(dim=-1) if esz > 1 else (fo != fn)
+        idx = changed.nonzero(as_tuple=False).view(-1)
+        nnz = int(idx.numel())
+        assert nnz > 0
+        idx_pieces.append(idx.to(torch.int32))
+        val_pieces.append(fn.view(-1, esz)[idx].reshape(-1))
+        params.append(
+            DeltaParam(
+                name=name,
+                dtype=str(new.dtype).replace("torch.", ""),
+                shape=list(new.shape),
+                pos_start=pos_off,
+                pos_end=pos_off + nnz * 4,
+                pos_width=4,
+                val_start=val_off,
+                val_end=val_off + nnz * esz,
+            )
+        )
+        pos_off += nnz * 4
+        val_off += nnz * esz
+    positions = torch.cat(idx_pieces).contiguous().view(torch.uint8)
+    values = torch.cat(val_pieces)
+    flush = _named_tensors(params, positions, values, encoding="indices", extra_spec={"values_bytes": True})
+    apply_delta(model, flush)
+
+    got = model.params["w.weight"].view(torch.uint8)
+    want = new_codes.view(torch.uint8)
+    assert torch.equal(got, want), "fp8 codes must match bit-for-bit after masked apply"
+    assert torch.equal(model.params["w.weight_scale_inv"], new_scales)

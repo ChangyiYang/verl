@@ -88,11 +88,12 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
         return
 
     encoding = spec["encoding"]
+    values_bytes = bool(spec.get("values_bytes"))
     with _masked_copy(_param_storage_index(model)):
         chunk: list[tuple[str, torch.Tensor]] = []
         chunk_bytes = 0
         for p in spec["params"]:
-            t = _decode_one(encoding, positions, values, p)
+            t = _decode_one(encoding, positions, values, p, values_bytes)
             nbytes = t.numel() * t.element_size()
             if chunk and chunk_bytes + nbytes > CHUNK_BYTES:
                 model.load_weights(chunk)
@@ -202,19 +203,21 @@ def _verify_dense(
             )
 
 
-def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p: dict) -> torch.Tensor:
+def _decode_one(
+    encoding: str, positions: torch.Tensor, values: torch.Tensor, p: dict, values_bytes: bool = False
+) -> torch.Tensor:
     """Densify one param's sparse delta into a full-shape NaN-masked tensor.
 
     ``indices`` positions are reinterpreted via an int32 view (8 B/element
     transient) rather than a per-byte int64 unpack (32 B/element), so even a
     full-seed flush of a large embedding stays within a few GiB.
+    ``values_bytes`` marks a mixed-dtype flush: value offsets are BYTE offsets
+    into a uint8 blob and each slice is reinterpreted (the clone re-bases to
+    storage offset 0 for the dtype view).
     """
     numel = math.prod(p["shape"])
     dtype = getattr(torch, p["dtype"])
-    flat = torch.full((numel,), float("nan"), dtype=dtype, device=values.device)
     vals = values[p["val_start"] : p["val_end"]]
-    if vals.numel() == 0:
-        return flat.view(p["shape"])
 
     pos_b = positions[p["pos_start"] : p["pos_end"]]
     if encoding == "indices":
@@ -223,7 +226,21 @@ def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p:
     else:
         raise ValueError(f"unsupported delta encoding: {encoding!r}")
 
-    flat.index_copy_(0, idx, vals.to(dtype))
+    if dtype.itemsize == 1:
+        # float8 codes: torch's float8 kernel coverage (index_copy, full-with-
+        # nan) is spotty across builds; densify entirely in byte space -- the
+        # NaN sentinel is the all-ones magnitude byte and positions map 1:1.
+        flat_u8 = torch.full((numel,), 0x7F, dtype=torch.uint8, device=values.device)
+        if vals.numel():
+            flat_u8.index_copy_(0, idx, vals.clone().view(torch.uint8))
+        return flat_u8.view(dtype).view(p["shape"])
+
+    flat = torch.full((numel,), float("nan"), dtype=dtype, device=values.device)
+    if vals.numel() == 0:
+        return flat.view(p["shape"])
+    if values_bytes:
+        vals = vals.clone().view(dtype)
+    flat.index_copy_(0, idx, vals if values_bytes else vals.to(dtype))
     return flat.view(p["shape"])
 
 
@@ -282,6 +299,14 @@ def _masked_copy(storage_index: list[tuple[int, int]]) -> Iterator[None]:
             and _in_param_storage(storage_index, self)
         ):
             cast = src.to(self.dtype)
+            if cast.element_size() == 1:
+                # float8 masked overlay entirely in byte space: NaN sentinel is
+                # the all-ones magnitude byte (isnan/where on float8 are not
+                # portable across torch builds; uint8 ops are).
+                cu8 = cast.contiguous().view(torch.uint8)
+                nan_mask = (cu8 & 0x7F) == 0x7F
+                merged = torch.where(nan_mask, self.contiguous().view(torch.uint8), cu8)
+                return orig_copy(self, merged.view(self.dtype))
             return orig_copy(self, torch.where(torch.isnan(cast), self, cast))
         return orig_copy(self, src, *args, **kwargs)
 

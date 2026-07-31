@@ -183,6 +183,9 @@ class BaseEngine:
     # on the node; backends whose memory profile makes that competition
     # dangerous override this to False (see MegatronEngine).
     delta_pin_snapshots: bool = True
+    # True when get_per_tensor_param_shard yields HF-coordinate shards (DTensor
+    # backends): enables shard-local quant-domain delta (fp8 sparse steady).
+    delta_shards_are_hf: bool = False
 
     def prime_delta_snapshots(self) -> None:
         """

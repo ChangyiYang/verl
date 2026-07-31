@@ -173,7 +173,11 @@ class _GatherQueue:
         self._queues: dict[int, tuple] = {}  # id(pg) -> (pg, [entries])
 
     def put(self, pg, slots: list, dtype_str: str, counts: torch.Tensor, idx: torch.Tensor, val: torch.Tensor):
-        _pg, entries = self._queues.setdefault(id(pg), (pg, []))
+        # one queue per (group, value dtype): batches concatenate values, so a
+        # batch must be dtype-homogeneous (fp8 codes / fp32 scales / bf16 mix
+        # under quant mode). Entry order and dtypes are identical on every
+        # rank, so the partition stays in lockstep.
+        _pg, entries = self._queues.setdefault((id(pg), val.dtype), (pg, []))
         entries.append((slots, dtype_str, counts, idx, val))
         if len(entries) >= self.batch_k:
             self._flush(pg, entries)
@@ -273,6 +277,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "val_dtype": str(flush.values_gpu.dtype).replace("torch.", ""),
             "spec": {
                 "encoding": self.encoding,
+                "values_bytes": self.quantize_fp8,
                 "params": [vars(p) for p in flush.params],
                 "checksum": int(flush.checksum),
             },
@@ -421,11 +426,53 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # full-resync per sync (the quant-domain sparse steady path lands
         # next); the wire is already half the bf16 bytes per element.
         self.quantize_fp8 = bool(quantize_fp8)
+        self._fp8_snaps: dict = {}
         self._shard_seeded = False
         # Gather the per-param sparse deltas in groups of this many parameters
         # (one count-matrix all_gather + two padded gathers per group instead of
         # three collectives per parameter).
         self.batch_gather = int(batch_gather)
+
+    def _fp8_shard_stream(self, gen):
+        """STEADY-side transform for fp8 mode: turn the backend's raw shard
+        stream into the ROLLOUT-domain shard stream. Every quantizable 2D
+        weight becomes two pseudo-params -- its fp8 code shard (same placement
+        spec: codes are elementwise with the weight) and the fp32 scale grid
+        (identical on every rank after the amax all_reduce, so a replicated
+        spec lets rank 0 alone ship scale deltas). Everything else passes
+        through in bf16. Downstream (snapshot prime, byte-diff, gather, wire)
+        is the stock steady pipeline: rollout state = codes + scales, and both
+        are just tensors to diff."""
+        from verl.utils.fp8_sharded import sharded_scaled_fp8_blockwise
+        from verl.workers.engine.spec import ShardSpec, derive_dtensor_placement
+
+        helper = self._fp8_helper()
+        block = helper.quant_config.get("weight_block_size", [128, 128])
+        for name, flat, spec in gen:
+            full_shape = tuple(int(x) for x in spec.full_shape)
+            if len(full_shape) != 2 or not helper.should_quantize_param(name):
+                yield name, flat, spec
+                continue
+            place, _contributes, pg = (
+                (spec.place, spec.contributes, spec.gather_group)
+                if spec.place is not None
+                else derive_dtensor_placement(spec)
+            )
+            cols = full_shape[1]
+            flat_off = place if isinstance(place, int) else place.flat_offset
+            assert flat_off % cols == 0 and flat.numel() % cols == 0, (
+                f"{name}: fp8 steady expects dim-0 row shards (offset {flat_off}, cols {cols})"
+            )
+            shard2d = flat.view(-1, cols)
+            codes, descale = sharded_scaled_fp8_blockwise(
+                shard2d, block, flat_off // cols, full_shape, group=pg
+            )
+            yield name, codes.reshape(-1), spec
+            yield (
+                name + "_scale_inv",
+                descale.reshape(-1),
+                ShardSpec(full_shape=tuple(descale.shape)),
+            )
 
     def _quantized_stream(self, weights):
         """Wrap the full HF export with rollout-scheme fp8 quantization: for
@@ -434,18 +481,23 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         helper names them; everything else passes through in bf16. Every rank
         walks the wrapper (the export is collective); the quantize kernel is
         cheap relative to the assembly it follows."""
-        from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
-        from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper, build_sglang_fp8_quant_config
+        from verl.utils.fp8_sharded import sharded_scaled_fp8_blockwise
 
-        helper = SGLangFP8QuantizerHelper(build_sglang_fp8_quant_config())
+        helper = self._fp8_helper()
         block = helper.quant_config.get("weight_block_size", [128, 128])
         for name, t in weights:
             if t.dim() != 2 or not helper.should_quantize_param(name):
                 yield name, t
                 continue
-            codes, descale = scaled_fp8_blockwise(t.to(torch.bfloat16), block)
+            # SAME implementation as the steady shard quantizer (group=None ==
+            # whole tensor): seed, steady and the verify re-export must agree
+            # bit-for-bit, and fp32->fp8 tie rounding is implementation-
+            # sensitive across kernels.
+            codes, descale = sharded_scaled_fp8_blockwise(
+                t.to(torch.bfloat16), block, 0, tuple(t.shape), group=None
+            )
             yield name, codes
-            yield name + "_scale_inv", descale.squeeze(-1)
+            yield name + "_scale_inv", descale
 
     def _verify_due(self) -> bool:
         """True on every K-th steady sync when constructed with ``verify_every=K``."""
@@ -453,6 +505,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             return False
         self._steady_count = getattr(self, "_steady_count", 0) + 1
         return self._steady_count % self.verify_every == 0
+
+    def _fp8_helper(self):
+        from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper, build_sglang_fp8_quant_config
+
+        h = getattr(self, "_fp8_helper_inst", None)
+        if h is None:
+            h = SGLangFP8QuantizerHelper(build_sglang_fp8_quant_config())
+            self._fp8_helper_inst = h
+        return h
 
     def _assemble_flush(self, per_param: list[_FlushPiece]) -> DeltaFlush:
         """Build one DeltaFlush (indices encoding) from rank 0's gathered per-param deltas.
@@ -465,6 +526,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         (``.cpu().numpy().tobytes()`` + join) dominated the whole send at scale
         (~2.4s/sync at 7B steady state, ~83s on the full seed).
         """
+        bytes_wire = self.quantize_fp8  # mixed dtypes (fp8 codes + fp32 scales + bf16)
         idx_pieces: list[torch.Tensor] = []
         val_pieces: list[torch.Tensor] = []
         params: list[DeltaParam] = []
@@ -478,7 +540,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 f"{piece.name}: {_prodshape(piece.shape)} elements exceeds the int32 position encoding"
             )
             idx_pieces.append(piece.idx.to(torch.int32))
-            val_pieces.append(piece.val)
+            val = piece.val.contiguous().view(torch.uint8) if bytes_wire else piece.val
+            val_pieces.append(val)
+            n_val = int(val.numel())  # elements, or bytes in bytes_wire mode
             params.append(
                 DeltaParam(
                     name=piece.name,
@@ -488,11 +552,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     pos_end=pos_off + nnz * 4,
                     pos_width=4,
                     val_start=val_off,
-                    val_end=val_off + nnz,
+                    val_end=val_off + n_val,
                 )
             )
             pos_off += nnz * 4
-            val_off += nnz
+            val_off += n_val
 
         values_gpu = torch.cat(val_pieces) if val_pieces else torch.empty(0, dtype=self.rollout_dtype, device="cuda")
         positions_u8 = (
@@ -637,29 +701,50 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # each one as soon as it fills (then frees it), so peak memory is ~2 buckets rather than the
         # whole model.
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
-        if self.quantize_fp8:
-            # fp8 rollout mode: every sync ships the FULL quantized export
-            # (codes + scale_inv) over the values wire -- the rollout's exact
-            # state, so the idempotence sweep applies unchanged. Sparse
-            # quant-domain steady is the follow-up; no snapshots to prime.
-            verify = self._shard_seeded and self._verify_due()
+        if not self._shard_seeded:
+            full, _ = engine.get_per_tensor_param()
+            if self.quantize_fp8:
+                # fp8 rollout mode: the seed ships the rollout's EXACT state
+                # (codes + scale_inv, trainer-quantized); snapshots pin the
+                # SAME quantized shard stream, so the steady byte-diff runs
+                # in the rollout's own domain.
+                from verl.utils.device import is_cuda_available
+                from verl.workers.engine.utils import prime_delta_snapshots
+
+                metrics = self._send_full_seed(self._quantized_stream(full), global_steps, bytes_wire=True)
+                if getattr(engine, "delta_shards_are_hf", False):
+                    raw, _ = engine.get_per_tensor_param_shard()
+                    prime_delta_snapshots(self._fp8_shard_stream(raw), self._fp8_snaps, pin=is_cuda_available)
+            else:
+                metrics = self._send_full_seed(full, global_steps)
+                # weights do not move during the sync, so the snapshots equal
+                # exactly what the rollout just received.
+                engine.prime_delta_snapshots()
+            return metrics
+        if self.quantize_fp8 and not getattr(engine, "delta_shards_are_hf", False):
+            # backends whose raw shards are NOT HF-coordinate (mcore's
+            # megatron-layout shards) cannot be block-quantized shard-locally:
+            # fall back to the trainer-quantized full resync (still half the
+            # bf16 wire bytes; measured faster than bf16 sparse at 7B).
+            verify = self._verify_due()
             full, _ = engine.get_per_tensor_param()
             metrics = self._send_full_seed(
                 self._quantized_stream(full), global_steps, bytes_wire=True, hold_last=verify
             )
-            self._shard_seeded = True
             if verify:
                 full, _ = engine.get_per_tensor_param()
                 self._send_full_seed(self._quantized_stream(full), global_steps, verify=True, bytes_wire=True)
             return metrics
-        if not self._shard_seeded:
-            full, _ = engine.get_per_tensor_param()
-            metrics = self._send_full_seed(full, global_steps)
-            # weights do not move during the sync, so the snapshots equal exactly
-            # what the rollout just received.
-            engine.prime_delta_snapshots()
-            return metrics
-        weights, _ = engine.get_per_tensor_param_delta_shard()
+        if self.quantize_fp8:
+            # quant-domain sparse steady: codes and scales are just tensors --
+            # the stock diff/gather/wire pipeline runs on the transformed
+            # shard stream against the engine-held quantized snapshots.
+            from verl.workers.engine.utils import _hf_entry_identity, hf_delta_export
+
+            raw, _ = engine.get_per_tensor_param_shard()
+            weights = hf_delta_export(self._fp8_shard_stream(raw), self._fp8_snaps, _hf_entry_identity)
+        else:
+            weights, _ = engine.get_per_tensor_param_delta_shard()
         is_r0 = self.is_master
         n_flushes = 0
         changed_elems = 0
@@ -716,7 +801,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         if verify:
             # collective on every rank: the full export assembles per tensor.
             full, _ = engine.get_per_tensor_param()
-            self._send_full_seed(full, global_steps, verify=True)
+            if self.quantize_fp8:
+                self._send_full_seed(self._quantized_stream(full), global_steps, verify=True, bytes_wire=True)
+            else:
+                self._send_full_seed(full, global_steps, verify=True)
         if not is_r0:
             return
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
