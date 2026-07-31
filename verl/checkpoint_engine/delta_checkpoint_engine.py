@@ -739,10 +739,34 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # quant-domain sparse steady: codes and scales are just tensors --
             # the stock diff/gather/wire pipeline runs on the transformed
             # shard stream against the engine-held quantized snapshots.
+            import os
+
             from verl.workers.engine.utils import _hf_entry_identity, hf_delta_export
 
+            prof = {"backend": 0.0, "quantize": 0.0, "diff": 0.0} if os.environ.get("VERL_DELTA_PROFILE") else None
+
+            def _timed(gen, key):
+                # cumulative per-phase wall time; device sync per item keeps the
+                # attribution honest (profiling mode only).
+                while True:
+                    t0 = time.time()
+                    try:
+                        item = next(gen)
+                    except StopIteration:
+                        return
+                    torch.cuda.synchronize()
+                    prof[key] += time.time() - t0
+                    yield item
+
             raw, _ = engine.get_per_tensor_param_shard()
-            weights = hf_delta_export(self._fp8_shard_stream(raw), self._fp8_snaps, _hf_entry_identity)
+            if prof is None:
+                weights = hf_delta_export(self._fp8_shard_stream(raw), self._fp8_snaps, _hf_entry_identity)
+            else:
+                stream = _timed(self._fp8_shard_stream(_timed(iter(raw), "backend")), "quantize")
+                weights = _timed(
+                    iter(hf_delta_export(stream, self._fp8_snaps, _hf_entry_identity)), "diff"
+                )
+                self._fp8_prof = prof
         else:
             weights, _ = engine.get_per_tensor_param_delta_shard()
         is_r0 = self.is_master
@@ -808,6 +832,18 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         if not is_r0:
             return
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
+        prof = getattr(self, "_fp8_prof", None)
+        if prof is not None:
+            quant = prof["quantize"] - prof["backend"]
+            diff = prof["diff"] - prof["quantize"]
+            logger.warning(
+                "delta-fp8 profile v=%s backend_export=%.2fs quantize+amax=%.2fs diff+snap=%.2fs (rest=gather+wire)",
+                global_steps,
+                prof["backend"],
+                quant,
+                diff,
+            )
+            self._fp8_prof = None
         logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
         if not total_elems:
             return None
