@@ -846,6 +846,7 @@ class MegatronEngine(BaseEngine):
                     per_tensor_param, model_type=self.model_config.hf_config.model_type
                 )
 
+        raw_master = bool(kwargs.get("raw_master"))
         # QAT injects observer params (*_quantizer.*) that have no HF mapping:
         # the bridge leaves None rows in its task list and (as of 0.6.0) its
         # export stream dereferences them. Prefilter and hand the tasks in.
@@ -853,8 +854,11 @@ class MegatronEngine(BaseEngine):
             tasks = [t for t in self.bridge.get_conversion_tasks(self.module) if t is not None]
             per_tensor_param = self.bridge.export_hf_weights(self.module, conversion_tasks=tasks)
 
-        # QAT: process weights through QATWeightExporter for quantized weight sync to vLLM
-        if self._qat_enabled:
+        # QAT: process weights through QATWeightExporter for quantized weight sync to vLLM.
+        # ``raw_master=True`` (the fp8 delta paths) bypasses it: QAT's NVFP4
+        # packing is the vLLM serving format; the sglang-fp8 pipeline quantizes
+        # the bf16 master itself and a double transform ships wrong shapes.
+        if self._qat_enabled and not raw_master:
             from verl.utils.modelopt import export_qat_weights
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)

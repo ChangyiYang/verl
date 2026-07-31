@@ -787,7 +787,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # whole model.
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
         if not self._shard_seeded:
-            full, _ = engine.get_per_tensor_param()
+            full, _ = engine.get_per_tensor_param(raw_master=self.quantize_fp8)
             if self.quantize_fp8:
                 # fp8 rollout mode: the seed ships the rollout's EXACT state
                 # (codes + scale_inv, trainer-quantized); snapshots pin the
@@ -907,7 +907,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 self._publish_terminal(False)
         if verify:
             # collective on every rank: the full export assembles per tensor.
-            full, _ = engine.get_per_tensor_param()
+            full, _ = engine.get_per_tensor_param(raw_master=self.quantize_fp8)
             if self.quantize_fp8:
                 self._send_full_seed(self._quantized_stream(full), global_steps, verify=True, bytes_wire=True)
             else:
