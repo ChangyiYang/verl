@@ -753,7 +753,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # snapshot prime), so it drives the training engine itself.
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
                 return metrics or {}
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            # sglang's online fp8 path quantizes incoming bf16 itself; QAT's
+            # exporter would hand it NVFP4-packed serving weights instead.
+            per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
+                raw_master=self.config.rollout.get("quantization", None) == "fp8"
+            )
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return metrics or {}
 
