@@ -584,7 +584,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 yield (slot_list, str(dtype).replace("torch.", ""), counts, hf_idx, hf_val, pg)
 
         if not prime_only and os.environ.get("VERL_DELTA_PROFILE"):
-            logger.info(
+            logger.warning(
                 "AMAX-PROFILE scale_flips=%d/%d blocks code_changed=%d/%d bytes",
                 prof["sf"],
                 prof["st"],

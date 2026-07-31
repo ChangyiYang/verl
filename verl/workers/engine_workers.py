@@ -750,8 +750,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if effective_mode != "naive":
             if effective_mode == "delta_sharded":
                 # the delta engine owns the sync state machine (seed vs steady,
-                # snapshot prime), so it drives the training engine itself.
-                metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+                # snapshot prime), so it drives the training engine itself. The
+                # steady walk reads megatron params directly (it bypasses
+                # get_per_tensor_param and its implicit onload), so offloaded
+                # params must be brought back first or their GPU storages are
+                # dangling pointers.
+                if self.actor.engine.is_param_offload_enabled:
+                    self.actor.engine.to(get_device_name(), model=True, optimizer=False, grad=False)
+                try:
+                    metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+                finally:
+                    if self.actor.engine.is_param_offload_enabled:
+                        self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+                        aggressive_empty_cache(force_sync=True)
                 return metrics or {}
             # sglang's online fp8 path quantizes incoming bf16 itself; QAT's
             # exporter would hand it NVFP4-packed serving weights instead.
