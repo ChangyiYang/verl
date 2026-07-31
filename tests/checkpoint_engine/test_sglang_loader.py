@@ -300,3 +300,44 @@ def test_post_load_weights_runs_unpatched_on_last_flush():
     apply_delta(model, _named_tensors(params, positions, values, extra_spec={"is_last": True}))
     assert model.post_load_calls == 1
     assert torch.isnan(model.probe).all(), "post_load_weights must run with vanilla copy_ semantics"
+
+
+def test_dense_bytes_flush_mixed_dtypes():
+    """fp8 seeds ship mixed-dtype flushes as one byte blob (codes uint8-viewed,
+    scales fp32, leftovers bf16) with BYTE offsets and per-param reinterpret."""
+    w_bf16 = torch.randn(8, 4, dtype=torch.bfloat16)
+    w_fp32 = torch.rand(3, 2, dtype=torch.float32) + 0.5
+    model = _FakeModel([("a.weight", torch.zeros_like(w_bf16)), ("a.weight_scale_inv", torch.zeros_like(w_fp32))])
+
+    b1 = w_bf16.reshape(-1).view(torch.uint8)
+    b2 = w_fp32.reshape(-1).view(torch.uint8)
+    values = torch.cat([b1, b2])
+    params = [
+        DeltaParam(
+            name="a.weight",
+            dtype="bfloat16",
+            shape=list(w_bf16.shape),
+            pos_start=0,
+            pos_end=0,
+            pos_width=4,
+            val_start=0,
+            val_end=int(b1.numel()),
+        ),
+        DeltaParam(
+            name="a.weight_scale_inv",
+            dtype="float32",
+            shape=list(w_fp32.shape),
+            pos_start=0,
+            pos_end=0,
+            pos_width=4,
+            val_start=int(b1.numel()),
+            val_end=int(b1.numel() + b2.numel()),
+        ),
+    ]
+    positions = torch.empty(0, dtype=torch.uint8)
+    flush = _named_tensors(params, positions, values, encoding="dense", extra_spec={"values_bytes": True})
+    flush = [(n, t) for n, t in flush if n != "__positions__"]
+    apply_delta(model, flush)
+
+    assert torch.equal(model.params["a.weight"].view(torch.int16), w_bf16.view(torch.int16))
+    assert torch.equal(model.params["a.weight_scale_inv"], w_fp32)

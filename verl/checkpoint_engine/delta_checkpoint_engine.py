@@ -292,7 +292,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         collective.broadcast(val_cp, src_rank=0, group_name=self.group_name)
 
     def _publish_values_flush(
-        self, params: list[DeltaParam], values: torch.Tensor, is_last: bool, verify: bool = False
+        self,
+        params: list[DeltaParam],
+        values: torch.Tensor,
+        is_last: bool,
+        verify: bool = False,
+        values_bytes: bool = False,
     ) -> None:
         """Publish a values-only (full-coverage, positions-free) flush -- used by the first
         sync. The wire encoding tag stays ``"dense"`` -- it is protocol, shared with the
@@ -311,6 +316,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 "encoding": "dense",
                 "verify": verify,
                 "is_last": is_last,
+                "values_bytes": values_bytes,
                 "params": [vars(p) for p in params],
                 "checksum": int(_checksum(empty_pos, values)),
             },
@@ -396,7 +402,13 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         logger.info("delta recv v=%s flushes=%d (yielded to server adapter)", global_steps, applied)
 
     def __init__(
-        self, *args, encoding: str = "indices", batch_gather: int = 32, verify_every: int = 0, **kwargs
+        self,
+        *args,
+        encoding: str = "indices",
+        batch_gather: int = 32,
+        verify_every: int = 0,
+        quantize_fp8: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         assert encoding == "indices", f"delta_sharded ships only the 'indices' position encoding; got {encoding!r}"
@@ -404,11 +416,36 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # every K-th steady sync appends a full state-verification sweep
         # (0 = off); see _verify_due / delta_loader._verify_dense.
         self.verify_every = int(verify_every)
+        # fp8 rollout mode: quantize on the trainer and ship the rollout's
+        # exact state (fp8 codes + blockwise scale_inv tensors). Currently
+        # full-resync per sync (the quant-domain sparse steady path lands
+        # next); the wire is already half the bf16 bytes per element.
+        self.quantize_fp8 = bool(quantize_fp8)
         self._shard_seeded = False
         # Gather the per-param sparse deltas in groups of this many parameters
         # (one count-matrix all_gather + two padded gathers per group instead of
         # three collectives per parameter).
         self.batch_gather = int(batch_gather)
+
+    def _quantized_stream(self, weights):
+        """Wrap the full HF export with rollout-scheme fp8 quantization: for
+        every 2D weight the rollout side quantizes, yield ``(name, codes)`` +
+        ``(name_scale_inv, descales)`` exactly as sglang's own quantizer
+        helper names them; everything else passes through in bf16. Every rank
+        walks the wrapper (the export is collective); the quantize kernel is
+        cheap relative to the assembly it follows."""
+        from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
+        from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper, build_sglang_fp8_quant_config
+
+        helper = SGLangFP8QuantizerHelper(build_sglang_fp8_quant_config())
+        block = helper.quant_config.get("weight_block_size", [128, 128])
+        for name, t in weights:
+            if t.dim() != 2 or not helper.should_quantize_param(name):
+                yield name, t
+                continue
+            codes, descale = scaled_fp8_blockwise(t.to(torch.bfloat16), block)
+            yield name, codes
+            yield name + "_scale_inv", descale.squeeze(-1)
 
     def _verify_due(self) -> bool:
         """True on every K-th steady sync when constructed with ``verify_every=K``."""
@@ -473,6 +510,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
         verify: bool = False,
+        bytes_wire: bool = False,
+        hold_last: bool = False,
     ) -> dict[str, float] | None:
         """First sync: stream the backend's FULL HF export over the values-only wire.
 
@@ -511,7 +550,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         def _publish_values(pending, is_last: bool) -> None:
             nonlocal n_flushes, wire_bytes
             params, values = pending
-            self._publish_values_flush(params, values, is_last=is_last, verify=verify)
+            self._publish_values_flush(params, values, is_last=is_last, verify=verify, values_bytes=bytes_wire)
             n_flushes += 1
             wire_bytes += int(values.nbytes)
 
@@ -526,24 +565,35 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             assert name not in seen_names, f"full export yields duplicate HF tensor {name!r}"
             seen_names.add(name)
             tensor = tensor.detach()
-            if tensor.is_floating_point() and tensor.dtype != self.rollout_dtype:
+            # fp8 codes and their fp32 scale_inv tensors ARE the rollout state:
+            # never fold them into the bf16 wire dtype.
+            keep_dtype = tensor.element_size() == 1 or name.endswith("_scale_inv")
+            if tensor.is_floating_point() and tensor.dtype != self.rollout_dtype and not keep_dtype:
                 tensor = tensor.to(self.rollout_dtype)
             if not is_r0:
                 del tensor
                 continue
             flat = tensor.contiguous().reshape(-1)
             total_elems += int(flat.numel())
-            bkt.add(_ValuesPiece(name, str(flat.dtype).replace("torch.", ""), list(tensor.shape), flat), flat.nbytes)
+            if bytes_wire:
+                # mixed-dtype flushes: pack every piece as raw bytes; offsets
+                # in the spec become BYTE offsets and the receiver reinterprets
+                # per-param via ``values_bytes``.
+                flat = flat.view(torch.uint8)
+            bkt.add(_ValuesPiece(name, str(tensor.dtype).replace("torch.", ""), list(tensor.shape), flat), flat.nbytes)
 
         if not verify:
             self._shard_seeded = True
         if not is_r0:
             return
         bkt.seal()
+        # ``hold_last`` keeps the receive session open for an appended verify
+        # sweep (same contract as the steady path: only the sync's final flush
+        # carries is_last).
         if bkt.pending is not None:
-            bkt.emit(is_last=True)
+            bkt.emit(is_last=not hold_last)
         else:
-            self._publish_terminal(True)
+            self._publish_terminal(not hold_last)
         # warning level on purpose: worker default log level swallows info, and the
         # one-off seed cost is the number people ask for when sizing a run.
         # the cupy staging pool does not return its blocks to CUDA on its own;
@@ -587,6 +637,21 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # each one as soon as it fills (then frees it), so peak memory is ~2 buckets rather than the
         # whole model.
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
+        if self.quantize_fp8:
+            # fp8 rollout mode: every sync ships the FULL quantized export
+            # (codes + scale_inv) over the values wire -- the rollout's exact
+            # state, so the idempotence sweep applies unchanged. Sparse
+            # quant-domain steady is the follow-up; no snapshots to prime.
+            verify = self._shard_seeded and self._verify_due()
+            full, _ = engine.get_per_tensor_param()
+            metrics = self._send_full_seed(
+                self._quantized_stream(full), global_steps, bytes_wire=True, hold_last=verify
+            )
+            self._shard_seeded = True
+            if verify:
+                full, _ = engine.get_per_tensor_param()
+                self._send_full_seed(self._quantized_stream(full), global_steps, verify=True, bytes_wire=True)
+            return metrics
         if not self._shard_seeded:
             full, _ = engine.get_per_tensor_param()
             metrics = self._send_full_seed(full, global_steps)

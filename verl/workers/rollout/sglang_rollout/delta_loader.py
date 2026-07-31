@@ -80,9 +80,11 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
 
     if spec["encoding"] == "dense":
         if spec.get("verify"):
-            _verify_dense(model, spec["params"], values, bool(spec.get("is_last")))
+            _verify_dense(model, spec["params"], values, bool(spec.get("is_last")), bool(spec.get("values_bytes")))
             return
-        _apply_dense(model, spec["params"], values)
+        _apply_dense(model, spec["params"], values, bool(spec.get("values_bytes")))
+        if spec.get("is_last") and hasattr(model, "post_load_weights"):
+            model.post_load_weights()
         return
 
     encoding = spec["encoding"]
@@ -110,13 +112,23 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
         model.post_load_weights()
 
 
-def _apply_dense(model: torch.nn.Module, params: list[dict], values: torch.Tensor) -> None:
-    """Apply a dense (full-coverage) flush: plain chunked load, no masking needed."""
+def _apply_dense(
+    model: torch.nn.Module, params: list[dict], values: torch.Tensor, values_bytes: bool = False
+) -> None:
+    """Apply a dense (full-coverage) flush: plain chunked load, no masking needed.
+
+    ``values_bytes`` marks a mixed-dtype flush (fp8 codes + fp32 scales + bf16
+    leftovers): offsets are BYTE offsets into a uint8 blob and each param is
+    reinterpreted, not cast. The ``.clone()`` re-bases the slice to storage
+    offset 0 so the dtype view never trips torch's alignment check."""
     chunk: list[tuple[str, torch.Tensor]] = []
     chunk_bytes = 0
     for p in params:
         dtype = getattr(torch, p["dtype"])
-        t = values[p["val_start"] : p["val_end"]].to(dtype).view(p["shape"])
+        if values_bytes:
+            t = values[p["val_start"] : p["val_end"]].clone().view(dtype).view(p["shape"])
+        else:
+            t = values[p["val_start"] : p["val_end"]].to(dtype).view(p["shape"])
         nbytes = t.numel() * t.element_size()
         if chunk and chunk_bytes + nbytes > CHUNK_BYTES:
             model.load_weights(chunk)
@@ -130,7 +142,9 @@ def _apply_dense(model: torch.nn.Module, params: list[dict], values: torch.Tenso
 _VERIFY_STATS: dict = {"params": 0, "pieces": []}
 
 
-def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tensor, is_last: bool) -> None:
+def _verify_dense(
+    model: torch.nn.Module, params: list[dict], values: torch.Tensor, is_last: bool, values_bytes: bool = False
+) -> None:
     """State-equivalence sweep, phrased as an IDEMPOTENCE check: replaying the
     trainer's FULL current weights onto an in-sync server must be a no-op. For
     each parameter we snapshot every ``copy_`` destination (the exact internal
@@ -156,13 +170,16 @@ def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tens
 
         torch.Tensor.copy_ = snap_then_copy_
         try:
-            _apply_dense(model, [p], values)
+            _apply_dense(model, [p], values, values_bytes)
         finally:
             torch.Tensor.copy_ = orig_copy
         bad = 0
         for dst, pre in touched.values():
             if dst.is_floating_point() and dst.element_size() == 2:
                 bad += int((dst.view(torch.int16) != pre.view(torch.int16)).sum())
+            elif dst.element_size() == 1:
+                # fp8 codes: bit compare via uint8 (eq on float8 is not portable)
+                bad += int((dst.view(torch.uint8) != pre.view(torch.uint8)).sum())
             else:
                 bad += int((dst != pre).sum())
         if bad:
