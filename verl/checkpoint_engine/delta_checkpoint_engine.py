@@ -474,6 +474,91 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 ShardSpec(full_shape=tuple(descale.shape)),
             )
 
+    def _mcore_fp8_entries(self, engine, prime_only: bool = False):
+        """mcore quant-domain steady entries (or snapshot prime when
+        ``prime_only``): per export-index record, run the comm-stubbed probe on
+        the FULL local shard, NaN-aware-quantize each quantizable HF slot with
+        the group-global scales, and byte-diff codes + scales against pinned
+        snapshots. Emits up to three dtype-homogeneous entries per record
+        (fp8 codes / fp32 scales / bf16 passthrough slots); scale grids are
+        identical on every rank of the group after the all_reduce, so only the
+        group's rank 0 contributes them."""
+        import torch.distributed as dist
+
+        from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
+        from verl.utils.device import is_cuda_available
+        from verl.utils.fp8_sharded import sharded_scaled_fp8_blockwise
+
+        helper = self._fp8_helper()
+        block = helper.quant_config.get("weight_block_size", [128, 128])
+        index = engine._mcore_export_index()
+        slot_cache = engine._delta_slot_cache
+
+        def _snap_diff(key, flat):
+            snap = self._fp8_snaps.get(key)
+            if snap is None or snap.numel() != flat.numel():
+                snap = torch.empty_like(flat, device="cpu", pin_memory=is_cuda_available)
+                self._fp8_snaps[key] = snap
+                snap.copy_(flat, non_blocking=True)
+                return None  # first sight: primed, nothing to diff
+            base = snap.to(flat.device, non_blocking=True)
+            lidx, lval = shard_delta_indices(flat, base, 0)
+            snap.copy_(flat, non_blocking=True)
+            return lidx, lval
+
+        for rec in index:
+            outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
+            pg = rec.spec.gather_group
+            group_rank = dist.get_rank(pg) if pg is not None else dist.get_rank()
+            slots = slot_cache.get(rec.megatron_name)
+            if slots is None:
+                slots = [(n, tuple(int(x) for x in t.shape)) for n, t in outs.items()]
+                slot_cache[rec.megatron_name] = slots
+            buckets: dict = {}  # dtype -> (slot list, counts list, idx pieces, val pieces)
+
+            def _emit(sname, sshape, flat, key, contributes=True):
+                got = _snap_diff(key, flat)
+                b = buckets.setdefault(flat.dtype, ([], [], [], []))
+                b[0].append((sname, tuple(sshape)))
+                if got is None or not contributes:
+                    b[1].append(0)
+                    return
+                lidx, lval = got
+                b[1].append(int(lidx.numel()))
+                if lidx.numel():
+                    b[2].append(lidx.to(torch.int32))
+                    b[3].append(lval)
+
+            for sname, _sshape in slots:
+                t = outs[sname]
+                if t.dim() == 2 and helper.should_quantize_param(sname):
+                    codes, descale = sharded_scaled_fp8_blockwise(
+                        t.to(torch.bfloat16), block, 0, tuple(t.shape), group=pg
+                    )
+                    _emit(sname, codes.shape, codes.reshape(-1), (rec.megatron_name, sname, "c"))
+                    _emit(
+                        sname + "_scale_inv",
+                        descale.shape,
+                        descale.reshape(-1),
+                        (rec.megatron_name, sname, "s"),
+                        contributes=(group_rank == 0),
+                    )
+                else:
+                    flat = t.to(torch.bfloat16).reshape(-1)
+                    _emit(sname, t.shape, flat, (rec.megatron_name, sname, "b"))
+
+            if prime_only:
+                continue
+            for dtype, (slot_list, count_list, idx_pieces, val_pieces) in buckets.items():
+                counts = torch.tensor(count_list, dtype=torch.int64)
+                if idx_pieces:
+                    hf_idx = torch.cat(idx_pieces)
+                    hf_val = torch.cat(val_pieces)
+                else:
+                    hf_idx = torch.empty(0, dtype=torch.int32, device=rec.param.device)
+                    hf_val = torch.empty(0, dtype=dtype, device=rec.param.device)
+                yield (slot_list, str(dtype).replace("torch.", ""), counts, hf_idx, hf_val, pg)
+
     def _quantized_stream(self, weights):
         """Wrap the full HF export with rollout-scheme fp8 quantization: for
         every 2D weight the rollout side quantizes, yield ``(name, codes)`` +
@@ -715,6 +800,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 if getattr(engine, "delta_shards_are_hf", False):
                     raw, _ = engine.get_per_tensor_param_shard()
                     prime_delta_snapshots(self._fp8_shard_stream(raw), self._fp8_snaps, pin=is_cuda_available)
+                else:
+                    for _ in self._mcore_fp8_entries(engine, prime_only=True):
+                        pass
             else:
                 metrics = self._send_full_seed(full, global_steps)
                 # weights do not move during the sync, so the snapshots equal
@@ -722,20 +810,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 engine.prime_delta_snapshots()
             return metrics
         if self.quantize_fp8 and not getattr(engine, "delta_shards_are_hf", False):
-            # backends whose raw shards are NOT HF-coordinate (mcore's
-            # megatron-layout shards) cannot be block-quantized shard-locally:
-            # fall back to the trainer-quantized full resync (still half the
-            # bf16 wire bytes; measured faster than bf16 sparse at 7B).
-            verify = self._verify_due()
-            full, _ = engine.get_per_tensor_param()
-            metrics = self._send_full_seed(
-                self._quantized_stream(full), global_steps, bytes_wire=True, hold_last=verify
-            )
-            if verify:
-                full, _ = engine.get_per_tensor_param()
-                self._send_full_seed(self._quantized_stream(full), global_steps, verify=True, bytes_wire=True)
-            return metrics
-        if self.quantize_fp8:
+            # mcore quant-domain sparse: the comm-stubbed probe turns the FULL
+            # local shard into its HF view (real values at this rank's
+            # positions, NaN placeholders elsewhere) -- the same transform the
+            # bf16 steady already pays per sync. Quantize that view NaN-aware
+            # (placeholders come out as the fp8 NaN byte, stable across syncs,
+            # so the code byte-diff is zero there) and byte-diff codes and
+            # scales against engine-held snapshots.
+            weights = self._mcore_fp8_entries(engine)
+        elif self.quantize_fp8:
             # quant-domain sparse steady: codes and scales are just tensors --
             # the stock diff/gather/wire pipeline runs on the transformed
             # shard stream against the engine-held quantized snapshots.

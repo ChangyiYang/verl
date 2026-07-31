@@ -67,6 +67,9 @@ def local_blockwise_absmax(
         return grid
 
     x = shard.to(torch.float32).abs()
+    # NaN placeholders (mcore probe output: positions owned by OTHER ranks)
+    # must not poison the partial max; zeros never win a legitimate max.
+    x = torch.nan_to_num(x, nan=0.0)
     # pad dim-1 to the block grid once (zeros never win a max)
     pad_n = n_bc * bn - n_full
     if pad_n:
@@ -95,6 +98,8 @@ def quantize_shard_with_descale(
     n_bc = descale.shape[1]
     s_inv = 1.0 / descale  # matches the kernel's second fp32 division
 
+    # NaN passes through multiply/clamp/cast untouched and lands as the fp8
+    # NaN byte -- exactly the wire sentinel for "not this rank's position".
     x = shard.to(torch.float32)
     pad_n = n_bc * bn - cols
     if pad_n:
