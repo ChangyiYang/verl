@@ -190,6 +190,9 @@ class McoreParamExport:
     spec: ShardSpec
     probe: Any  # comm-stubbed mapping copy (local megatron_to_hf evaluator)
     module: Any  # module handle megatron_to_hf reads config from
+    # GLOBAL slot table for this directory row (set by the index-build
+    # exchange): identical on every rank of the row's merge group.
+    slots: Optional[list] = None
 
 
 def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -> list[McoreParamExport]:
@@ -290,51 +293,69 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
             )
         )
 
-    if pp_world > 1:
-        _preseed_slot_tables(index, slot_cache)
-        # a placeholder with no slot table after the exchange has no owner on
-        # ANY stage: the bridge skipped it everywhere (no mapping / missing HF
-        # key), so it is outside the bridge's own export scope -- exactly what
-        # PP=1 does by skipping param_weight=None tasks. Drop it from the
-        # directory (all ranks agree: the exchange result is identical) and
-        # say so, instead of shipping unsized rows.
-        unowned = [rec.megatron_name for rec in index if rec.param is None and rec.megatron_name not in slot_cache]
-        if unowned:
-            logger.warning(
-                "delta export drops %d param(s) the bridge skipped on every pp stage "
-                "(no mapping or missing HF key; out of export scope): %s",
-                len(unowned),
-                unowned[:8],
-            )
-            dropped = set(unowned)
-            index = [rec for rec in index if rec.megatron_name not in dropped]
+    _exchange_slot_tables(index, slot_cache)
+    # a row with an empty union has no owner on ANY rank: the bridge skipped
+    # it everywhere (no mapping / missing HF key), so it is outside the
+    # bridge's own export scope -- exactly what PP=1 does by skipping
+    # param_weight=None tasks. Drop it (all ranks agree: the exchange result
+    # is identical) instead of shipping unsized rows.
+    unowned = [rec.megatron_name for rec in index if rec.slots is None]
+    if unowned:
+        logger.warning(
+            "delta export drops %d row(s) the bridge skipped on every rank "
+            "(no mapping or missing HF key; out of export scope): %s",
+            len(unowned),
+            unowned[:8],
+        )
+        index = [rec for rec in index if rec.slots is not None]
     return index
 
 
-def _preseed_slot_tables(index: list[McoreParamExport], slot_cache: dict) -> None:
-    """One-time PP slot-table exchange: each rank probes a zero delta through
-    its OWNED params (filling ``slot_cache`` with their ``(hf_name, hf_shape)``
-    tables), then allgathers the tables over the pp group so every rank can
-    emit correctly-sized zero-count entries for stages it does not own. Tables
-    are static metadata; the cost is one probe pass at first export."""
-    from megatron.core import parallel_state as mpu
+def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict) -> None:
+    """One-time GLOBAL slot-table exchange, run at every world size, keyed by
+    DIRECTORY ROW (not by param name).
 
-    assert slot_cache is not None, "PP>1 slot pre-seeding needs the engine's slot cache"
-    owned: dict[str, list] = {}
+    The engine's batched gather merges entries BY SLOT POSITION within each
+    directory row and rank 0 names the merged pieces from ITS OWN list, so
+    the per-row list must be identical on every rank of the row's merge
+    group. Name-keyed merging is not enough on mcore: expert param NAMES
+    embed the expert ids (``...experts.linear_fc1.weight0`` on ep rank 0 vs
+    ``weight1`` on ep rank 1), so the same row carries different names per
+    rank while still gathering together. Each rank therefore probes a zero
+    delta through its OWNED rows to reveal its local ``(hf_name, hf_shape)``
+    list, one ``all_gather_object`` over WORLD exchanges the ordered row
+    lists, and every row's table becomes the rank-order first-seen union --
+    identical everywhere by construction. Dense/TP rows (same list on every
+    rank) dedup to themselves; expert rows concatenate the per-ep-rank
+    lists; PP placeholder rows inherit the owners' union."""
+    local_rows: list = []
     for rec in index:
         if rec.param is None:
+            local_rows.append(None)
             continue
         if rec.megatron_name not in slot_cache:
             empty_idx = torch.empty(0, dtype=torch.int64, device=rec.param.device)
             empty_val = torch.empty(0, dtype=torch.bfloat16, device=rec.param.device)
             mcore_hf_delta_entry(rec, 0, empty_idx, empty_val, slot_cache)
-        owned[rec.megatron_name] = slot_cache[rec.megatron_name]
+        local_rows.append(slot_cache[rec.megatron_name])
 
-    pp_group = mpu.get_pipeline_model_parallel_group()
-    gathered: list = [None] * torch.distributed.get_world_size(group=pp_group)
-    torch.distributed.all_gather_object(gathered, owned, group=pp_group)
-    for tables in gathered:
-        slot_cache.update(tables)
+    world = torch.distributed.get_world_size()
+    gathered: list = [None] * world
+    torch.distributed.all_gather_object(gathered, local_rows)
+    n_rows = len(local_rows)
+    assert all(len(rows) == n_rows for rows in gathered), (
+        f"directory row counts diverge across ranks: {[len(r) for r in gathered]} -- "
+        "the bridge's global enumeration is expected to be structurally parallel"
+    )
+    for k, rec in enumerate(index):
+        union: dict = {}
+        for rows in gathered:  # rank order -> identical result on every rank
+            row = rows[k]
+            if row is None:
+                continue
+            for slot in row:
+                union[(slot[0], tuple(slot[1]))] = None  # ordered-set semantics
+        rec.slots = [(n, tuple(shape)) for (n, shape) in union.keys()] if union else None
 
 
 def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval: torch.Tensor, slot_cache: dict):
@@ -353,7 +374,7 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
         f"{rec.megatron_name}: NaN sentinels require a floating-point param, got {lval.dtype}"
     )
 
-    cached = slot_cache.get(rec.megatron_name)
+    cached = rec.slots if rec.slots is not None else slot_cache.get(rec.megatron_name)
     if rec.param is None:
         # owned by another pipeline stage: pure lockstep row. The slot table
         # was pre-seeded from the owner stage (fail loud if not -- an
@@ -381,15 +402,26 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
     outs = rec.probe.megatron_to_hf(buf, rec.module)
 
     key = rec.megatron_name
-    slots = slot_cache.get(key)
+    slots = rec.slots if rec.slots is not None else slot_cache.get(key)
     if slots is None:
+        # only reachable from the index-build exchange itself, which probes a
+        # zero delta to reveal this rank's local list before the row unions
+        # are installed on the recs; steady entries always find rec.slots.
         slots = [(n, tuple(int(x) for x in t.shape)) for n, t in outs.items()]
         slot_cache[key] = slots
+    unknown = set(outs) - {n for n, _ in slots}
+    assert not unknown, (
+        f"{key}: probe emitted slots missing from the global table {sorted(unknown)[:4]} -- "
+        "non-deterministic converter naming would misalign the batched gather"
+    )
     counts = torch.zeros(len(slots), dtype=torch.int64)
     idx_pieces: list[torch.Tensor] = []
     val_pieces: list[torch.Tensor] = []
     for s_i, (sname, _sshape) in enumerate(slots):
-        fl = outs[sname].reshape(-1)
+        out = outs.get(sname)
+        if out is None:
+            continue  # another rank's slot (e.g. its ep-local experts): zero count here
+        fl = out.reshape(-1)
         p_ = (~torch.isnan(fl)).nonzero(as_tuple=False).view(-1)
         if p_.numel():
             counts[s_i] = p_.numel()

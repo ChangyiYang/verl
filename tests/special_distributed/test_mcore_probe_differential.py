@@ -43,6 +43,7 @@ sys.path.insert(0, os.environ.get("VERL_PATH", "/home/changyi/verl_ab_pre"))
 MODEL_KIND = os.environ.get("MODEL_KIND", "qwen2")
 TP = int(os.environ.get("TP_SIZE", "2"))
 PP = int(os.environ.get("PP_SIZE", "1"))
+EP = int(os.environ.get("EP_SIZE", "1"))
 
 
 def _build_tiny_hf_dir(rank: int) -> str:
@@ -182,13 +183,28 @@ def _pp_differential(bridge, model, rank: int, world: int) -> None:
     slot_cache: dict = {}
     index = build_export_index(bridge, model, slot_cache)
 
-    # 1. directory lockstep: every rank must hold the identical name sequence.
+    # 1. directory lockstep: same ROW COUNT everywhere (mcore expert param
+    # NAMES legitimately differ per ep rank -- the row is the unit).
     names = [r.megatron_name for r in index]
     all_names: list = [None] * world
     dist.all_gather_object(all_names, names)
     failures = []
-    if rank == 0 and any(n != names for n in all_names):
-        failures.append("directory diverges across ranks")
+    if rank == 0 and any(len(n) != len(names) for n in all_names):
+        failures.append(f"directory row counts diverge: {[len(n) for n in all_names]}")
+
+    # 1b. per-row slot-table identity: the batched gather merges BY SLOT
+    # POSITION within a row and rank 0 names merged pieces from its own list,
+    # so the row's table must be identical on every rank (the ep_size>1
+    # collision this oracle now guards).
+    row_tables = [r.slots for r in index]
+    all_tables: list = [None] * world
+    dist.all_gather_object(all_tables, row_tables)
+    if rank == 0:
+        for r_i, tbls in enumerate(all_tables):
+            bad = [k for k in range(len(row_tables)) if tbls[k] != row_tables[k]][:3]
+            if bad:
+                failures.append(f"row slot tables diverge on rank {r_i} (rows {bad})")
+                break
 
     # 2. entries: owned params ship a full delta (every local element), rows
     # owned by other stages must come back as zero-count lockstep entries.
@@ -279,7 +295,12 @@ def main():
 
     from megatron.core import parallel_state as mpu
 
-    mpu.initialize_model_parallel(tensor_model_parallel_size=TP, pipeline_model_parallel_size=PP)
+    mpu.initialize_model_parallel(
+        tensor_model_parallel_size=TP,
+        pipeline_model_parallel_size=PP,
+        expert_model_parallel_size=EP,
+        expert_tensor_parallel_size=1 if EP > 1 else None,
+    )
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
     model_parallel_cuda_manual_seed(1234)
@@ -292,6 +313,9 @@ def main():
     provider = bridge.to_megatron_provider(load_weights=False)
     provider.tensor_model_parallel_size = TP
     provider.pipeline_model_parallel_size = PP
+    if EP > 1:
+        provider.expert_model_parallel_size = EP
+        provider.expert_tensor_parallel_size = 1
     provider.bf16 = True
     provider.params_dtype = torch.bfloat16
     provider.finalize()
@@ -302,7 +326,7 @@ def main():
     # differential would flag test artifacts instead of probe bugs.
     bridge.load_hf_weights(model)
 
-    if PP > 1:
+    if PP > 1 or EP > 1 or os.environ.get("ENGINE_DIFF"):
         _pp_differential(bridge, model, rank, world)
         return
 
