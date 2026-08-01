@@ -433,48 +433,6 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # three collectives per parameter).
         self.batch_gather = int(batch_gather)
 
-    def _fp8_shard_stream(self, gen):
-        """STEADY-side transform for fp8 mode: turn the backend's raw shard
-        stream into the ROLLOUT-domain shard stream. Every quantizable 2D
-        weight becomes two pseudo-params -- its fp8 code shard (same placement
-        spec: codes are elementwise with the weight) and the fp32 scale grid
-        (identical on every rank after the amax all_reduce, so a replicated
-        spec lets rank 0 alone ship scale deltas). Everything else passes
-        through in bf16. Downstream (snapshot prime, byte-diff, gather, wire)
-        is the stock steady pipeline: rollout state = codes + scales, and both
-        are just tensors to diff."""
-        from verl.utils.fp8_sharded import sharded_scaled_fp8_blockwise
-        from verl.workers.engine.spec import ShardSpec, derive_dtensor_placement
-
-        helper = self._fp8_helper()
-        block = helper.quant_config.get("weight_block_size", [128, 128])
-        for name, flat, spec in gen:
-            full_shape = tuple(int(x) for x in spec.full_shape)
-            if len(full_shape) != 2 or not helper.should_quantize_param(name):
-                yield name, flat, spec
-                continue
-            place, _contributes, pg = (
-                (spec.place, spec.contributes, spec.gather_group)
-                if spec.place is not None
-                else derive_dtensor_placement(spec)
-            )
-            cols = full_shape[1]
-            flat_off = place if isinstance(place, int) else place.flat_offset
-            assert flat_off % cols == 0 and flat.numel() % cols == 0, (
-                f"{name}: fp8 steady expects dim-0 row shards (offset {flat_off}, cols {cols})"
-            )
-            shard2d = flat.view(-1, cols)
-            codes, descale = sharded_scaled_fp8_blockwise(
-                shard2d, block, flat_off // cols, full_shape, group=pg
-            )
-            yield name, codes.reshape(-1), spec
-            yield (
-                name + "_scale_inv",
-                descale.reshape(-1),
-                ShardSpec(full_shape=tuple(descale.shape)),
-            )
-
-
     def _quantized_stream(self, weights):
         """Wrap the full HF export with rollout-scheme fp8 quantization: for
         every 2D weight the rollout side quantizes, yield ``(name, codes)`` +
@@ -709,25 +667,18 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # (codes + scale_inv, trainer-quantized); snapshots pin the
                 # SAME quantized shard stream, so the steady byte-diff runs
                 # in the rollout's own domain.
-                from verl.utils.device import is_cuda_available
-                from verl.workers.engine.utils import prime_delta_snapshots
-
                 metrics = self._send_full_seed(self._quantized_stream(full), global_steps, bytes_wire=True)
-                if getattr(engine, "delta_shards_are_hf", False):
-                    raw, _ = engine.get_per_tensor_param_shard()
-                    prime_delta_snapshots(self._fp8_shard_stream(raw), self._fp8_snaps, pin=is_cuda_available)
-                else:
-                    from verl.workers.engine.megatron.delta_export import hf_quant_delta_export
+                from verl.workers.engine.megatron.delta_export import hf_quant_delta_export
 
-                    for _ in hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_helper(), prime_only=True):
-                        pass
+                for _ in hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_helper(), prime_only=True):
+                    pass
             else:
                 metrics = self._send_full_seed(full, global_steps)
                 # weights do not move during the sync, so the snapshots equal
                 # exactly what the rollout just received.
                 engine.prime_delta_snapshots()
             return metrics
-        if self.quantize_fp8 and not getattr(engine, "delta_shards_are_hf", False):
+        if self.quantize_fp8:
             # mcore quant-domain sparse: the comm-stubbed probe turns the FULL
             # local shard into its HF view (real values at this rank's
             # positions, NaN placeholders elsewhere) -- the same transform the
@@ -738,38 +689,6 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             from verl.workers.engine.megatron.delta_export import hf_quant_delta_export
 
             weights = hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_helper())
-        elif self.quantize_fp8:
-            # quant-domain sparse steady: codes and scales are just tensors --
-            # the stock diff/gather/wire pipeline runs on the transformed
-            # shard stream against the engine-held quantized snapshots.
-            import os
-
-            from verl.workers.engine.utils import _hf_entry_identity, hf_delta_export
-
-            prof = {"backend": 0.0, "quantize": 0.0, "diff": 0.0} if os.environ.get("VERL_DELTA_PROFILE") else None
-
-            def _timed(gen, key):
-                # cumulative per-phase wall time; device sync per item keeps the
-                # attribution honest (profiling mode only).
-                while True:
-                    t0 = time.time()
-                    try:
-                        item = next(gen)
-                    except StopIteration:
-                        return
-                    torch.cuda.synchronize()
-                    prof[key] += time.time() - t0
-                    yield item
-
-            raw, _ = engine.get_per_tensor_param_shard()
-            if prof is None:
-                weights = hf_delta_export(self._fp8_shard_stream(raw), self._fp8_snaps, _hf_entry_identity)
-            else:
-                stream = _timed(self._fp8_shard_stream(_timed(iter(raw), "backend")), "quantize")
-                weights = _timed(
-                    iter(hf_delta_export(stream, self._fp8_snaps, _hf_entry_identity)), "diff"
-                )
-                self._fp8_prof = prof
         else:
             weights, _ = engine.get_per_tensor_param_delta_shard()
         is_r0 = self.is_master
@@ -835,18 +754,6 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         if not is_r0:
             return
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
-        prof = getattr(self, "_fp8_prof", None)
-        if prof is not None:
-            quant = prof["quantize"] - prof["backend"]
-            diff = prof["diff"] - prof["quantize"]
-            logger.warning(
-                "delta-fp8 profile v=%s backend_export=%.2fs quantize+amax=%.2fs diff+snap=%.2fs (rest=gather+wire)",
-                global_steps,
-                prof["backend"],
-                quant,
-                diff,
-            )
-            self._fp8_prof = None
         logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
         if not total_elems:
             return None
