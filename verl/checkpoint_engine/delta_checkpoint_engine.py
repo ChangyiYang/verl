@@ -488,7 +488,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
         from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
         from verl.utils.device import is_cuda_available
-        from verl.utils.fp8_sharded import sharded_scaled_fp8_blockwise
+        from verl.utils.fp8_sharded import _ABSMAX_EPS as _FP8_ABSMAX_EPS
+        from verl.utils.fp8_sharded import local_blockwise_absmax, quantize_shard_with_descale
+        from verl.utils.kernel.fp8_kernel import FP8_DTYPE as _FP8_DTYPE
+        from verl.utils.kernel.fp8_kernel import FP8_MAX as _FP8_MAX
+        from verl.utils.kernel.fp8_kernel import ceil_div
 
         helper = self._fp8_helper()
         block = helper.quant_config.get("weight_block_size", [128, 128])
@@ -508,16 +512,25 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             return lidx, lval
 
         prof = {"sf": 0, "st": 0, "cc": 0, "ct": 0}  # scale flips / code bytes, changed vs total
+        # phase timers (mcore steady decomposition): synced per rec, coarse but honest
+        tprof = {"probe": 0.0, "quant": 0.0, "diff": 0.0, "n_reduce": 0, "n_slots": 0, "n_absent": 0}
+        _do_tprof = bool(os.environ.get("VERL_DELTA_PROFILE"))
+
+        def _sync():
+            if _do_tprof and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
         for rec in index:
-            # PP placeholder rows (param owned by another stage): no probe, no
-            # local rows -- the union walk below joins every collective with
-            # empty shards and gathers zero-count entries.
+            _sync()
+            _t0 = time.time()
             if rec.probe is None:
                 outs = {}
                 dev = torch.device(torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
             else:
                 outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
                 dev = rec.param.device
+            _sync()
+            tprof["probe"] += time.time() - _t0
             pg = rec.spec.gather_group
             group_rank = dist.get_rank(pg) if pg is not None else dist.get_rank()
             # rec.slots is the row-keyed UNION table (identical on every rank of
@@ -529,7 +542,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             buckets: dict = {}  # dtype -> (slot list, counts list, idx pieces, val pieces)
 
             def _emit(sname, sshape, flat, key, contributes=True, buckets=buckets, prof=prof):
+                _t = time.time()
                 got = _snap_diff(key, flat)
+                _sync()
+                tprof["diff"] += time.time() - _t
                 b = buckets.setdefault(flat.dtype, ([], [], [], []))
                 b[0].append((sname, tuple(sshape)))
                 kind = key[2]
@@ -550,19 +566,55 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     b[2].append(lidx.to(torch.int32))
                     b[3].append(lval)
 
+            # one absmax all_reduce per REC, not per slot: every rank walks the
+            # same union order, so the concatenated partial grids stay aligned;
+            # absent rows contribute zero partials without materializing shards.
+            _tq = time.time()
+            quantizable = [
+                (sname, sshape)
+                for sname, sshape in slots
+                if len(sshape) == 2 and helper.should_quantize_param(sname)
+            ]
+            grids = []
+            bm, bn = int(block[0]), int(block[1])
+            for sname, sshape in quantizable:
+                t = outs.get(sname)
+                tprof["n_slots"] += 1
+                if t is None:
+                    tprof["n_absent"] += 1
+                    g = torch.zeros(
+                        ceil_div(int(sshape[0]), bm), ceil_div(int(sshape[1]), bn), dtype=torch.float32, device=dev
+                    )
+                else:
+                    g = local_blockwise_absmax(t.to(torch.bfloat16), block, 0, tuple(sshape))
+                grids.append(g)
+            if grids and pg is not None:
+                tprof["n_reduce"] += 1
+                flatg = torch.cat([g.reshape(-1) for g in grids])
+                dist.all_reduce(flatg, op=dist.ReduceOp.MAX, group=pg)
+                off = 0
+                for i, g in enumerate(grids):
+                    n = g.numel()
+                    grids[i] = flatg[off : off + n].view_as(g)
+                    off += n
+            descales = {}
+            for (sname, sshape), g in zip(quantizable, grids, strict=False):
+                absmax = g.clamp(min=_FP8_ABSMAX_EPS)
+                descales[sname] = absmax / _FP8_MAX
+            _sync()
+            tprof["quant"] += time.time() - _tq
+
             for sname, sshape in slots:
                 t = outs.get(sname)
                 if len(sshape) == 2 and helper.should_quantize_param(sname):
-                    # union rows owned by other ranks still join the absmax
-                    # all_reduce (empty shard -> zero partial grid) so the
-                    # group's collectives stay in lockstep; their codes row
-                    # is empty and gathers as a zero-count entry.
-                    shard = (
-                        t.to(torch.bfloat16)
-                        if t is not None
-                        else torch.empty((0, sshape[1]), dtype=torch.bfloat16, device=dev)
-                    )
-                    codes, descale = sharded_scaled_fp8_blockwise(shard, block, 0, tuple(sshape), group=pg)
+                    descale = descales[sname]
+                    _tq = time.time()
+                    if t is not None:
+                        codes = quantize_shard_with_descale(t.to(torch.bfloat16), descale, block, 0)
+                    else:
+                        codes = torch.empty(0, dtype=_FP8_DTYPE, device=dev)
+                    _sync()
+                    tprof["quant"] += time.time() - _tq
                     _emit(sname, sshape, codes.reshape(-1), (rec.megatron_name, sname, "c"))
                     _emit(
                         sname + "_scale_inv",
@@ -598,6 +650,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 prof["st"],
                 prof["cc"],
                 prof["ct"],
+            )
+            logger.warning(
+                "MCORE-PROF probe=%.2fs quant=%.2fs diff=%.2fs reduces=%d slots=%d absent=%d",
+                tprof["probe"],
+                tprof["quant"],
+                tprof["diff"],
+                tprof["n_reduce"],
+                tprof["n_slots"],
+                tprof["n_absent"],
             )
 
     def _quantized_stream(self, weights):
