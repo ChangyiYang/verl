@@ -509,7 +509,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
         prof = {"sf": 0, "st": 0, "cc": 0, "ct": 0}  # scale flips / code bytes, changed vs total
         for rec in index:
-            outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
+            # PP placeholder rows (param owned by another stage): no probe, no
+            # local rows -- the union walk below joins every collective with
+            # empty shards and gathers zero-count entries.
+            if rec.probe is None:
+                outs = {}
+                dev = torch.device(torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+            else:
+                outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
+                dev = rec.param.device
             pg = rec.spec.gather_group
             group_rank = dist.get_rank(pg) if pg is not None else dist.get_rank()
             # rec.slots is the row-keyed UNION table (identical on every rank of
@@ -552,7 +560,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     shard = (
                         t.to(torch.bfloat16)
                         if t is not None
-                        else torch.empty((0, sshape[1]), dtype=torch.bfloat16, device=rec.param.device)
+                        else torch.empty((0, sshape[1]), dtype=torch.bfloat16, device=dev)
                     )
                     codes, descale = sharded_scaled_fp8_blockwise(shard, block, 0, tuple(sshape), group=pg)
                     _emit(sname, sshape, codes.reshape(-1), (rec.megatron_name, sname, "c"))
@@ -567,7 +575,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     flat = (
                         t.to(torch.bfloat16).reshape(-1)
                         if t is not None
-                        else torch.empty(0, dtype=torch.bfloat16, device=rec.param.device)
+                        else torch.empty(0, dtype=torch.bfloat16, device=dev)
                     )
                     _emit(sname, sshape, flat, (rec.megatron_name, sname, "b"))
 
@@ -579,8 +587,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     hf_idx = torch.cat(idx_pieces)
                     hf_val = torch.cat(val_pieces)
                 else:
-                    hf_idx = torch.empty(0, dtype=torch.int32, device=rec.param.device)
-                    hf_val = torch.empty(0, dtype=dtype, device=rec.param.device)
+                    hf_idx = torch.empty(0, dtype=torch.int32, device=dev)
+                    hf_val = torch.empty(0, dtype=dtype, device=dev)
                 yield (slot_list, str(dtype).replace("torch.", ""), counts, hf_idx, hf_val, pg)
 
         if not prime_only and os.environ.get("VERL_DELTA_PROFILE"):
