@@ -511,7 +511,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             snap.copy_(flat, non_blocking=True)
             return lidx, lval
 
-        prof = {"sf": 0, "st": 0, "cc": 0, "ct": 0}  # scale flips / code bytes, changed vs total
+        prof = {"sf": 0, "st": 0, "cc": 0, "ct": 0, "cf": 0}  # scale/code changed-vs-total + code-in-flipped-block
         # phase timers (mcore steady decomposition): synced per rec, coarse but honest
         tprof = {"probe": 0.0, "quant": 0.0, "diff": 0.0, "n_reduce": 0, "n_slots": 0, "n_absent": 0}
         _do_tprof = bool(os.environ.get("VERL_DELTA_PROFILE"))
@@ -555,7 +555,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     prof["st"] += flat.numel()
                 if got is None or not contributes:
                     b[1].append(0)
-                    return
+                    return got
                 lidx, lval = got
                 if kind == "c":
                     prof["cc"] += int(lidx.numel())
@@ -565,6 +565,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 if lidx.numel():
                     b[2].append(lidx.to(torch.int32))
                     b[3].append(lval)
+                return got
 
             # one absmax all_reduce per REC, not per slot: every rank walks the
             # same union order, so the concatenated partial grids stay aligned;
@@ -615,14 +616,20 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                         codes = torch.empty(0, dtype=_FP8_DTYPE, device=dev)
                     _sync()
                     tprof["quant"] += time.time() - _tq
-                    _emit(sname, sshape, codes.reshape(-1), (rec.megatron_name, sname, "c"))
-                    _emit(
+                    code_got = _emit(sname, sshape, codes.reshape(-1), (rec.megatron_name, sname, "c"))
+                    scale_got = _emit(
                         sname + "_scale_inv",
                         descale.shape,
                         descale.reshape(-1),
                         (rec.megatron_name, sname, "s"),
                         contributes=(group_rank == 0),
                     )
+                    # cross-stat: changed codes falling inside flipped-scale blocks
+                    if code_got is not None and code_got[0].numel() and t is not None:
+                        cidx = code_got[0]
+                        blk = (cidx // int(sshape[1]) // bm) * descale.shape[1] + (cidx % int(sshape[1])) // bn
+                        if scale_got is not None and scale_got[0].numel():
+                            prof["cf"] += int(torch.isin(blk, scale_got[0].to(blk.dtype)).sum())
                 else:
                     flat = (
                         t.to(torch.bfloat16).reshape(-1)
@@ -645,11 +652,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
         if not prime_only and os.environ.get("VERL_DELTA_PROFILE"):
             logger.warning(
-                "AMAX-PROFILE scale_flips=%d/%d blocks code_changed=%d/%d bytes",
+                "AMAX-PROFILE scale_flips=%d/%d blocks code_changed=%d/%d bytes code_in_flipped_blocks=%d",
                 prof["sf"],
                 prof["st"],
                 prof["cc"],
                 prof["ct"],
+                prof["cf"],
             )
             logger.warning(
                 "MCORE-PROF probe=%.2fs quant=%.2fs diff=%.2fs reduces=%d slots=%d absent=%d",

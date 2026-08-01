@@ -755,14 +755,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # get_per_tensor_param and its implicit onload), so offloaded
                 # params must be brought back first or their GPU storages are
                 # dangling pointers.
+                import time as _time
+
+                _t_on = _time.time()
                 if self.actor.engine.is_param_offload_enabled:
                     self.actor.engine.to(get_device_name(), model=True, optimizer=False, grad=False)
+                _t_send = _time.time()
                 try:
                     metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
                 finally:
+                    _t_off = _time.time()
                     if self.actor.engine.is_param_offload_enabled:
                         self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
                         aggressive_empty_cache(force_sync=True)
+                    if os.environ.get("VERL_DELTA_PROFILE"):
+                        logger.warning(
+                            "SYNC-PROF onload=%.2fs send=%.2fs offload=%.2fs",
+                            _t_send - _t_on,
+                            _t_off - _t_send,
+                            _time.time() - _t_off,
+                        )
                 return metrics or {}
             # sglang's online fp8 path quantizes incoming bf16 itself; QAT's
             # exporter would hand it NVFP4-packed serving weights instead.
