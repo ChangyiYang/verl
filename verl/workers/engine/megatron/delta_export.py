@@ -442,7 +442,7 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
     return slots, dtype_str, counts, hf_idx, hf_val
 
 
-def hf_quant_delta_export(engine, snaps: dict, quant_helper, prime_only: bool = False):
+def hf_quant_delta_export(engine, snaps: dict, quant_spec, prime_only: bool = False):
     """mcore quant-domain steady entries (or snapshot prime when
     ``prime_only``): per export-index record, run the comm-stubbed probe on
     the FULL local shard, NaN-aware-quantize each quantizable HF slot with
@@ -461,8 +461,7 @@ def hf_quant_delta_export(engine, snaps: dict, quant_helper, prime_only: bool = 
     from verl.utils.kernel.fp8_kernel import FP8_MAX as _FP8_MAX
     from verl.utils.kernel.fp8_kernel import ceil_div
 
-    helper = quant_helper
-    block = helper.quant_config.get("weight_block_size", [128, 128])
+    block = list(quant_spec.weight_block_size)
     index = engine._mcore_export_index()
     slot_cache = engine._delta_slot_cache
 
@@ -541,7 +540,7 @@ def hf_quant_delta_export(engine, snaps: dict, quant_helper, prime_only: bool = 
         quantizable = [
             (sname, sshape)
             for sname, sshape in slots
-            if len(sshape) == 2 and helper.should_quantize_param(sname)
+            if len(sshape) == 2 and quant_spec.should_quantize(sname)
         ]
         grids = []
         bm, bn = int(block[0]), int(block[1])
@@ -574,7 +573,7 @@ def hf_quant_delta_export(engine, snaps: dict, quant_helper, prime_only: bool = 
 
         for sname, sshape in slots:
             t = outs.get(sname)
-            if len(sshape) == 2 and helper.should_quantize_param(sname):
+            if len(sshape) == 2 and quant_spec.should_quantize(sname):
                 descale = descales[sname]
                 _tq = time.time()
                 if t is not None:

@@ -433,37 +433,23 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # three collectives per parameter).
         self.batch_gather = int(batch_gather)
 
-    def _quantized_stream(self, weights):
-        """Wrap the full HF export with rollout-scheme fp8 quantization: for
-        every 2D weight the rollout side quantizes, yield ``(name, codes)`` +
-        ``(name_scale_inv, descales)`` exactly as sglang's own quantizer
-        helper names them; everything else passes through in bf16. Every rank
-        walks the wrapper (the export is collective); the quantize kernel is
-        cheap relative to the assembly it follows."""
-        from verl.utils.fp8_sharded import sharded_scaled_fp8_blockwise
-
-        helper = self._fp8_helper()
-        block = helper.quant_config.get("weight_block_size", [128, 128])
-        for name, t in weights:
-            if t.dim() != 2 or not helper.should_quantize_param(name):
-                yield name, t
-                continue
-            # SAME implementation as the steady shard quantizer (group=None ==
-            # whole tensor): seed, steady and the verify re-export must agree
-            # bit-for-bit, and fp32->fp8 tie rounding is implementation-
-            # sensitive across kernels.
-            codes, descale = sharded_scaled_fp8_blockwise(
-                t.to(torch.bfloat16), block, 0, tuple(t.shape), group=None
-            )
-            yield name, codes
-            yield name + "_scale_inv", descale
-
     def _verify_due(self) -> bool:
         """True on every K-th steady sync when constructed with ``verify_every=K``."""
         if self.verify_every <= 0:
             return False
         self._steady_count = getattr(self, "_steady_count", 0) + 1
         return self._steady_count % self.verify_every == 0
+
+    def _fp8_spec(self):
+        """Distill the serving engine's quant config into a rollout-agnostic
+        :class:`~verl.utils.fp8_sharded.QuantSpec` for the backend."""
+        from verl.utils.fp8_sharded import QuantSpec
+
+        h = self._fp8_helper()
+        return QuantSpec(
+            weight_block_size=tuple(h.quant_config.get("weight_block_size", [128, 128])),
+            should_quantize=h.should_quantize_param,
+        )
 
     def _fp8_helper(self):
         from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper, build_sglang_fp8_quant_config
@@ -661,18 +647,19 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # whole model.
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
         if not self._shard_seeded:
-            full, _ = engine.get_per_tensor_param(raw_master=self.quantize_fp8)
             if self.quantize_fp8:
-                # fp8 rollout mode: the seed ships the rollout's EXACT state
-                # (codes + scale_inv, trainer-quantized); snapshots pin the
-                # SAME quantized shard stream, so the steady byte-diff runs
-                # in the rollout's own domain.
-                metrics = self._send_full_seed(self._quantized_stream(full), global_steps, bytes_wire=True)
+                # fp8 rollout mode: the BACKEND produces the rollout's exact
+                # state (codes + scale_inv, quantized off the raw master per
+                # the explicit spec); the seed ships it verbatim and the
+                # steady byte-diff then runs in the rollout's own domain.
+                full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=self._fp8_spec())
+                metrics = self._send_full_seed(full, global_steps, bytes_wire=True)
                 from verl.workers.engine.megatron.delta_export import hf_quant_delta_export
 
-                for _ in hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_helper(), prime_only=True):
+                for _ in hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_spec(), prime_only=True):
                     pass
             else:
+                full, _ = engine.get_per_tensor_param()
                 metrics = self._send_full_seed(full, global_steps)
                 # weights do not move during the sync, so the snapshots equal
                 # exactly what the rollout just received.
@@ -688,7 +675,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # scales against engine-held snapshots.
             from verl.workers.engine.megatron.delta_export import hf_quant_delta_export
 
-            weights = hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_helper())
+            weights = hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_spec())
         else:
             weights, _ = engine.get_per_tensor_param_delta_shard()
         is_r0 = self.is_master
@@ -746,10 +733,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 self._publish_terminal(False)
         if verify:
             # collective on every rank: the full export assembles per tensor.
-            full, _ = engine.get_per_tensor_param(raw_master=self.quantize_fp8)
             if self.quantize_fp8:
-                self._send_full_seed(self._quantized_stream(full), global_steps, verify=True, bytes_wire=True)
+                full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=self._fp8_spec())
+                self._send_full_seed(full, global_steps, verify=True, bytes_wire=True)
             else:
+                full, _ = engine.get_per_tensor_param()
                 self._send_full_seed(full, global_steps, verify=True)
         if not is_r0:
             return

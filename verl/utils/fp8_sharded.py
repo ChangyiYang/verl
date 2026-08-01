@@ -37,6 +37,8 @@ mask contributes zeros.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from verl.utils.kernel.fp8_kernel import FP8_DTYPE, FP8_MAX, ceil_div
@@ -137,3 +139,34 @@ def sharded_scaled_fp8_blockwise(
     descale = absmax / FP8_MAX  # kernel: x_s = absmax / fp8_max
     codes = quantize_shard_with_descale(shard, descale, weight_block_size, row_offset)
     return codes, descale
+
+
+@dataclass
+class QuantSpec:
+    """Rollout-format request handed to a backend's ``get_per_tensor_param``.
+
+    Deliberately rollout-agnostic: the caller (checkpoint engine) distills the
+    serving engine's quantization config into a block shape plus a per-param
+    predicate; the backend only honors the spec and never sees who asked.
+    """
+
+    weight_block_size: tuple[int, int]
+    should_quantize: object  # Callable[[str], bool]
+
+
+def quantize_hf_stream(weights, spec: QuantSpec):
+    """Wrap a full HF ``(name, tensor)`` export with blockwise fp8 quantization:
+    for every 2D weight the spec selects, yield ``(name, codes)`` +
+    ``(name_scale_inv, descales)``; everything else passes through in bf16.
+    Whole-tensor path (``group=None``) -- bitwise-identical to the sharded
+    steady quantizer, which matters because fp32->fp8 tie rounding is
+    implementation-sensitive across kernels.
+    """
+    block = list(spec.weight_block_size)
+    for name, t in weights:
+        if t.dim() != 2 or not spec.should_quantize(name):
+            yield name, t
+            continue
+        codes, descale = sharded_scaled_fp8_blockwise(t.to(torch.bfloat16), block, 0, tuple(t.shape), group=None)
+        yield name, codes
+        yield name + "_scale_inv", descale

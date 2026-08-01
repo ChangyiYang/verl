@@ -863,6 +863,17 @@ class MegatronEngine(BaseEngine):
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
 
+        # explicit rollout-format request: the backend owns format production
+        # (codes + scale_inv exactly as the serving engine names them) without
+        # knowing who asked -- the caller distills its quant config into the
+        # spec. Composes with raw_master (quantize the bf16 master, not QAT's
+        # serving export).
+        quant_spec = kwargs.get("quant_spec")
+        if quant_spec is not None:
+            from verl.utils.fp8_sharded import quantize_hf_stream
+
+            per_tensor_param = quantize_hf_stream(per_tensor_param, quant_spec)
+
         return per_tensor_param, peft_config
 
     def _mcore_export_index(self):
