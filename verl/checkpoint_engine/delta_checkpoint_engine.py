@@ -427,7 +427,6 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # full-resync per sync (the quant-domain sparse steady path lands
         # next); the wire is already half the bf16 bytes per element.
         self.quantize_fp8 = bool(quantize_fp8)
-        self._fp8_snaps: dict = {}
         self._shard_seeded = False
         # Gather the per-param sparse deltas in groups of this many parameters
         # (one count-matrix all_gather + two padded gathers per group instead of
@@ -678,10 +677,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # steady byte-diff then runs in the rollout's own domain.
                 full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=self._fp8_spec(engine))
                 metrics = self._send_full_seed(full, global_steps, bytes_wire=True)
-                from verl.workers.engine.megatron.delta_export import hf_quant_delta_export
-
-                for _ in hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_spec(engine), prime_only=True):
-                    pass
+                engine.prime_delta_snapshots(quant_spec=self._fp8_spec(engine))
             else:
                 full, _ = engine.get_per_tensor_param()
                 metrics = self._send_full_seed(full, global_steps)
@@ -689,17 +685,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # exactly what the rollout just received.
                 engine.prime_delta_snapshots()
             return metrics
+        # the BACKEND owns delta production for every dtype: with a quant spec
+        # it yields quant-domain entries (codes + scale grids diffed against
+        # engine-held snapshots), without one the bf16 shard deltas.
         if self.quantize_fp8:
-            # mcore quant-domain sparse: the comm-stubbed probe turns the FULL
-            # local shard into its HF view (real values at this rank's
-            # positions, NaN placeholders elsewhere) -- the same transform the
-            # bf16 steady already pays per sync. Quantize that view NaN-aware
-            # (placeholders come out as the fp8 NaN byte, stable across syncs,
-            # so the code byte-diff is zero there) and byte-diff codes and
-            # scales against engine-held snapshots.
-            from verl.workers.engine.megatron.delta_export import hf_quant_delta_export
-
-            weights = hf_quant_delta_export(engine, self._fp8_snaps, self._fp8_spec(engine))
+            weights, _ = engine.get_per_tensor_param_delta_shard(quant_spec=self._fp8_spec(engine))
         else:
             weights, _ = engine.get_per_tensor_param_delta_shard()
         is_r0 = self.is_master

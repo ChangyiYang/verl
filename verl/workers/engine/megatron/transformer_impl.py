@@ -927,16 +927,38 @@ class MegatronEngine(BaseEngine):
         rec = self._delta_export_by_name[name]
         return mcore_hf_delta_entry(rec, place, lidx, lval, self._delta_slot_cache)
 
-    def get_per_tensor_param_delta_shard(self, **kwargs):
+    def get_per_tensor_param_delta_shard(self, quant_spec=None, **kwargs):
         """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
         per mcore parameter (see the FSDP engine's method of the same name for the
         contract; MegatronEngine extends BaseEngine directly, so the thin wrapper
-        is repeated here). Requires a prior :meth:`prime_delta_snapshots` call."""
+        is repeated here). Requires a prior :meth:`prime_delta_snapshots` call.
+
+        With ``quant_spec`` the payloads are produced directly in the rollout's
+        quantization domain (codes + scale grids diffed against the engine-held
+        quant snapshots) -- the backend owns delta production for every dtype."""
+        if quant_spec is not None:
+            from .delta_export import hf_quant_delta_export
+
+            self._quant_delta_snaps = getattr(self, "_quant_delta_snaps", {})
+            return hf_quant_delta_export(self, self._quant_delta_snaps, quant_spec), None
         from ..utils import hf_delta_export
 
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
         gen, _ = self.get_per_tensor_param_shard()
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
+
+    def prime_delta_snapshots(self, quant_spec=None) -> None:
+        """Capture the state the NEXT delta-shard call will diff against. With
+        ``quant_spec``, runs the same quant-domain walk as the steady export in
+        prime-only mode (same keys, same collective sequence)."""
+        if quant_spec is not None:
+            from .delta_export import hf_quant_delta_export
+
+            self._quant_delta_snaps = getattr(self, "_quant_delta_snaps", {})
+            for _ in hf_quant_delta_export(self, self._quant_delta_snaps, quant_spec, prime_only=True):
+                pass
+            return
+        super().prime_delta_snapshots()
 
     def disable_adapter(self) -> ContextManager:
         return self.peft_cls.disable_adapter(self.module)
