@@ -119,28 +119,6 @@ def quantize_shard_with_descale(
     return x
 
 
-def sharded_scaled_fp8_blockwise(
-    shard: torch.Tensor,
-    weight_block_size: list[int] | tuple[int, int],
-    row_offset: int,
-    full_shape: tuple[int, int],
-    group=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Two-phase sharded quantization: partial absmax -> all_reduce(MAX) ->
-    local quantize. Returns ``(codes, descale)`` where ``codes`` covers this
-    rank's rows and ``descale`` is the full global grid (identical on every
-    rank after the reduce)."""
-    import torch.distributed as dist
-
-    grid = local_blockwise_absmax(shard, weight_block_size, row_offset, full_shape)
-    if group is not None:
-        dist.all_reduce(grid, op=dist.ReduceOp.MAX, group=group)
-    absmax = grid.clamp_(min=_ABSMAX_EPS)  # kernel: maximum(max|x|, eps)
-    descale = absmax / FP8_MAX  # kernel: x_s = absmax / fp8_max
-    codes = quantize_shard_with_descale(shard, descale, weight_block_size, row_offset)
-    return codes, descale
-
-
 @dataclass
 class QuantSpec:
     """Rollout-format request handed to a backend's ``get_per_tensor_param``.
@@ -167,6 +145,9 @@ def quantize_hf_stream(weights, spec: QuantSpec):
         if t.dim() != 2 or not spec.should_quantize(name):
             yield name, t
             continue
-        codes, descale = sharded_scaled_fp8_blockwise(t.to(torch.bfloat16), block, 0, tuple(t.shape), group=None)
+        t = t.to(torch.bfloat16)
+        grid = local_blockwise_absmax(t, block, 0, tuple(t.shape))
+        descale = grid.clamp_(min=_ABSMAX_EPS) / FP8_MAX
+        codes = quantize_shard_with_descale(t, descale, block, 0)
         yield name, codes
         yield name + "_scale_inv", descale
