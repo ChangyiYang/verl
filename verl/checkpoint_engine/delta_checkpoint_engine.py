@@ -278,6 +278,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "spec": {
                 "encoding": self.encoding,
                 "values_bytes": self.quantize_fp8,
+                # sparse flushes carry the quant config too: the receiver's
+                # handshake (incl. the seed-required sentinel guard) must be
+                # reachable on the steady path, not only on the dense seed.
+                "quant_config": getattr(self, "_fp8_quant_cfg", None),
                 "params": [vars(p) for p in flush.params],
                 "checksum": int(flush.checksum),
             },

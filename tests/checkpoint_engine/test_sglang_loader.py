@@ -390,3 +390,28 @@ def test_sparse_bytes_flush_fp8_codes_and_scales():
     want = new_codes.view(torch.uint8)
     assert torch.equal(got, want), "fp8 codes must match bit-for-bit after masked apply"
     assert torch.equal(model.params["w.weight_scale_inv"], new_scales)
+
+def test_sentinel_guard_blocks_unseeded_sparse():
+    """A sparse fp8 flush arriving while weight_scale_inv still holds the
+    unloaded sentinel must fail loud (seed-required guard)."""
+    import pytest
+
+    from verl.workers.rollout.sglang_rollout.delta_loader import _check_quant_handshake
+
+    class _M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            sentinel = torch.finfo(torch.float32).min
+            self.weight = torch.nn.Parameter(torch.zeros(256, 256, dtype=torch.float8_e4m3fn), requires_grad=False)
+            self.weight_scale_inv = torch.nn.Parameter(
+                torch.full((2, 2), sentinel, dtype=torch.float32), requires_grad=False
+            )
+
+    model = _M()
+    spec = {"encoding": "indices", "values_bytes": True,
+            "quant_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}}
+    with pytest.raises(AssertionError, match="never seeded"):
+        _check_quant_handshake(model, spec)
+    # dense seed spec passes (guard only polices sparse arrivals)
+    _check_quant_handshake(model, dict(spec, encoding="dense"))
+
