@@ -961,7 +961,10 @@ class MegatronEngine(BaseEngine):
 
             self._quant_delta_snaps = getattr(self, "_quant_delta_snaps", {})
             gen, _ = self.get_per_tensor_param_shard(quant_spec=quant_spec)
-            prime_delta_snapshots(gen, self._quant_delta_snaps, pin=is_cuda_available and self.delta_pin_snapshots)
+            # quant snapshots pin unconditionally: they are ~4x smaller than the
+            # bf16 shard sets that motivated delta_pin_snapshots=False, and the
+            # pageable H2D/D2H round-trip costs seconds per sync at 7B already.
+            prime_delta_snapshots(gen, self._quant_delta_snaps, pin=is_cuda_available)
             return
         super().prime_delta_snapshots()
 
