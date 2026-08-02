@@ -670,28 +670,22 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # whole model.
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
         if not self._shard_seeded:
-            if self.quantize_fp8:
-                # fp8 rollout mode: the BACKEND produces the rollout's exact
-                # state (codes + scale_inv, quantized off the raw master per
-                # the explicit spec); the seed ships it verbatim and the
-                # steady byte-diff then runs in the rollout's own domain.
-                full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=self._fp8_spec(engine))
-                metrics = self._send_full_seed(full, global_steps, bytes_wire=True)
-                engine.prime_delta_snapshots(quant_spec=self._fp8_spec(engine))
-            else:
-                full, _ = engine.get_per_tensor_param()
-                metrics = self._send_full_seed(full, global_steps)
-                # weights do not move during the sync, so the snapshots equal
-                # exactly what the rollout just received.
-                engine.prime_delta_snapshots()
+            # the BACKEND produces the seed in the rollout's exact format (with a
+            # quant spec: codes + scale_inv off the raw master; without: bf16),
+            # ships it verbatim, then snapshots the SAME domain as the diff base
+            # -- weights do not move during the sync, so the snapshots equal
+            # exactly what the rollout just received.
+            spec = self._fp8_spec(engine) if self.quantize_fp8 else None
+            full, _ = engine.get_per_tensor_param(raw_master=spec is not None, quant_spec=spec)
+            metrics = self._send_full_seed(full, global_steps, bytes_wire=spec is not None)
+            engine.prime_delta_snapshots(quant_spec=spec)
             return metrics
         # the BACKEND owns delta production for every dtype: with a quant spec
         # it yields quant-domain entries (codes + scale grids diffed against
         # engine-held snapshots), without one the bf16 shard deltas.
-        if self.quantize_fp8:
-            weights, _ = engine.get_per_tensor_param_delta_shard(quant_spec=self._fp8_spec(engine))
-        else:
-            weights, _ = engine.get_per_tensor_param_delta_shard()
+        weights, _ = engine.get_per_tensor_param_delta_shard(
+            quant_spec=self._fp8_spec(engine) if self.quantize_fp8 else None
+        )
         is_r0 = self.is_master
         n_flushes = 0
         changed_elems = 0

@@ -186,7 +186,7 @@ class BaseEngine:
     # True when get_per_tensor_param_shard yields HF-coordinate shards (DTensor
     # backends): enables shard-local quant-domain delta (fp8 sparse steady).
 
-    def prime_delta_snapshots(self) -> None:
+    def prime_delta_snapshots(self, quant_spec=None) -> None:
         """
         Snapshot this rank's CURRENT shards as the delta diff base. Called right after the
         seed sync (which streams :meth:`get_per_tensor_param`'s full HF export):
@@ -200,6 +200,7 @@ class BaseEngine:
         from verl.utils.device import is_cuda_available
         from verl.workers.engine.utils import prime_delta_snapshots
 
+        assert quant_spec is None, f"{type(self).__name__} does not support quant-domain delta snapshots"
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
         gen, _ = self.get_per_tensor_param_shard()
         prime_delta_snapshots(gen, self._delta_shard_snap, pin=is_cuda_available and self.delta_pin_snapshots)
