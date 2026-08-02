@@ -572,7 +572,9 @@ def quant_delta_entry(engine):
     def _entry(name, spec, place, lidx, lval):
         slots, sizes, dtype_str = engine._quant_group_meta[name]
         if os.environ.get("VERL_DELTA_PROFILE"):
-            prof = engine._quant_profile = getattr(engine, "_quant_profile", {"sf": 0, "st": 0, "cc": 0, "ct": 0})
+            prof = getattr(engine, "_quant_profile", None)
+            if prof is None:
+                prof = engine._quant_profile = {"sf": 0, "st": 0, "cc": 0, "ct": 0}
             kind = name.rsplit("::", 1)[-1]
             if kind == "c":
                 prof["cc"] += int(lidx.numel())
