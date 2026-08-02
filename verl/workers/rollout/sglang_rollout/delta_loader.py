@@ -60,12 +60,42 @@ CHUNK_BYTES = 512 << 20
 LOADER_FQN = "verl.workers.rollout.sglang_rollout.delta_loader.apply_delta"
 
 
+def _find_live_quant_config(model: torch.nn.Module):
+    """Read the live quantization config straight from a quantized sglang layer.
+
+    Reads ``module.quant_method.quant_config`` (NOT ``module.quant_config``:
+    layers excluded via ignored_layers keep the config object but get an
+    UnquantizedLinearMethod, so the quant_method is the authority on whether
+    the layer is actually quantized)."""
+    for name, module in model.named_modules():
+        qm = getattr(module, "quant_method", None)
+        qc = getattr(qm, "quant_config", None)
+        if qc is None:
+            continue
+        block = getattr(qc, "weight_block_size", None)
+        if block is None or not hasattr(module, "weight_scale_inv"):
+            continue
+        return {
+            "layer_name": name,
+            "quant_method": type(qc).__name__,
+            "weight_block_size": [int(x) for x in block],
+            "use_mxfp8": bool(getattr(qc, "use_mxfp8", False)),
+            "module": module,
+        }
+    return None
+
+
 def _check_quant_handshake(model: torch.nn.Module, spec: dict) -> None:
-    """Fail loud at the FIRST flush if the trainer's quant config does not match
-    the live model: the wire meta carries the trainer's config, and the live
-    block size is recoverable from any (weight, weight_scale_inv) grid pair.
-    Catches trainer/rollout quant-config divergence (e.g. mismatched
-    ignored_layers or block size) before it surfaces as shape weirdness."""
+    """Two separate questions, answered loudly at the first flush:
+
+    1. config handshake -- do trainer and rollout use the same quantization
+       definition? Compared against the LIVE layer config
+       (``quant_method.quant_config``), falling back to shape inference only
+       when no live config is discoverable.
+    2. state sanity -- do the created params match that definition (scale grid
+       shape = ceil(weight shape / block)), and has the state been seeded
+       (sparse deltas on sentinel scales are refused)?
+    """
     cfg = spec.get("quant_config")
     if cfg is None or getattr(model, "_delta_quant_handshake_done", False):
         return
@@ -76,28 +106,55 @@ def _check_quant_handshake(model: torch.nn.Module, spec: dict) -> None:
     if spec.get("encoding") != "dense":
         sentinel = torch.finfo(torch.float32).min
         for name, param in model.named_parameters():
-            if name.endswith("weight_scale_inv") and param.numel():
-                assert float(param.data.flatten()[0]) != sentinel, (
-                    f"sparse fp8 delta arrived but {name} still holds the unloaded sentinel scale "
-                    "-- the rollout was never seeded (full seed sync must precede any steady delta)"
-                )
-                break
+            if not name.endswith("weight_scale_inv") or not param.numel():
+                continue
+            assert float(param.data.flatten()[0]) != sentinel, (
+                f"sparse fp8 delta arrived but {name} still holds the unloaded sentinel scale "
+                "-- the rollout was never seeded (full seed sync must precede any steady delta)"
+            )
+            break
     want = cfg.get("weight_block_size")
     if want is not None:
         want = [int(x) for x in want]
-        for name, param in model.named_parameters():
-            if not name.endswith("weight_scale_inv") or param.dim() != 2:
-                continue
-            base = dict(model.named_parameters()).get(name[: -len("_scale_inv")])
-            if base is None or base.dim() != 2:
-                continue
-            bm = (base.shape[0] + param.shape[0] - 1) // param.shape[0]
-            bn = (base.shape[1] + param.shape[1] - 1) // param.shape[1]
-            assert [bm, bn] == want, (
-                f"quant handshake failed on {name}: live block size ~[{bm}, {bn}] "
-                f"vs trainer config {want} (spec quant_config={cfg})"
+        live = _find_live_quant_config(model)
+        if live is not None:
+            assert not live["use_mxfp8"], (
+                f"quant handshake failed: rollout layer {live['layer_name']} runs mxfp8 "
+                f"({live['quant_method']}), trainer ships plain blockwise fp8 ({cfg})"
             )
-            break
+            assert live["weight_block_size"] == want, (
+                f"quant handshake failed: rollout {live['quant_method']} block size "
+                f"{live['weight_block_size']} vs trainer config {want}"
+            )
+            # state sanity: created params match the agreed definition
+            module = live["module"]
+            w = getattr(module, "weight", None)
+            si = getattr(module, "weight_scale_inv", None)
+            if w is not None and si is not None and w.dim() == 2 and si.dim() == 2:
+                expect = [
+                    (w.shape[0] + want[0] - 1) // want[0],
+                    (w.shape[1] + want[1] - 1) // want[1],
+                ]
+                assert list(si.shape) == expect, (
+                    f"state sanity failed on {live['layer_name']}: scale grid {list(si.shape)} "
+                    f"vs expected {expect} for block {want}"
+                )
+        else:
+            # no discoverable live config: fall back to shape inference
+            logger.warning("quant handshake: no live quant_config found on any module; falling back to shape check")
+            for name, param in model.named_parameters():
+                if not name.endswith("weight_scale_inv") or param.dim() != 2:
+                    continue
+                base = dict(model.named_parameters()).get(name[: -len("_scale_inv")])
+                if base is None or base.dim() != 2:
+                    continue
+                bm = (base.shape[0] + param.shape[0] - 1) // param.shape[0]
+                bn = (base.shape[1] + param.shape[1] - 1) // param.shape[1]
+                assert [bm, bn] == want, (
+                    f"quant handshake failed on {name}: live block size ~[{bm}, {bn}] "
+                    f"vs trainer config {want} (spec quant_config={cfg})"
+                )
+                break
     model._delta_quant_handshake_done = True
 
 

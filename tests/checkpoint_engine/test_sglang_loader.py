@@ -415,3 +415,42 @@ def test_sentinel_guard_blocks_unseeded_sparse():
     # dense seed spec passes (guard only polices sparse arrivals)
     _check_quant_handshake(model, dict(spec, encoding="dense"))
 
+def test_quant_handshake_reads_live_config():
+    """Config handshake reads quant_method.quant_config (live authority) and
+    fails loud on block-size / mxfp8 mismatch; matching config passes with the
+    state-sanity grid check."""
+    import pytest
+
+    from verl.workers.rollout.sglang_rollout.delta_loader import _check_quant_handshake
+
+    class _QC:
+        weight_block_size = [128, 128]
+        use_mxfp8 = False
+
+    class _QM:
+        quant_config = _QC()
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_method = _QM()
+            self.weight = torch.nn.Parameter(torch.zeros(256, 256, dtype=torch.float8_e4m3fn), requires_grad=False)
+            self.weight_scale_inv = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.float32), requires_grad=False)
+
+    class _M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = _Layer()
+
+    ok_spec = {"encoding": "dense", "quant_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}}
+    _check_quant_handshake(_M(), ok_spec)  # matching config + grid: passes
+
+    with pytest.raises(AssertionError, match="block size"):
+        bad = {"encoding": "dense", "quant_config": {"quant_method": "fp8", "weight_block_size": [256, 256]}}
+        _check_quant_handshake(_M(), bad)
+
+    mx = _M()
+    mx.layer.quant_method.quant_config = type("QC", (), {"weight_block_size": [1, 32], "use_mxfp8": True})()
+    with pytest.raises(AssertionError, match="mxfp8"):
+        _check_quant_handshake(mx, ok_spec)
+
