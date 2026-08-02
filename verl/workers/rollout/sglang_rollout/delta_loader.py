@@ -60,6 +60,34 @@ CHUNK_BYTES = 512 << 20
 LOADER_FQN = "verl.workers.rollout.sglang_rollout.delta_loader.apply_delta"
 
 
+def _check_quant_handshake(model: torch.nn.Module, spec: dict) -> None:
+    """Fail loud at the FIRST flush if the trainer's quant config does not match
+    the live model: the wire meta carries the trainer's config, and the live
+    block size is recoverable from any (weight, weight_scale_inv) grid pair.
+    Catches trainer/rollout quant-config divergence (e.g. mismatched
+    ignored_layers or block size) before it surfaces as shape weirdness."""
+    cfg = spec.get("quant_config")
+    if cfg is None or getattr(model, "_delta_quant_handshake_done", False):
+        return
+    want = cfg.get("weight_block_size")
+    if want is not None:
+        want = [int(x) for x in want]
+        for name, param in model.named_parameters():
+            if not name.endswith("weight_scale_inv") or param.dim() != 2:
+                continue
+            base = dict(model.named_parameters()).get(name[: -len("_scale_inv")])
+            if base is None or base.dim() != 2:
+                continue
+            bm = (base.shape[0] + param.shape[0] - 1) // param.shape[0]
+            bn = (base.shape[1] + param.shape[1] - 1) // param.shape[1]
+            assert [bm, bn] == want, (
+                f"quant handshake failed on {name}: live block size ~[{bm}, {bn}] "
+                f"vs trainer config {want} (spec quant_config={cfg})"
+            )
+            break
+    model._delta_quant_handshake_done = True
+
+
 def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
     """Decode one sparse delta flush and masked-apply it onto ``model`` in place."""
     from verl.checkpoint_engine.delta_sync.encode import checksum as _checksum
@@ -78,6 +106,7 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
             "indicates corruption between sender encode and receiver apply"
         )
 
+    _check_quant_handshake(model, spec)
     if spec["encoding"] == "dense":
         if spec.get("verify"):
             _verify_dense(model, spec["params"], values, bool(spec.get("is_last")), bool(spec.get("values_bytes")))
