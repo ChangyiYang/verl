@@ -41,6 +41,13 @@ class _FakeModel:
         for name, tensor in chunk:
             self.params[name].copy_(tensor)
 
+    # the storage-scoped masked copy consults these, like any nn.Module
+    def named_parameters(self):
+        return iter(self.params.items())
+
+    def named_buffers(self):
+        return iter(())
+
 
 def _make_named(dtype=torch.bfloat16) -> list[tuple[str, torch.Tensor]]:
     torch.manual_seed(0)
@@ -83,12 +90,14 @@ def _sparse_indices_flush(old_named, new_named):
     return params, positions, values
 
 
-def _named_tensors(params, positions, values, encoding="indices"):
+def _named_tensors(params, positions, values, encoding="indices", extra_spec=None):
     spec = {
         "encoding": encoding,
         "params": [vars(p) for p in params],
         "checksum": int(checksum(positions, values)),
     }
+    if extra_spec:
+        spec.update(extra_spec)
     spec_t = torch.frombuffer(bytearray(json.dumps(spec).encode()), dtype=torch.uint8)
     out = [("__delta_spec__", spec_t), ("__values__", values.clone())]
     if positions.numel():
@@ -227,3 +236,221 @@ def test_verify_sweep_fails_loud_on_divergence():
     model = _FakeModel(diverged)
     with pytest.raises(RuntimeError, match="verification FAILED"):
         apply_delta(model, _dense_verify_flush(named))
+
+
+class _ScratchCopyModel(_FakeModel):
+    """A loader that also copies the incoming (NaN-masked) tensor into a
+    scratch buffer on the way -- the exact pattern quant loaders use for
+    repacking. Scratch writes must keep VANILLA copy semantics (NaNs pass
+    through); only the param write is masked."""
+
+    def __init__(self, named):
+        super().__init__(named)
+        self.scratch = {n: torch.zeros_like(t) for n, t in named}
+
+    def load_weights(self, chunk):
+        for name, tensor in chunk:
+            self.scratch[name].copy_(tensor)  # NOT model state: no masking
+            self.params[name].copy_(tensor)
+
+
+def test_masked_copy_scoped_to_param_storage():
+    """NaN-masked overlay applies to param storages only: a scratch copy in the
+    same load path receives the NaN sentinels verbatim."""
+    named = _make_named()
+    model = _ScratchCopyModel(named)
+    new_named = [(n, t.clone()) for n, t in named]
+    new_named[0][1][3, 5] = 42.0
+    params, positions, values = _sparse_indices_flush(named, new_named)
+    apply_delta(model, _named_tensors(params, positions, values))
+
+    assert model.params["layer.0.weight"][3, 5] == 42.0
+    untouched = ~torch.isnan(model.params["layer.0.weight"])
+    assert untouched.all(), "param must never hold NaN after a masked apply"
+    scr = model.scratch["layer.0.weight"]
+    assert torch.isnan(scr).sum() == scr.numel() - 1, "scratch copy must receive the NaN mask verbatim"
+    assert scr[3, 5] == 42.0
+
+
+class _PostLoadModel(_FakeModel):
+    """Records that post_load_weights ran, and that it ran with VANILLA copy_
+    semantics (a NaN source must write through -- proving the masked patch is
+    off by the time derived tensors recompute)."""
+
+    def __init__(self, named):
+        super().__init__(named)
+        self.post_load_calls = 0
+        self.probe = torch.zeros(4)
+
+    def post_load_weights(self):
+        self.post_load_calls += 1
+        self.probe.copy_(torch.full((4,), float("nan")))
+
+
+def test_post_load_weights_runs_unpatched_on_last_flush():
+    named = _make_named()
+    model = _PostLoadModel(named)
+    new_named = [(n, t.clone()) for n, t in named]
+    new_named[0][1][0, 0] = 7.0
+    params, positions, values = _sparse_indices_flush(named, new_named)
+
+    apply_delta(model, _named_tensors(params, positions, values))
+    assert model.post_load_calls == 0, "non-final flush must not trigger post_load_weights"
+
+    apply_delta(model, _named_tensors(params, positions, values, extra_spec={"is_last": True}))
+    assert model.post_load_calls == 1
+    assert torch.isnan(model.probe).all(), "post_load_weights must run with vanilla copy_ semantics"
+
+
+def test_dense_bytes_flush_mixed_dtypes():
+    """fp8 seeds ship mixed-dtype flushes as one byte blob (codes uint8-viewed,
+    scales fp32, leftovers bf16) with BYTE offsets and per-param reinterpret."""
+    w_bf16 = torch.randn(8, 4, dtype=torch.bfloat16)
+    w_fp32 = torch.rand(3, 2, dtype=torch.float32) + 0.5
+    model = _FakeModel([("a.weight", torch.zeros_like(w_bf16)), ("a.weight_scale_inv", torch.zeros_like(w_fp32))])
+
+    b1 = w_bf16.reshape(-1).view(torch.uint8)
+    b2 = w_fp32.reshape(-1).view(torch.uint8)
+    values = torch.cat([b1, b2])
+    params = [
+        DeltaParam(
+            name="a.weight",
+            dtype="bfloat16",
+            shape=list(w_bf16.shape),
+            pos_start=0,
+            pos_end=0,
+            pos_width=4,
+            val_start=0,
+            val_end=int(b1.numel()),
+        ),
+        DeltaParam(
+            name="a.weight_scale_inv",
+            dtype="float32",
+            shape=list(w_fp32.shape),
+            pos_start=0,
+            pos_end=0,
+            pos_width=4,
+            val_start=int(b1.numel()),
+            val_end=int(b1.numel() + b2.numel()),
+        ),
+    ]
+    positions = torch.empty(0, dtype=torch.uint8)
+    flush = _named_tensors(params, positions, values, encoding="dense", extra_spec={"values_bytes": True})
+    flush = [(n, t) for n, t in flush if n != "__positions__"]
+    apply_delta(model, flush)
+
+    assert torch.equal(model.params["a.weight"].view(torch.int16), w_bf16.view(torch.int16))
+    assert torch.equal(model.params["a.weight_scale_inv"], w_fp32)
+
+
+def test_sparse_bytes_flush_fp8_codes_and_scales():
+    """A3 wire: quant-domain sparse flush -- fp8 code delta + fp32 scale delta
+    in one byte-packed indices flush; masked apply touches only the changed
+    positions (fp8 NaN sentinel = all-ones magnitude byte)."""
+    codes = torch.randn(16, 8).to(torch.float8_e4m3fn)
+    scales = torch.rand(2, 1, dtype=torch.float32) + 0.5
+    model = _FakeModel([("w.weight", codes.clone()), ("w.weight_scale_inv", scales.clone())])
+
+    new_codes = codes.clone()
+    new_codes[3, 5] = torch.tensor(0.5).to(torch.float8_e4m3fn)
+    new_scales = scales.clone()
+    new_scales[1, 0] = 9.0
+
+    params, idx_pieces, val_pieces = [], [], []
+    pos_off = val_off = 0
+    for name, old, new in [("w.weight", codes, new_codes), ("w.weight_scale_inv", scales, new_scales)]:
+        fo, fn = old.reshape(-1).view(torch.uint8), new.reshape(-1).view(torch.uint8)
+        esz = old.element_size()
+        changed = (fo.view(-1, esz) != fn.view(-1, esz)).any(dim=-1) if esz > 1 else (fo != fn)
+        idx = changed.nonzero(as_tuple=False).view(-1)
+        nnz = int(idx.numel())
+        assert nnz > 0
+        idx_pieces.append(idx.to(torch.int32))
+        val_pieces.append(fn.view(-1, esz)[idx].reshape(-1))
+        params.append(
+            DeltaParam(
+                name=name,
+                dtype=str(new.dtype).replace("torch.", ""),
+                shape=list(new.shape),
+                pos_start=pos_off,
+                pos_end=pos_off + nnz * 4,
+                pos_width=4,
+                val_start=val_off,
+                val_end=val_off + nnz * esz,
+            )
+        )
+        pos_off += nnz * 4
+        val_off += nnz * esz
+    positions = torch.cat(idx_pieces).contiguous().view(torch.uint8)
+    values = torch.cat(val_pieces)
+    flush = _named_tensors(params, positions, values, encoding="indices", extra_spec={"values_bytes": True})
+    apply_delta(model, flush)
+
+    got = model.params["w.weight"].view(torch.uint8)
+    want = new_codes.view(torch.uint8)
+    assert torch.equal(got, want), "fp8 codes must match bit-for-bit after masked apply"
+    assert torch.equal(model.params["w.weight_scale_inv"], new_scales)
+
+def test_sentinel_guard_blocks_unseeded_sparse():
+    """A sparse fp8 flush arriving while weight_scale_inv still holds the
+    unloaded sentinel must fail loud (seed-required guard)."""
+    import pytest
+
+    from verl.workers.rollout.sglang_rollout.delta_loader import _check_quant_handshake
+
+    class _M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            sentinel = torch.finfo(torch.float32).min
+            self.weight = torch.nn.Parameter(torch.zeros(256, 256, dtype=torch.float8_e4m3fn), requires_grad=False)
+            self.weight_scale_inv = torch.nn.Parameter(
+                torch.full((2, 2), sentinel, dtype=torch.float32), requires_grad=False
+            )
+
+    model = _M()
+    spec = {"encoding": "indices", "values_bytes": True,
+            "quant_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}}
+    with pytest.raises(AssertionError, match="never seeded"):
+        _check_quant_handshake(model, spec)
+    # dense seed spec passes (guard only polices sparse arrivals)
+    _check_quant_handshake(model, dict(spec, encoding="dense"))
+
+def test_quant_handshake_reads_live_config():
+    """Config handshake reads quant_method.quant_config (live authority) and
+    fails loud on block-size / mxfp8 mismatch; matching config passes with the
+    state-sanity grid check."""
+    import pytest
+
+    from verl.workers.rollout.sglang_rollout.delta_loader import _check_quant_handshake
+
+    class _QC:
+        weight_block_size = [128, 128]
+        use_mxfp8 = False
+
+    class _QM:
+        quant_config = _QC()
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_method = _QM()
+            self.weight = torch.nn.Parameter(torch.zeros(256, 256, dtype=torch.float8_e4m3fn), requires_grad=False)
+            self.weight_scale_inv = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.float32), requires_grad=False)
+
+    class _M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = _Layer()
+
+    ok_spec = {"encoding": "dense", "quant_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}}
+    _check_quant_handshake(_M(), ok_spec)  # matching config + grid: passes
+
+    with pytest.raises(AssertionError, match="block size"):
+        bad = {"encoding": "dense", "quant_config": {"quant_method": "fp8", "weight_block_size": [256, 256]}}
+        _check_quant_handshake(_M(), bad)
+
+    mx = _M()
+    mx.layer.quant_method.quant_config = type("QC", (), {"weight_block_size": [1, 32], "use_mxfp8": True})()
+    with pytest.raises(AssertionError, match="mxfp8"):
+        _check_quant_handshake(mx, ok_spec)
+

@@ -750,10 +750,37 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if effective_mode != "naive":
             if effective_mode == "delta_sharded":
                 # the delta engine owns the sync state machine (seed vs steady,
-                # snapshot prime), so it drives the training engine itself.
-                metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+                # snapshot prime), so it drives the training engine itself. The
+                # steady walk reads megatron params directly (it bypasses
+                # get_per_tensor_param and its implicit onload), so offloaded
+                # params must be brought back first or their GPU storages are
+                # dangling pointers.
+                import time as _time
+
+                _t_on = _time.time()
+                if self.actor.engine.is_param_offload_enabled:
+                    self.actor.engine.to(get_device_name(), model=True, optimizer=False, grad=False)
+                _t_send = _time.time()
+                try:
+                    metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+                finally:
+                    _t_off = _time.time()
+                    if self.actor.engine.is_param_offload_enabled:
+                        self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+                        aggressive_empty_cache(force_sync=True)
+                    if os.environ.get("VERL_DELTA_PROFILE"):
+                        logger.warning(
+                            "SYNC-PROF onload=%.2fs send=%.2fs offload=%.2fs",
+                            _t_send - _t_on,
+                            _t_off - _t_send,
+                            _time.time() - _t_off,
+                        )
                 return metrics or {}
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            # sglang's online fp8 path quantizes incoming bf16 itself; QAT's
+            # exporter would hand it NVFP4-packed serving weights instead.
+            per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
+                raw_master=getattr(self.config.rollout, "quantization", None) == "fp8"
+            )
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return metrics or {}
 
@@ -766,8 +793,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. determine if we need a base weight sync (adapter path only)
+        # QAT's exporter emits the vLLM serving format (e.g. NVFP4-packed
+        # codes); sglang's online fp8 path quantizes incoming bf16 itself, so
+        # it must see the raw master weights instead.
+        raw_master = getattr(self.config.rollout, "quantization", None) == "fp8"
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
+            layered_summon=self.layered_summon, base_sync_done=True, raw_master=raw_master
         )
 
         do_lora_base_sync = False
@@ -778,7 +809,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
             per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=False
+                layered_summon=self.layered_summon, base_sync_done=False, raw_master=raw_master
             )
             await self.rollout.update_weights(
                 per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
