@@ -754,6 +754,16 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         if not is_r0:
             return
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
+        prof = getattr(engine, "_quant_profile", None)
+        if prof is not None:
+            logger.warning(
+                "AMAX-PROFILE scale_flips=%d/%d blocks code_changed=%d/%d bytes",
+                prof["sf"],
+                prof["st"],
+                prof["cc"],
+                prof["ct"],
+            )
+            engine._quant_profile = None
         logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
         if not total_elems:
             return None

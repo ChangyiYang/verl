@@ -53,7 +53,6 @@ from __future__ import annotations
 import copy
 import logging
 import os
-import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -442,113 +441,65 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
     return slots, dtype_str, counts, hf_idx, hf_val
 
 
-def hf_quant_delta_export(engine, snaps: dict, quant_spec, prime_only: bool = False):
-    """mcore quant-domain steady entries (or snapshot prime when
-    ``prime_only``): per export-index record, run the comm-stubbed probe on
-    the FULL local shard, NaN-aware-quantize each quantizable HF slot with
-    the group-global scales, and byte-diff codes + scales against pinned
-    snapshots. Emits up to three dtype-homogeneous entries per record
-    (fp8 codes / fp32 scales / bf16 passthrough slots); scale grids are
-    identical on every rank of the group after the all_reduce, so only the
-    group's rank 0 contributes them."""
+def quant_shard_stream(engine, quant_spec):
+    """Quant-domain shard exporter with the SAME contract as
+    ``get_per_tensor_param_shard``: yields ``(name, local_flat, ShardSpec)``
+    triples that the GENERIC ``hf_delta_export`` / ``prime_delta_snapshots``
+    machinery consumes -- the quant path and the bf16 path share one diff
+    implementation by construction.
+
+    Per export-index record: run the comm-stubbed probe on the FULL local
+    shard, batch every quantizable slot's partial absmax grid into ONE
+    all_reduce over the record's merge group, quantize locally, and yield up
+    to three dtype-homogeneous groups (concatenated across the record's union
+    slots, zero-length segments for rows other ranks own -- lockstep by
+    construction):
+
+        ``{megatron_name}::c``  fp8 codes        (contributes: always)
+        ``{megatron_name}::s``  fp32 scale grids (contributes: group rank 0)
+        ``{megatron_name}::b``  bf16 passthrough (contributes: always)
+
+    Slot metadata for the entry builder is registered on
+    ``engine._quant_group_meta[name]`` as ``(slots, sizes)``.
+    """
     import torch.distributed as dist
 
-    from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
-    from verl.utils.device import is_cuda_available
-    from verl.utils.fp8_sharded import _ABSMAX_EPS as _FP8_ABSMAX_EPS
-    from verl.utils.fp8_sharded import local_blockwise_absmax, quantize_shard_with_descale
-    from verl.utils.kernel.fp8_kernel import FP8_DTYPE as _FP8_DTYPE
-    from verl.utils.kernel.fp8_kernel import FP8_MAX as _FP8_MAX
-    from verl.utils.kernel.fp8_kernel import ceil_div
+    from verl.utils.fp8_sharded import _ABSMAX_EPS, local_blockwise_absmax, quantize_shard_with_descale
+    from verl.utils.kernel.fp8_kernel import FP8_DTYPE, FP8_MAX, ceil_div
 
+    helper_should_quantize = quant_spec.should_quantize
     block = list(quant_spec.weight_block_size)
+    bm, bn = int(block[0]), int(block[1])
     index = engine._mcore_export_index()
     slot_cache = engine._delta_slot_cache
-
-    def _snap_diff(key, flat):
-        snap = snaps.get(key)
-        if snap is None or snap.numel() != flat.numel():
-            snap = torch.empty_like(flat, device="cpu", pin_memory=is_cuda_available)
-            snaps[key] = snap
-            snap.copy_(flat, non_blocking=True)
-            return None  # first sight: primed, nothing to diff
-        base = snap.to(flat.device, non_blocking=True)
-        lidx, lval = shard_delta_indices(flat, base, 0)
-        snap.copy_(flat, non_blocking=True)
-        return lidx, lval
-
-    prof = {"sf": 0, "st": 0, "cc": 0, "ct": 0, "cf": 0}  # scale/code changed-vs-total + code-in-flipped-block
-    # phase timers (mcore steady decomposition): synced per rec, coarse but honest
-    tprof = {"probe": 0.0, "quant": 0.0, "diff": 0.0, "n_reduce": 0, "n_slots": 0, "n_absent": 0}
-    _do_tprof = bool(os.environ.get("VERL_DELTA_PROFILE"))
-
-    def _sync():
-        if _do_tprof and torch.cuda.is_available():
-            torch.cuda.synchronize()
+    meta = engine._quant_group_meta = getattr(engine, "_quant_group_meta", {})
 
     for rec in index:
-        _sync()
-        _t0 = time.time()
         if rec.probe is None:
             outs = {}
             dev = torch.device(torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         else:
             outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
             dev = rec.param.device
-        _sync()
-        tprof["probe"] += time.time() - _t0
         pg = rec.spec.gather_group
         group_rank = dist.get_rank(pg) if pg is not None else dist.get_rank()
-        # rec.slots is the row-keyed UNION table (identical on every rank of
-        # the merge group); the local probe only covers this rank's rows.
         slots = rec.slots if rec.slots is not None else slot_cache.get(rec.megatron_name)
         if slots is None:
             slots = [(n, tuple(int(x) for x in t.shape)) for n, t in outs.items()]
             slot_cache[rec.megatron_name] = slots
-        buckets: dict = {}  # dtype -> (slot list, counts list, idx pieces, val pieces)
 
-        def _emit(sname, sshape, flat, key, contributes=True, buckets=buckets, prof=prof):
-            _t = time.time()
-            got = _snap_diff(key, flat)
-            _sync()
-            tprof["diff"] += time.time() - _t
-            b = buckets.setdefault(flat.dtype, ([], [], [], []))
-            b[0].append((sname, tuple(sshape)))
-            kind = key[2]
-            if kind == "c":
-                prof["ct"] += flat.numel()
-            elif kind == "s" and contributes:
-                prof["st"] += flat.numel()
-            if got is None or not contributes:
-                b[1].append(0)
-                return got
-            lidx, lval = got
-            if kind == "c":
-                prof["cc"] += int(lidx.numel())
-            elif kind == "s":
-                prof["sf"] += int(lidx.numel())
-            b[1].append(int(lidx.numel()))
-            if lidx.numel():
-                b[2].append(lidx.to(torch.int32))
-                b[3].append(lval)
-            return got
-
-        # one absmax all_reduce per REC, not per slot: every rank walks the
-        # same union order, so the concatenated partial grids stay aligned;
-        # absent rows contribute zero partials without materializing shards.
-        _tq = time.time()
         quantizable = [
             (sname, sshape)
             for sname, sshape in slots
-            if len(sshape) == 2 and quant_spec.should_quantize(sname)
+            if len(sshape) == 2 and helper_should_quantize(sname)
         ]
+        # one absmax all_reduce per record: concatenated partial grids stay
+        # aligned because every rank walks the same union order; absent rows
+        # contribute zero partials without materializing shards.
         grids = []
-        bm, bn = int(block[0]), int(block[1])
         for sname, sshape in quantizable:
             t = outs.get(sname)
-            tprof["n_slots"] += 1
             if t is None:
-                tprof["n_absent"] += 1
                 g = torch.zeros(
                     ceil_div(int(sshape[0]), bm), ceil_div(int(sshape[1]), bn), dtype=torch.float32, device=dev
                 )
@@ -556,81 +507,85 @@ def hf_quant_delta_export(engine, snaps: dict, quant_spec, prime_only: bool = Fa
                 g = local_blockwise_absmax(t.to(torch.bfloat16), block, 0, tuple(sshape))
             grids.append(g)
         if grids and pg is not None:
-            tprof["n_reduce"] += 1
             flatg = torch.cat([g.reshape(-1) for g in grids])
             dist.all_reduce(flatg, op=dist.ReduceOp.MAX, group=pg)
             off = 0
-            for i, g in enumerate(grids):
-                n = g.numel()
-                grids[i] = flatg[off : off + n].view_as(g)
-                off += n
-        descales = {}
-        for (sname, sshape), g in zip(quantizable, grids, strict=False):
-            absmax = g.clamp(min=_FP8_ABSMAX_EPS)
-            descales[sname] = absmax / _FP8_MAX
-        _sync()
-        tprof["quant"] += time.time() - _tq
+            for i2, g in enumerate(grids):
+                n2 = g.numel()
+                grids[i2] = flatg[off : off + n2].view_as(g)
+                off += n2
 
+        groups = {
+            "c": {"slots": [], "pieces": [], "dtype": FP8_DTYPE, "contributes": True},
+            "s": {"slots": [], "pieces": [], "dtype": torch.float32, "contributes": group_rank == 0},
+            "b": {"slots": [], "pieces": [], "dtype": torch.bfloat16, "contributes": True},
+        }
+        qi = 0
         for sname, sshape in slots:
             t = outs.get(sname)
-            if len(sshape) == 2 and quant_spec.should_quantize(sname):
-                descale = descales[sname]
-                _tq = time.time()
+            if len(sshape) == 2 and helper_should_quantize(sname):
+                descale = grids[qi].clamp(min=_ABSMAX_EPS) / FP8_MAX
+                qi += 1
                 if t is not None:
                     codes = quantize_shard_with_descale(t.to(torch.bfloat16), descale, block, 0)
                 else:
-                    codes = torch.empty(0, dtype=_FP8_DTYPE, device=dev)
-                _sync()
-                tprof["quant"] += time.time() - _tq
-                code_got = _emit(sname, sshape, codes.reshape(-1), (rec.megatron_name, sname, "c"))
-                scale_got = _emit(
-                    sname + "_scale_inv",
-                    descale.shape,
-                    descale.reshape(-1),
-                    (rec.megatron_name, sname, "s"),
-                    contributes=(group_rank == 0),
-                )
-                # cross-stat: changed codes falling inside flipped-scale blocks
-                if code_got is not None and code_got[0].numel() and t is not None:
-                    cidx = code_got[0]
-                    blk = (cidx // int(sshape[1]) // bm) * descale.shape[1] + (cidx % int(sshape[1])) // bn
-                    if scale_got is not None and scale_got[0].numel():
-                        prof["cf"] += int(torch.isin(blk, scale_got[0].to(blk.dtype)).sum())
+                    codes = torch.empty(0, dtype=FP8_DTYPE, device=dev)
+                groups["c"]["slots"].append((sname, tuple(sshape)))
+                groups["c"]["pieces"].append(codes.reshape(-1))
+                groups["s"]["slots"].append((sname + "_scale_inv", tuple(descale.shape)))
+                groups["s"]["pieces"].append(descale.reshape(-1))
             else:
                 flat = (
                     t.to(torch.bfloat16).reshape(-1)
                     if t is not None
                     else torch.empty(0, dtype=torch.bfloat16, device=dev)
                 )
-                _emit(sname, sshape, flat, (rec.megatron_name, sname, "b"))
+                groups["b"]["slots"].append((sname, tuple(sshape)))
+                groups["b"]["pieces"].append(flat)
 
-        if prime_only:
-            continue
-        for dtype, (slot_list, count_list, idx_pieces, val_pieces) in buckets.items():
-            counts = torch.tensor(count_list, dtype=torch.int64)
-            if idx_pieces:
-                hf_idx = torch.cat(idx_pieces)
-                hf_val = torch.cat(val_pieces)
-            else:
-                hf_idx = torch.empty(0, dtype=torch.int32, device=dev)
-                hf_val = torch.empty(0, dtype=dtype, device=dev)
-            yield (slot_list, str(dtype).replace("torch.", ""), counts, hf_idx, hf_val, pg)
+        for kind, g in groups.items():
+            if not g["slots"]:
+                continue
+            name = f"{rec.megatron_name}::{kind}"
+            sizes = [int(pc.numel()) for pc in g["pieces"]]
+            meta[name] = (g["slots"], sizes, str(g["dtype"]).replace("torch.", ""))
+            flat = (
+                torch.cat(g["pieces"])
+                if g["pieces"]
+                else torch.empty(0, dtype=g["dtype"], device=dev)
+            )
+            spec = ShardSpec(
+                full_shape=(int(flat.numel()),),
+                place=0,
+                contributes=g["contributes"],
+                gather_group=pg,
+            )
+            yield name, flat, spec
 
-    if not prime_only and os.environ.get("VERL_DELTA_PROFILE"):
-        logger.warning(
-            "AMAX-PROFILE scale_flips=%d/%d blocks code_changed=%d/%d bytes code_in_flipped_blocks=%d",
-            prof["sf"],
-            prof["st"],
-            prof["cc"],
-            prof["ct"],
-            prof["cf"],
-        )
-        logger.warning(
-            "MCORE-PROF probe=%.2fs quant=%.2fs diff=%.2fs reduces=%d slots=%d absent=%d",
-            tprof["probe"],
-            tprof["quant"],
-            tprof["diff"],
-            tprof["n_reduce"],
-            tprof["n_slots"],
-            tprof["n_absent"],
-        )
+
+def quant_delta_entry(engine):
+    """Entry builder for the quant shard stream, closed over the engine's group
+    metadata: splits the concatenated group's delta positions back into
+    per-slot counts and slot-local indices -- the exact wire entry shape the
+    bf16 path produces."""
+
+    def _entry(name, spec, place, lidx, lval):
+        slots, sizes, dtype_str = engine._quant_group_meta[name]
+        if os.environ.get("VERL_DELTA_PROFILE"):
+            prof = engine._quant_profile = getattr(engine, "_quant_profile", {"sf": 0, "st": 0, "cc": 0, "ct": 0})
+            kind = name.rsplit("::", 1)[-1]
+            if kind == "c":
+                prof["cc"] += int(lidx.numel())
+                prof["ct"] += int(sum(sizes))
+            elif kind == "s" and spec.contributes:
+                prof["sf"] += int(lidx.numel())
+                prof["st"] += int(sum(sizes))
+        bounds = torch.tensor(sizes, device=lidx.device).cumsum(0)
+        seg = torch.searchsorted(bounds, lidx, right=True)
+        counts = torch.bincount(seg, minlength=len(sizes)).to("cpu")
+        offsets = torch.cat([torch.zeros(1, dtype=bounds.dtype, device=lidx.device), bounds[:-1]])
+        local_idx = (lidx - offsets[seg]).to(torch.int32)
+        return (slots, dtype_str, counts, local_idx, lval)
+
+    return _entry
+

@@ -895,13 +895,17 @@ class MegatronEngine(BaseEngine):
             self._delta_export_by_name = {rec.megatron_name: rec for rec in index}
         return index
 
-    def get_per_tensor_param_shard(self, **kwargs):
+    def get_per_tensor_param_shard(self, quant_spec=None, **kwargs):
         """Yield each rank's *local* mcore shard ``(name, local_flat_bf16,
         ShardSpec)`` -- the spec carries only the wire merge group (the
         comm-stubbed probe owns all shard geometry). Pure export, no side
         effects. Params owned by another pipeline stage yield an empty shard
         (zero-count lockstep rows; see the index builder)."""
         load_megatron_model_to_gpu(self.module, load_grad=False)
+        if quant_spec is not None:
+            from .delta_export import quant_shard_stream
+
+            return quant_shard_stream(self, quant_spec), None
         index = self._mcore_export_index()
 
         def _gen():
@@ -936,15 +940,15 @@ class MegatronEngine(BaseEngine):
         With ``quant_spec`` the payloads are produced directly in the rollout's
         quantization domain (codes + scale grids diffed against the engine-held
         quant snapshots) -- the backend owns delta production for every dtype."""
-        if quant_spec is not None:
-            from .delta_export import hf_quant_delta_export
-
-            self._quant_delta_snaps = getattr(self, "_quant_delta_snaps", {})
-            return hf_quant_delta_export(self, self._quant_delta_snaps, quant_spec), None
         from ..utils import hf_delta_export
 
+        gen, _ = self.get_per_tensor_param_shard(quant_spec=quant_spec)
+        if quant_spec is not None:
+            from .delta_export import quant_delta_entry
+
+            self._quant_delta_snaps = getattr(self, "_quant_delta_snaps", {})
+            return hf_delta_export(gen, self._quant_delta_snaps, quant_delta_entry(self)), None
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
-        gen, _ = self.get_per_tensor_param_shard()
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def prime_delta_snapshots(self, quant_spec=None) -> None:
@@ -952,11 +956,12 @@ class MegatronEngine(BaseEngine):
         ``quant_spec``, runs the same quant-domain walk as the steady export in
         prime-only mode (same keys, same collective sequence)."""
         if quant_spec is not None:
-            from .delta_export import hf_quant_delta_export
+            from verl.utils.device import is_cuda_available
+            from verl.workers.engine.utils import prime_delta_snapshots
 
             self._quant_delta_snaps = getattr(self, "_quant_delta_snaps", {})
-            for _ in hf_quant_delta_export(self, self._quant_delta_snaps, quant_spec, prime_only=True):
-                pass
+            gen, _ = self.get_per_tensor_param_shard(quant_spec=quant_spec)
+            prime_delta_snapshots(gen, self._quant_delta_snaps, pin=is_cuda_available and self.delta_pin_snapshots)
             return
         super().prime_delta_snapshots()
 
