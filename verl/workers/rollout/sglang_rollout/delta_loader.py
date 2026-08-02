@@ -69,6 +69,19 @@ def _check_quant_handshake(model: torch.nn.Module, spec: dict) -> None:
     cfg = spec.get("quant_config")
     if cfg is None or getattr(model, "_delta_quant_handshake_done", False):
         return
+    # seed-required guard: sglang boots serialized-fp8 params with SENTINEL
+    # scales (never loaded from a bf16 ckpt) -- serving or sparse-patching that
+    # state would silently produce garbage. The first quantized payload must be
+    # the full seed; a sparse delta arriving on sentinel scales fails loud.
+    if spec.get("encoding") != "dense":
+        sentinel = torch.finfo(torch.float32).min
+        for name, param in model.named_parameters():
+            if name.endswith("weight_scale_inv") and param.numel():
+                assert float(param.data.flatten()[0]) != sentinel, (
+                    f"sparse fp8 delta arrived but {name} still holds the unloaded sentinel scale "
+                    "-- the rollout was never seeded (full seed sync must precede any steady delta)"
+                )
+                break
     want = cfg.get("weight_block_size")
     if want is not None:
         want = [int(x) for x in want]
