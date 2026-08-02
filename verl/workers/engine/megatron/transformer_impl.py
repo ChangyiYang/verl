@@ -941,15 +941,15 @@ class MegatronEngine(BaseEngine):
         quantization domain (codes + scale grids diffed against the engine-held
         quant snapshots) -- the backend owns delta production for every dtype."""
         from ..utils import hf_delta_export
+        from .delta_export import quant_delta_entry
 
         gen, _ = self.get_per_tensor_param_shard(quant_spec=quant_spec)
-        if quant_spec is not None:
-            from .delta_export import quant_delta_entry
-
-            self._quant_delta_snaps = getattr(self, "_quant_delta_snaps", {})
-            return hf_delta_export(gen, self._quant_delta_snaps, quant_delta_entry(self)), None
+        # ONE snapshot store for both domains: quant groups key as
+        # "{megatron_name}::{kind}", bf16 shards as plain megatron names --
+        # disjoint namespaces, identical prime/diff/refresh semantics.
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
-        return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
+        entry = quant_delta_entry(self) if quant_spec is not None else self._hf_delta_entry
+        return hf_delta_export(gen, self._delta_shard_snap, entry), None
 
     def prime_delta_snapshots(self, quant_spec=None) -> None:
         """Capture the state the NEXT delta-shard call will diff against. With
@@ -959,12 +959,12 @@ class MegatronEngine(BaseEngine):
             from verl.utils.device import is_cuda_available
             from verl.workers.engine.utils import prime_delta_snapshots
 
-            self._quant_delta_snaps = getattr(self, "_quant_delta_snaps", {})
+            self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
             gen, _ = self.get_per_tensor_param_shard(quant_spec=quant_spec)
             # quant snapshots pin unconditionally: they are ~4x smaller than the
             # bf16 shard sets that motivated delta_pin_snapshots=False, and the
             # pageable H2D/D2H round-trip costs seconds per sync at 7B already.
-            prime_delta_snapshots(gen, self._quant_delta_snaps, pin=is_cuda_available)
+            prime_delta_snapshots(gen, self._delta_shard_snap, pin=is_cuda_available)
             return
         super().prime_delta_snapshots()
 
