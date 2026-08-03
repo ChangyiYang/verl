@@ -125,3 +125,50 @@ class SGLangFP8QuantizerHelper(FP8QuantizerHelper):
             if _matches_ignored_layer(param_name, ignored_layer):
                 return False
         return super().should_quantize_param(param_name)
+
+
+class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
+    """DSv4-native fp8 conversion for the nccl full-sync path.
+
+    The serialized rollout ckpt is the single source of truth: a weight is
+    quantized iff its ``<stem>.scale`` companion exists in the ckpt index
+    (wo_a stays bf16, norms/sinks/router never appear), and scales follow the
+    ckpt's ue8m0 dialect (power-of-two, ``.scale`` suffix) so sglang's
+    deepseek_v4 loader consumes them exactly like a checkpoint load.
+    """
+
+    def __init__(self, quant_config, ckpt_path: str):
+        super().__init__(quant_config)
+        import json
+        import os
+
+        idx = json.load(open(os.path.join(ckpt_path, "model.safetensors.index.json")))
+        names = set(idx["weight_map"])
+        self._quantized = {n for n in names if n.endswith(".weight") and n[: -len(".weight")] + ".scale" in names}
+
+    def should_quantize_param(self, param_name):
+        return param_name in self._quantized
+
+    async def quant_weights_by_name(self, weights, dtype=None):
+        import torch
+
+        from verl.utils.fp8_sharded import local_blockwise_absmax, quantize_shard_with_descale
+        from verl.utils.sglang.utils import ensure_async_iterator
+
+        bm_bn = self.quant_config.get("weight_block_size") if isinstance(self.quant_config, dict) else None
+        bm_bn = tuple(bm_bn or (128, 128))
+        FP8_MAX = 448.0
+        async for k, v in ensure_async_iterator(weights):
+            if not self.should_quantize_param(k):
+                yield (k, v)
+                continue
+            x = v.to(torch.float32)
+            amax = local_blockwise_absmax(x, bm_bn, row_offset=0, full_shape=tuple(x.shape))
+            # ue8m0 dialect: descale rounded UP to a power of two (exactly
+            # representable in fp32, so the wire can carry fp32 and the e8m0
+            # param cast on apply is lossless).
+            descale = torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-10) / FP8_MAX)))
+            codes = quantize_shard_with_descale(x, descale, bm_bn, row_offset=0)
+            yield (k, codes)
+            yield (k[: -len(".weight")] + ".scale", descale)
+            del x, amax, descale, codes
