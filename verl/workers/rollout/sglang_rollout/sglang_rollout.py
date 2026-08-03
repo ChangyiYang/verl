@@ -344,14 +344,26 @@ class ServerAdapter(BaseRollout):
         else:
             update_weights_bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
             if self.config.get("quantization", None) == "fp8":
-                from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper
+                if getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v4":
+                    # DSv4 ships a serialized fp8(ue8m0) ckpt with native naming;
+                    # quantize by the ckpt's own manifest instead of name rules.
+                    from verl.utils.sglang.sglang_fp8_utils import DeepseekV4FP8QuantizerHelper
 
-                logger.info("Convert bf16 weights to fp8 format before loading")
-                fp8_quantizer_helper = SGLangFP8QuantizerHelper(self.model_config.hf_config.quantization_config)
-                weights = fp8_quantizer_helper.quant_weights_by_name(
-                    weights,
-                    dtype=self.model_config.hf_config.dtype,
-                )
+                    logger.info("Convert bf16 weights to DSv4-native fp8(ue8m0) before loading")
+                    fp8_quantizer_helper = DeepseekV4FP8QuantizerHelper(
+                        self.model_config.hf_config.quantization_config,
+                        self.model_config.local_path,
+                    )
+                    weights = fp8_quantizer_helper.quant_weights_by_name(weights)
+                else:
+                    from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper
+
+                    logger.info("Convert bf16 weights to fp8 format before loading")
+                    fp8_quantizer_helper = SGLangFP8QuantizerHelper(self.model_config.hf_config.quantization_config)
+                    weights = fp8_quantizer_helper.quant_weights_by_name(
+                        weights,
+                        dtype=self.model_config.hf_config.dtype,
+                    )
             else:
                 weights = weights
 
