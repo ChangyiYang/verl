@@ -172,3 +172,11 @@ class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
             yield (k, codes)
             yield (k[: -len(".weight")] + ".scale", descale)
             del x, amax, descale, codes
+            # DSv4 is large enough that the per-parameter transients accumulate
+            # faster than the caching allocator releases them, and the conversion
+            # OOMs partway through. Reclaim every 32 params: frequent enough to
+            # bound the high-water mark, rare enough that the sync cost is noise.
+            _n_q = getattr(self, "_n_q", 0) + 1
+            self._n_q = _n_q
+            if _n_q % 32 == 0:
+                torch.cuda.empty_cache()
