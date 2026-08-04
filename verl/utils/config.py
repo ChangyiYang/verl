@@ -112,6 +112,38 @@ def validate_config(
             f"({minimal_bsz})"
         )
 
+    # Soft prompt vs. the vLLM prefix cache.
+    #
+    # vLLM's automatic prefix caching is keyed on TOKEN IDS. The soft prompt's ids
+    # are constant across steps while the embedding rows behind them change at
+    # every optimizer step, so a cached prefix block computed at step N is reused
+    # at step N+1 against different weights. The rollout then samples from a stale
+    # prompt and nothing errors -- this program has already measured that failure
+    # once, reading 2.50% instead of 25.00% until reset_prefix_cache() was added.
+    #
+    # verl already resets the prefix cache on the weight-sync path
+    # (update_weights -> rollout.resume -> wake_up -> engine.reset_prefix_cache),
+    # but that path is gated on free_cache_engine and skipped in standalone mode.
+    # A soft prefix is the maximally cacheable prefix in every request -- byte
+    # identical across all steps and all prompts by construction -- so it is
+    # guaranteed to hit a stale entry where an ordinary varying prompt might not.
+    # Fail loudly instead of trusting the gate.
+    if getattr(config.actor_rollout_ref.model, "soft_prompt_num_tokens", 0) > 0:
+        rollout_cfg = config.actor_rollout_ref.rollout
+        if getattr(rollout_cfg, "enable_prefix_caching", True) and not rollout_cfg.free_cache_engine:
+            raise ValueError(
+                "soft_prompt_num_tokens > 0 with rollout.enable_prefix_caching=True and "
+                "rollout.free_cache_engine=False: the prefix cache is keyed on token ids, the "
+                "soft prompt's ids never change, and nothing would reset the cache after a "
+                "weight sync -- the rollout would silently sample from a stale prompt. Set "
+                "rollout.free_cache_engine=True (default) or rollout.enable_prefix_caching=False."
+            )
+        if getattr(rollout_cfg, "mode", None) == "standalone":
+            raise ValueError(
+                "soft_prompt_num_tokens > 0 with rollout.mode=standalone: standalone skips "
+                "wake_up, which is what resets the vLLM prefix cache after a weight sync."
+            )
+
     # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
     # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
     def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):

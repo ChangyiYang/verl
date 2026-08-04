@@ -54,6 +54,15 @@ exclude_modules: null
 # Path to pre-trained LoRA adapter to load for continued training
 lora_adapter_path: null
 
+# Soft-prompt-only training on a frozen backbone. 0 disables. When > 0, the
+# prompt occupies that many reserved vocabulary rows and is the only thing that
+# receives gradient; the rollout reaches it by prepending those token ids.
+soft_prompt_num_tokens: 0
+
+# safetensors file holding a "prompt_embeddings" (num_tokens, hidden) tensor, to
+# continue from an already-trained prompt instead of a random vocabulary init.
+soft_prompt_init_path: null
+
 # whether to use liger. Only valid when we use hf model definition
 use_liger: False
 

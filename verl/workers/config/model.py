@@ -133,6 +133,15 @@ class HFModelConfig(BaseConfig):
 
     # path to pre-trained LoRA adapter to load for continued training
     lora_adapter_path: Optional[str] = None
+
+    # Soft-prompt-only training on a frozen backbone. > 0 enables it; the prompt
+    # occupies that many reserved vocabulary rows (rows the tokenizer never
+    # emits) and is the only thing that receives gradient. See
+    # verl/utils/soft_prompt.py for why this is not peft.PromptTuningConfig.
+    soft_prompt_num_tokens: int = 0
+    # safetensors file with a "prompt_embeddings" (num_tokens, hidden) tensor, to
+    # continue from an already-trained prompt instead of a random vocabulary init.
+    soft_prompt_init_path: Optional[str] = None
     use_liger: bool = False
 
     use_fused_kernels: bool = False

@@ -1033,12 +1033,42 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            # The teacher must NOT see the soft prompt. It is the published RL
+            # model; the reserved rows in ITS embedding table are untrained
+            # garbage, and conditioning on them would corrupt every hidden state
+            # downstream -- silently, since nothing would error. The objective is
+            # KL( student(.| soft, x, y_<t) || teacher(.| x, y_<t) ): the teacher
+            # conditions on the bare prompt. So strip the soft ids here and
+            # re-pad the returned arrays so response positions still line up
+            # with the student's sequence.
+            from verl.utils.soft_prompt import soft_prompt_ids_from_config
+
+            n_soft = len(soft_prompt_ids_from_config(self.config, self.tokenizer))
+            sequence_ids = prompt_ids + response_ids
+            if n_soft:
+                sequence_ids = sequence_ids[n_soft:]
+
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
+                sequence_ids=sequence_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
             )
+            if n_soft:
+                # Left-pad back to the student's length. These entries sit in the
+                # prompt region, which response_mask excludes, so their values are
+                # never read -- but the lengths must match or the loss silently
+                # pairs student position t with teacher position t - n_soft.
+                # Both come back with a trailing top-k dimension when topk > 0,
+                # so take the pad shape from the tensors rather than assuming 1-D.
+                teacher_ids = torch.cat(
+                    [teacher_ids.new_zeros((n_soft, *teacher_ids.shape[1:])), teacher_ids], dim=0
+                )
+                teacher_logprobs = torch.cat(
+                    [teacher_logprobs.new_zeros((n_soft, *teacher_logprobs.shape[1:])), teacher_logprobs],
+                    dim=0,
+                )
+
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 

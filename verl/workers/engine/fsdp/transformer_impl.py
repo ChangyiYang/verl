@@ -140,6 +140,8 @@ class FSDPEngine(BaseEngine):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = self.model_config.lora_rank > 0
+        self._soft_prompt_tokens = getattr(self.model_config, "soft_prompt_num_tokens", 0)
+        self._soft_prompt_ids = None
         # Set in _build_fsdp_module when FSDP2 CPUOffloadPolicy is configured (see #5995).
         self._uses_fsdp2_cpu_offload_policy = False
 
@@ -312,6 +314,47 @@ class FSDPEngine(BaseEngine):
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         return module
+
+    def _install_soft_prompt(self, module):
+        """Reserve vocabulary rows for the soft prompt and freeze everything else.
+
+        The reserved ids are derived from the tokenizer, not assumed: Qwen pads
+        the output vocabulary above the registered vocabulary and the registered
+        ids are not contiguous, so `len(tokenizer)` is not a safe boundary.
+        """
+        import torch
+
+        from verl.utils.soft_prompt import install_soft_prompt, reserved_vocab_ids
+
+        tokenizer = self.model_config.tokenizer
+        vocab_size = int(module.get_input_embeddings().weight.shape[0])
+        soft_ids = reserved_vocab_ids(
+            vocab_size, tokenizer.get_vocab().values(), self._soft_prompt_tokens
+        )
+
+        init_path = getattr(self.model_config, "soft_prompt_init_path", None)
+        ids = install_soft_prompt(
+            module,
+            soft_ids,
+            # Same seed on every rank: the reserved rows are replicated, not
+            # sharded, at this point, and ranks that disagreed would silently
+            # train different prompts until the first all-reduce hid it.
+            generator=torch.Generator(device=module.get_input_embeddings().weight.device).manual_seed(0),
+        )
+        if init_path:
+            from safetensors.torch import load_file
+
+            vectors = load_file(init_path, device="cpu")["prompt_embeddings"]
+            if tuple(vectors.shape) != (self._soft_prompt_tokens, module.config.hidden_size):
+                raise ValueError(
+                    f"{init_path} holds {tuple(vectors.shape)} but this run needs "
+                    f"{(self._soft_prompt_tokens, module.config.hidden_size)}"
+                )
+            with torch.no_grad():
+                weight = module.get_input_embeddings().weight
+                weight[ids] = vectors.to(weight.device, weight.dtype)
+            logger.info("soft prompt initialised from %s", init_path)
+        return ids
 
     def _build_lora_module(self, module):
         module.enable_input_require_grads()
@@ -575,6 +618,13 @@ class FSDPEngine(BaseEngine):
         if self._is_lora:
             module = self._build_lora_module(module)
 
+        # Soft-prompt-only training. Must run before FSDP wrapping: it flips
+        # requires_grad and writes embedding rows on the unsharded module.
+        if self._soft_prompt_tokens > 0:
+            if self._is_lora:
+                raise ValueError("soft_prompt_num_tokens and lora_rank are mutually exclusive")
+            self._soft_prompt_ids = self._install_soft_prompt(module)
+
         # Apply QAT before FSDP wrapping (training only)
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
@@ -589,6 +639,13 @@ class FSDPEngine(BaseEngine):
         log_gpu_memory_usage("Before FSDP", logger=None)
         module = self._build_fsdp_module(module)
         log_gpu_memory_usage("After FSDP", logger=None)
+
+        # After wrapping, not before: fully_shard replaces the parameter with a
+        # DTensor, so a hook registered on the pre-shard tensor never fires.
+        if self._soft_prompt_ids is not None:
+            from verl.utils.soft_prompt import register_grad_mask
+
+            register_grad_mask(module, self._soft_prompt_ids)
 
         if not self.engine_config.forward_only:
             # Initialize optimizer with model parameters and config settings

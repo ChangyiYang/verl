@@ -60,6 +60,16 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 mm_processor_kwargs=mm_processor_kwargs,
             )
 
+        # 2b. Soft prompt: lead the request with the reserved vocabulary rows.
+        # This is what makes the rollout on-policy for the prompt -- without it
+        # the sampler would generate from the bare base model while the trainer
+        # optimised a prompt nothing ever conditioned on, and nothing would crash.
+        from verl.utils.soft_prompt import soft_prompt_ids_from_config
+
+        soft_ids = soft_prompt_ids_from_config(self.config, self.tokenizer)
+        if soft_ids:
+            prompt_ids = list(soft_ids) + list(prompt_ids)
+
         # 3. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):
