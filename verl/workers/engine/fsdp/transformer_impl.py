@@ -339,9 +339,13 @@ class FSDPEngine(BaseEngine):
             # Same seed on every rank: the reserved rows are replicated, not
             # sharded, at this point, and ranks that disagreed would silently
             # train different prompts until the first all-reduce hid it.
-            generator=torch.Generator(device=module.get_input_embeddings().weight.device).manual_seed(0),
+            # CPU generator, fixed seed: the reserved rows must be identical on
+            # every rank that holds real weights. (Ranks built on meta skip the
+            # write entirely and receive rank 0's rows via sync_module_states.)
+            generator=torch.Generator().manual_seed(0),
         )
-        if init_path:
+        weight = module.get_input_embeddings().weight
+        if init_path and not weight.is_meta:
             from safetensors.torch import load_file
 
             vectors = load_file(init_path, device="cpu")["prompt_embeddings"]
@@ -351,8 +355,7 @@ class FSDPEngine(BaseEngine):
                     f"{(self._soft_prompt_tokens, module.config.hidden_size)}"
                 )
             with torch.no_grad():
-                weight = module.get_input_embeddings().weight
-                weight[ids] = vectors.to(weight.device, weight.dtype)
+                weight[ids.to(weight.device)] = vectors.to(weight.device, weight.dtype)
             logger.info("soft prompt initialised from %s", init_path)
         return ids
 

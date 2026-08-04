@@ -99,21 +99,31 @@ def install_soft_prompt(
         raise ValueError("model has no input embeddings; cannot host a soft prompt")
 
     weight = emb.weight
-    ids = torch.tensor(sorted(soft_ids), dtype=torch.long, device=weight.device)
+    ids = torch.tensor(sorted(soft_ids), dtype=torch.long)
 
-    # Initialise from real vocabulary rows. Sampling from the existing embedding
-    # distribution rather than from N(0, 1) matters: a randomly-scaled row is far
-    # outside the manifold the frozen backbone was trained on, and the first
-    # forward passes are then dominated by getting back to a sane norm.
-    # @changyi_yang specified "从所有token里随机抽样就行了".
-    with torch.no_grad():
-        if init_ids is None:
-            src = torch.randint(
-                0, weight.shape[0], (len(ids),), generator=generator, device=weight.device
-            )
-        else:
-            src = torch.tensor(init_ids, dtype=torch.long, device=weight.device)
-        weight[ids] = weight[src].clone()
+    # verl builds the module under a meta-device context on every rank but rank 0
+    # when the checkpoint does not tie embeddings
+    # (`get_init_weight_context_manager(use_meta_tensor=not tie_word_embeddings)`).
+    # There is nothing to write there, and FSDP's `sync_module_states=True`
+    # broadcasts rank 0's real weights afterwards -- which is also what guarantees
+    # every rank ends up with the SAME prompt. Writing here would either throw
+    # ("META device type not an accelerator") or, worse, silently seed different
+    # ranks differently.
+    if not weight.is_meta:
+        ids = ids.to(weight.device)
+        # Initialise from real vocabulary rows. Sampling from the existing
+        # embedding distribution rather than from N(0, 1) matters: a randomly
+        # scaled row is far outside the manifold the frozen backbone was trained
+        # on, and the first forward passes are then dominated by getting back to
+        # a sane norm. @changyi_yang specified "从所有token里随机抽样就行了".
+        with torch.no_grad():
+            if init_ids is None:
+                # Generator on CPU, then move: a device generator would have to
+                # match the parameter's device, which varies by rank.
+                src = torch.randint(0, weight.shape[0], (len(ids),), generator=generator).to(weight.device)
+            else:
+                src = torch.tensor(init_ids, dtype=torch.long, device=weight.device)
+            weight[ids] = weight[src].clone()
 
     module.requires_grad_(False)
     weight.requires_grad_(True)
