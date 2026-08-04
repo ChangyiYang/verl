@@ -136,7 +136,12 @@ def compute_topk_loss(
     """
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
-        case "fsdp" | "veomni":
+        # "fsdp2" belongs here for the same reason -- the FSDP loss is written
+        # against the local logits shard and does not care which FSDP version
+        # produced it. Without this arm, actor.strategy=fsdp2 with
+        # loss_mode=forward_kl_topk dies at the first optimizer step with
+        # "Unsupported strategy", after a full rollout has already been paid for.
+        case "fsdp" | "fsdp2" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
             distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
