@@ -173,7 +173,11 @@ class _GatherQueue:
         self._queues: dict[int, tuple] = {}  # id(pg) -> (pg, [entries])
 
     def put(self, pg, slots: list, dtype_str: str, counts: torch.Tensor, idx: torch.Tensor, val: torch.Tensor):
-        _pg, entries = self._queues.setdefault(id(pg), (pg, []))
+        # one queue per (group, value dtype): batches concatenate values, so a
+        # batch must be dtype-homogeneous (fp8 codes / fp32 scales / bf16 mix
+        # under quant mode). Entry order and dtypes are identical on every
+        # rank, so the partition stays in lockstep.
+        _pg, entries = self._queues.setdefault((id(pg), val.dtype), (pg, []))
         entries.append((slots, dtype_str, counts, idx, val))
         if len(entries) >= self.batch_k:
             self._flush(pg, entries)
@@ -273,6 +277,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "val_dtype": str(flush.values_gpu.dtype).replace("torch.", ""),
             "spec": {
                 "encoding": self.encoding,
+                "values_bytes": self.quantize_fp8,
+                # sparse flushes carry the quant config too: the receiver's
+                # handshake (incl. the seed-required sentinel guard) must be
+                # reachable on the steady path, not only on the dense seed.
+                "quant_config": getattr(self, "_fp8_quant_cfg", None),
                 "params": [vars(p) for p in flush.params],
                 "checksum": int(flush.checksum),
             },
@@ -292,7 +301,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         collective.broadcast(val_cp, src_rank=0, group_name=self.group_name)
 
     def _publish_values_flush(
-        self, params: list[DeltaParam], values: torch.Tensor, is_last: bool, verify: bool = False
+        self,
+        params: list[DeltaParam],
+        values: torch.Tensor,
+        is_last: bool,
+        verify: bool = False,
+        values_bytes: bool = False,
     ) -> None:
         """Publish a values-only (full-coverage, positions-free) flush -- used by the first
         sync. The wire encoding tag stays ``"dense"`` -- it is protocol, shared with the
@@ -311,6 +325,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 "encoding": "dense",
                 "verify": verify,
                 "is_last": is_last,
+                "values_bytes": values_bytes,
+                "quant_config": getattr(self, "_fp8_quant_cfg", None),
                 "params": [vars(p) for p in params],
                 "checksum": int(_checksum(empty_pos, values)),
             },
@@ -396,7 +412,13 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         logger.info("delta recv v=%s flushes=%d (yielded to server adapter)", global_steps, applied)
 
     def __init__(
-        self, *args, encoding: str = "indices", batch_gather: int = 32, verify_every: int = 0, **kwargs
+        self,
+        *args,
+        encoding: str = "indices",
+        batch_gather: int = 32,
+        verify_every: int = 0,
+        quantize_fp8: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         assert encoding == "indices", f"delta_sharded ships only the 'indices' position encoding; got {encoding!r}"
@@ -404,6 +426,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # every K-th steady sync appends a full state-verification sweep
         # (0 = off); see _verify_due / delta_loader._verify_dense.
         self.verify_every = int(verify_every)
+        # fp8 rollout mode: quantize on the trainer and ship the rollout's
+        # exact state (fp8 codes + blockwise scale_inv tensors). Currently
+        # full-resync per sync (the quant-domain sparse steady path lands
+        # next); the wire is already half the bf16 bytes per element.
+        self.quantize_fp8 = bool(quantize_fp8)
         self._shard_seeded = False
         # Gather the per-param sparse deltas in groups of this many parameters
         # (one count-matrix all_gather + two padded gathers per group instead of
@@ -411,11 +438,56 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         self.batch_gather = int(batch_gather)
 
     def _verify_due(self) -> bool:
-        """True on every K-th steady sync when constructed with ``verify_every=K``."""
+        """True on every K-th steady sync (``verify_every=K``), and ALWAYS on the
+        first steady sync -- the runtime fuse must exist even when periodic
+        verification is off (verify_every=0 keeps only that one mandatory sweep)."""
+        self._steady_count = getattr(self, "_steady_count", 0) + 1
+        if self._steady_count == 1:
+            return True
         if self.verify_every <= 0:
             return False
-        self._steady_count = getattr(self, "_steady_count", 0) + 1
         return self._steady_count % self.verify_every == 0
+
+    def _fp8_spec(self, engine=None):
+        """Distill the serving engine's quant config into a rollout-agnostic
+        :class:`~verl.utils.fp8_sharded.QuantSpec` for the backend."""
+        from verl.utils.fp8_sharded import QuantSpec
+
+        h = self._fp8_helper(engine)
+        return QuantSpec(
+            weight_block_size=tuple(h.quant_config.get("weight_block_size", [128, 128])),
+            should_quantize=h.should_quantize_param,
+        )
+
+    def _fp8_helper(self, engine=None):
+        """Build the quantizer helper from the SAME inputs the rollout used --
+        the model's hf_config (real ignored_layers / modules_to_not_convert)
+        -- instead of guessing bare defaults, and guard the supported mode."""
+        from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper, build_sglang_fp8_quant_config
+
+        h = getattr(self, "_fp8_helper_inst", None)
+        if h is None:
+            hf_config = None
+            if engine is not None:
+                model_config = getattr(engine, "model_config", None)
+                hf_config = getattr(model_config, "hf_config", None)
+            if hf_config is None:
+                logger.warning(
+                    "fp8 delta: no hf_config available; quant config built from bare defaults "
+                    "(ignored_layers/modules_to_not_convert from the checkpoint will be missed)"
+                )
+            cfg = build_sglang_fp8_quant_config(hf_config)
+            # supported-mode guards: this engine ships blockwise fp8 with a
+            # plain fp32 scale_inv grid, nothing else.
+            assert cfg.get("quant_method") == "fp8", f"unsupported quant_method {cfg.get('quant_method')!r}"
+            if cfg.get("weight_block_size") is None:
+                raise NotImplementedError("per-tensor fp8 is not supported by the delta engine (blockwise only)")
+            for bad in ("scale_fmt", "ue8m0", "deepgemm"):
+                assert bad not in cfg, f"unsupported scale format flag {bad!r} in quant config: {cfg}"
+            self._fp8_quant_cfg = cfg
+            h = SGLangFP8QuantizerHelper(cfg)
+            self._fp8_helper_inst = h
+        return h
 
     def _assemble_flush(self, per_param: list[_FlushPiece]) -> DeltaFlush:
         """Build one DeltaFlush (indices encoding) from rank 0's gathered per-param deltas.
@@ -428,6 +500,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         (``.cpu().numpy().tobytes()`` + join) dominated the whole send at scale
         (~2.4s/sync at 7B steady state, ~83s on the full seed).
         """
+        bytes_wire = self.quantize_fp8  # mixed dtypes (fp8 codes + fp32 scales + bf16)
         idx_pieces: list[torch.Tensor] = []
         val_pieces: list[torch.Tensor] = []
         params: list[DeltaParam] = []
@@ -441,7 +514,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 f"{piece.name}: {_prodshape(piece.shape)} elements exceeds the int32 position encoding"
             )
             idx_pieces.append(piece.idx.to(torch.int32))
-            val_pieces.append(piece.val)
+            val = piece.val.contiguous().view(torch.uint8) if bytes_wire else piece.val
+            val_pieces.append(val)
+            n_val = int(val.numel())  # elements, or bytes in bytes_wire mode
             params.append(
                 DeltaParam(
                     name=piece.name,
@@ -451,11 +526,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     pos_end=pos_off + nnz * 4,
                     pos_width=4,
                     val_start=val_off,
-                    val_end=val_off + nnz,
+                    val_end=val_off + n_val,
                 )
             )
             pos_off += nnz * 4
-            val_off += nnz
+            val_off += n_val
 
         values_gpu = torch.cat(val_pieces) if val_pieces else torch.empty(0, dtype=self.rollout_dtype, device="cuda")
         positions_u8 = (
@@ -473,6 +548,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
         verify: bool = False,
+        bytes_wire: bool = False,
     ) -> dict[str, float] | None:
         """First sync: stream the backend's FULL HF export over the values-only wire.
 
@@ -511,7 +587,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         def _publish_values(pending, is_last: bool) -> None:
             nonlocal n_flushes, wire_bytes
             params, values = pending
-            self._publish_values_flush(params, values, is_last=is_last, verify=verify)
+            self._publish_values_flush(params, values, is_last=is_last, verify=verify, values_bytes=bytes_wire)
             n_flushes += 1
             wire_bytes += int(values.nbytes)
 
@@ -526,20 +602,30 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             assert name not in seen_names, f"full export yields duplicate HF tensor {name!r}"
             seen_names.add(name)
             tensor = tensor.detach()
-            if tensor.is_floating_point() and tensor.dtype != self.rollout_dtype:
+            # fp8 codes and their fp32 scale_inv tensors ARE the rollout state:
+            # never fold them into the bf16 wire dtype.
+            keep_dtype = tensor.element_size() == 1 or name.endswith("_scale_inv")
+            if tensor.is_floating_point() and tensor.dtype != self.rollout_dtype and not keep_dtype:
                 tensor = tensor.to(self.rollout_dtype)
             if not is_r0:
                 del tensor
                 continue
             flat = tensor.contiguous().reshape(-1)
             total_elems += int(flat.numel())
-            bkt.add(_ValuesPiece(name, str(flat.dtype).replace("torch.", ""), list(tensor.shape), flat), flat.nbytes)
+            if bytes_wire:
+                # mixed-dtype flushes: pack every piece as raw bytes; offsets
+                # in the spec become BYTE offsets and the receiver reinterprets
+                # per-param via ``values_bytes``.
+                flat = flat.view(torch.uint8)
+            bkt.add(_ValuesPiece(name, str(tensor.dtype).replace("torch.", ""), list(tensor.shape), flat), flat.nbytes)
 
         if not verify:
             self._shard_seeded = True
         if not is_r0:
             return
         bkt.seal()
+                # sweep (same contract as the steady path: only the sync's final flush
+        # carries is_last).
         if bkt.pending is not None:
             bkt.emit(is_last=True)
         else:
@@ -588,13 +674,22 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # whole model.
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
         if not self._shard_seeded:
-            full, _ = engine.get_per_tensor_param()
-            metrics = self._send_full_seed(full, global_steps)
-            # weights do not move during the sync, so the snapshots equal exactly
-            # what the rollout just received.
-            engine.prime_delta_snapshots()
+            # the BACKEND produces the seed in the rollout's exact format (with a
+            # quant spec: codes + scale_inv off the raw master; without: bf16),
+            # ships it verbatim, then snapshots the SAME domain as the diff base
+            # -- weights do not move during the sync, so the snapshots equal
+            # exactly what the rollout just received.
+            spec = self._fp8_spec(engine) if self.quantize_fp8 else None
+            full, _ = engine.get_per_tensor_param(raw_master=spec is not None, quant_spec=spec)
+            metrics = self._send_full_seed(full, global_steps, bytes_wire=spec is not None)
+            engine.prime_delta_snapshots(quant_spec=spec)
             return metrics
-        weights, _ = engine.get_per_tensor_param_delta_shard()
+        # the BACKEND owns delta production for every dtype: with a quant spec
+        # it yields quant-domain entries (codes + scale grids diffed against
+        # engine-held snapshots), without one the bf16 shard deltas.
+        weights, _ = engine.get_per_tensor_param_delta_shard(
+            quant_spec=self._fp8_spec(engine) if self.quantize_fp8 else None
+        )
         is_r0 = self.is_master
         n_flushes = 0
         changed_elems = 0
@@ -650,11 +745,25 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 self._publish_terminal(False)
         if verify:
             # collective on every rank: the full export assembles per tensor.
-            full, _ = engine.get_per_tensor_param()
-            self._send_full_seed(full, global_steps, verify=True)
+            if self.quantize_fp8:
+                full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=self._fp8_spec(engine))
+                self._send_full_seed(full, global_steps, verify=True, bytes_wire=True)
+            else:
+                full, _ = engine.get_per_tensor_param()
+                self._send_full_seed(full, global_steps, verify=True)
         if not is_r0:
             return
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
+        prof = getattr(engine, "_quant_profile", None)
+        if prof is not None:
+            logger.warning(
+                "AMAX-PROFILE scale_flips=%d/%d blocks code_changed=%d/%d bytes",
+                prof["sf"],
+                prof["st"],
+                prof["cc"],
+                prof["ct"],
+            )
+            engine._quant_profile = None
         logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
         if not total_elems:
             return None
