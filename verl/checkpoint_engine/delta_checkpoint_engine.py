@@ -273,6 +273,27 @@ class _FusionStager:
         self.n_groups += 1
         return out, True
 
+    def offer_piece(self, name: str, piece, nbytes: int):
+        """Seed-path variant: co-locate a group's members, nothing else.
+
+        A full export contains every member by construction, so there is no
+        absent half to materialise -- only the flush boundary matters. Returns
+        ``(list_of_(piece, nbytes), is_group)`` or ``None`` while incomplete.
+        """
+        matched = self._match(name)
+        if matched is None:
+            return [(piece, nbytes)], False
+        key, sfx = matched
+        suffixes = next(s for k, s in _FUSION_GROUPS if k == key)
+        slot = self._pending.setdefault((name[: -len(sfx)], key), {})
+        assert sfx not in slot, f"duplicate fusion member {name!r} for group {key!r}"
+        slot[sfx] = (piece, nbytes)
+        if len(slot) < len(suffixes):
+            return None
+        self._pending.pop((name[: -len(sfx)], key))
+        self.n_groups += 1
+        return [slot[s] for s in suffixes], True
+
     def assert_drained(self) -> None:
         assert not self._pending, (
             f"fusion groups never completed: {sorted(self._pending)}. Every member listed in "
@@ -754,6 +775,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             wire_bytes += int(values.nbytes)
 
         bkt = _FlushBucket(self.bucket_size, _assemble_values, _publish_values)
+        # The seed streams the FULL export, so every fused member is present --
+        # but byte bucketing splits pairs here exactly like it does in the steady
+        # path, and the seed is the FIRST sync, so without this the run dies
+        # before the steady staging is ever exercised.
+        stager = _FusionStager()
 
         seen_names: set = set()
         for name, tensor in weights:
@@ -779,12 +805,26 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # in the spec become BYTE offsets and the receiver reinterprets
                 # per-param via ``values_bytes``.
                 flat = flat.view(torch.uint8)
-            bkt.add(_ValuesPiece(name, str(tensor.dtype).replace("torch.", ""), list(tensor.shape), flat), flat.nbytes)
+            offered = stager.offer_piece(
+                name,
+                _ValuesPiece(name, str(tensor.dtype).replace("torch.", ""), list(tensor.shape), flat),
+                flat.nbytes,
+            )
+            if offered is None:
+                continue
+            released, is_group = offered
+            if is_group:
+                bkt.add_atomic(released)
+            else:
+                for piece, nbytes in released:
+                    bkt.add(piece, nbytes)
 
         if not verify:
             self._shard_seeded = True
         if not is_r0:
             return
+        stager.assert_drained()
+        logger.info("seed fusion staging: groups=%d", stager.n_groups)
         bkt.seal()
                 # sweep (same contract as the steady path: only the sync's final flush
         # carries is_last).
