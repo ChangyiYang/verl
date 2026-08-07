@@ -121,6 +121,26 @@ class _FlushBucket:
         if self.nbytes >= self.cap:
             self.seal()
 
+    def add_atomic(self, sized_pieces: list[tuple]) -> None:
+        """Add several pieces that must not be split across flushes.
+
+        The cap check happens BEFORE the group goes in (seal the current bucket
+        first if it would overflow), so the boundary can only fall between
+        groups -- never inside one. A group larger than ``cap`` becomes its own
+        oversized flush, which is correct if not ideal; the fused DSv4 params
+        this exists for are a few MiB.
+        """
+        if not sized_pieces:
+            return
+        total = sum(int(nb) for _, nb in sized_pieces)
+        if self.pieces and self.nbytes + total > self.cap:
+            self.seal()
+        for piece, nbytes in sized_pieces:
+            self.pieces.append(piece)
+            self.nbytes += int(nbytes)
+        if self.nbytes >= self.cap:
+            self.seal()
+
     def seal(self) -> None:
         if not self.pieces:
             return
@@ -134,18 +154,160 @@ class _FlushBucket:
             self.pending = None
 
 
-def _bucket_sliced(bkt: _FlushBucket, name: str, dtype_str: str, shape, aidx: torch.Tensor, aval: torch.Tensor) -> None:
-    """Slice one param's (idx, val) delta into <= MAX_ENTRY_ELEMS pieces and bucket
-    them (bounds the receiver-side decode transient; the masked apply is sequential,
+# Destination params that the ROLLOUT-side loader rebuilds by concatenating two
+# separately-named checkpoint tensors. sglang's DSv4 loader buffers the halves in
+# a cache created inside ``load_weights`` and asserts it empty on return, so both
+# members have to arrive in the SAME call -- i.e. the same flush. Bucketing by
+# bytes alone splits them sooner or later and the assert fires; that is not
+# delta-specific, plain full NCCL sync hits it too.
+#
+# Suffixes are spelled out through ``.self_attn.`` on purpose: a bare
+# ``.wkv.weight`` would also match ``.compressor.wkv.weight`` and
+# ``.indexer.compressor.wkv.weight``. ``_FusionStager._match`` asserts a name
+# never matches two groups, so an ambiguity introduced later fails loudly here
+# rather than silently mis-grouping.
+#
+# fp8 splits into two groups because sglang keys its cache on the destination
+# param name: ``wqkv_a.weight`` and ``wqkv_a.weight_scale_inv`` are separate
+# entries and each needs its own pair.
+# The attention block is spelled ``self_attn`` in the names that reach sglang
+# (the loader's cache key ``model.layers.N.self_attn.wqkv_a.weight`` back-derives
+# an incoming ``...self_attn.wq_a.weight``), but Megatron-Bridge's DSv4 mapping
+# writes ``layers.N.attn.*``. Carry both rather than bet on which layer renames:
+# the two are mutually exclusive under ``endswith`` (``self_attn`` has no dot
+# before ``attn``), so listing both cannot create an ambiguity.
+_ATTN_SPELLINGS = (".self_attn.", ".attn.")
+
+
+def _fusion_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    families = (
+        ("wqkv_a", ("wq_a.weight", "wkv.weight")),
+        ("wqkv_a_scale", ("wq_a.weight_scale_inv", "wkv.weight_scale_inv")),
+        ("compressor_wkv_gate", ("compressor.wkv.weight", "compressor.wgate.weight")),
+        (
+            "indexer_compressor_wkv_gate",
+            ("indexer.compressor.wkv.weight", "indexer.compressor.wgate.weight"),
+        ),
+    )
+    out = []
+    for attn in _ATTN_SPELLINGS:
+        tag = "" if attn == ".self_attn." else "@attn"
+        for key, members in families:
+            out.append((key + tag, tuple(attn + m for m in members)))
+    return tuple(out)
+
+
+_FUSION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = _fusion_groups()
+
+
+class _FusionStager:
+    """Hold the members of a fused destination param until the group is complete,
+    then release them together so they ride one flush.
+
+    Two things have to be true at the receiver for a fused param to survive a
+    sparse sync, and this covers both:
+
+    * **completeness** -- a member with no changed elements is released as an
+      EMPTY entry instead of being dropped. The receiver densifies it to an
+      all-NaN full-shape tensor, and since ``_masked_copy`` keeps the
+      destination wherever the source is NaN, cat-ing that half into the fused
+      param is a no-op for it. (Verified: ``_decode_one`` already returns pure
+      NaN for a zero-length entry, both in the fp8 byte path and the float path,
+      so the receiver needs no change.)
+    * **co-location** -- see ``_FlushBucket.add_atomic``; being complete does not
+      help if the two halves land in different ``load_weights`` calls.
+
+    Params outside any group pass straight through.
+    """
+
+    __slots__ = ("_pending", "n_groups", "n_filled")
+
+    def __init__(self) -> None:
+        self._pending: dict[tuple[str, str], dict] = {}
+        self.n_groups = 0  # groups released with at least one changed member
+        self.n_filled = 0  # halves materialised as all-NaN because nothing changed
+
+    @staticmethod
+    def _match(name: str):
+        hits = [(key, sfx) for key, sfxs in _FUSION_GROUPS for sfx in sfxs if name.endswith(sfx)]
+        assert len(hits) <= 1, f"{name!r} matches multiple fusion groups: {hits}"
+        return hits[0] if hits else None
+
+    def offer(self, name: str, dtype_str: str, shape, aidx, aval):
+        """Return ``(entries, is_group)``, or ``None`` while a group is incomplete.
+
+        A non-member yields itself with ``is_group=False`` -- the caller keeps
+        dropping unchanged non-members, so this costs nothing for the ~99% of
+        params that are not fused. A member yields ``None`` until its siblings
+        arrive, then the whole group in declared order with ``is_group=True`` --
+        or ``([], True)`` if no member of the group changed at all, since there
+        is then nothing to send.
+        """
+        matched = self._match(name)
+        if matched is None:
+            return [(name, dtype_str, shape, aidx, aval)], False
+
+        key, sfx = matched
+        suffixes = next(s for k, s in _FUSION_GROUPS if k == key)
+        slot = self._pending.setdefault((name[: -len(sfx)], key), {})
+        assert sfx not in slot, f"duplicate fusion member {name!r} for group {key!r}"
+        slot[sfx] = (name, dtype_str, shape, aidx, aval)
+        if len(slot) < len(suffixes):
+            return None
+
+        self._pending.pop((name[: -len(sfx)], key))
+        members = [slot[s] for s in suffixes]
+        if all(e[3] is None or e[3].numel() == 0 for e in members):
+            return [], True
+        # Materialise the absent halves. Device/dtype come from a member that did
+        # change, so the empties cat cleanly with the rest of the flush.
+        donor = next(e for e in members if e[3] is not None and e[3].numel())
+        dev = donor[3].device
+        out = []
+        for m_name, m_dtype, m_shape, m_idx, m_val in members:
+            if m_idx is None or m_idx.numel() == 0:
+                m_idx = torch.empty(0, dtype=torch.int32, device=dev)
+                m_val = torch.empty(0, dtype=getattr(torch, m_dtype), device=dev)
+                self.n_filled += 1
+            out.append((m_name, m_dtype, m_shape, m_idx, m_val))
+        self.n_groups += 1
+        return out, True
+
+    def assert_drained(self) -> None:
+        assert not self._pending, (
+            f"fusion groups never completed: {sorted(self._pending)}. Every member listed in "
+            f"_FUSION_GROUPS must appear in the export stream, including unchanged ones."
+        )
+
+
+def _slice_pieces(name: str, dtype_str: str, shape, aidx: torch.Tensor, aval: torch.Tensor) -> list[tuple]:
+    """Slice one param's (idx, val) delta into <= MAX_ENTRY_ELEMS ``(piece, nbytes)``
+    pairs (bounds the receiver-side decode transient; the masked apply is sequential,
     so splitting is transparent). Bucket bytes = actual wire bytes (int32 positions
-    + values)."""
+    + values).
+
+    An empty delta yields ONE empty piece rather than none: a zero-length range()
+    would emit nothing, but fusion-group members with no changed elements must
+    still reach the receiver so it can densify them to all-NaN (see _FusionStager).
+    """
+    if aidx.numel() == 0:
+        return [(_FlushPiece(name, dtype_str, list(shape), aidx, aval), 0)]
     max_elems = DeltaShardedCheckpointEngine.MAX_ENTRY_ELEMS
+    out = []
     for s in range(0, aidx.numel(), max_elems):
         e = min(s + max_elems, aidx.numel())
-        bkt.add(
-            _FlushPiece(name, dtype_str, list(shape), aidx[s:e], aval[s:e]),
-            (e - s) * (4 + aval.element_size()),
+        out.append(
+            (
+                _FlushPiece(name, dtype_str, list(shape), aidx[s:e], aval[s:e]),
+                (e - s) * (4 + aval.element_size()),
+            )
         )
+    return out
+
+
+def _bucket_sliced(bkt: _FlushBucket, name: str, dtype_str: str, shape, aidx: torch.Tensor, aval: torch.Tensor) -> None:
+    for piece, nbytes in _slice_pieces(name, dtype_str, shape, aidx, aval):
+        bkt.add(piece, nbytes)
 
 
 class _GatherQueue:
@@ -702,6 +864,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             n_flushes += 1
 
         bkt = _FlushBucket(self.bucket_size, self._assemble_flush, _publish_steady)
+        stager = _FusionStager()
 
         batch_k = self.batch_gather
 
@@ -715,11 +878,28 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         ) -> None:
             nonlocal total_elems, changed_elems, wire_bytes
             total_elems += int(full_numel)
-            if aidx is None or aidx.numel() == 0:
+            # Members of a fused destination param are held back until the group
+            # is whole, then emitted as one indivisible run of pieces. Everything
+            # else falls through unchanged. Note the accounting below runs on the
+            # RELEASED entries, so an empty half contributes 0 changed elements
+            # and 0 wire bytes -- it costs one entry, not one tensor.
+            offered = stager.offer(name, dtype_str, full_shape, aidx, aval)
+            if offered is None:
                 return
-            changed_elems += int(aidx.numel())
-            wire_bytes += int(aidx.numel()) * (4 + aval.element_size())
-            _bucket_sliced(bkt, name, dtype_str, full_shape, aidx, aval)
+            released, is_group = offered
+            sized: list[tuple] = []
+            for e_name, e_dtype, e_shape, e_idx, e_val in released:
+                if e_idx is None or (e_idx.numel() == 0 and not is_group):
+                    continue  # unchanged and not fused -- drop it, as before
+                changed_elems += int(e_idx.numel())
+                if e_idx.numel():
+                    wire_bytes += int(e_idx.numel()) * (4 + e_val.element_size())
+                sized.extend(_slice_pieces(e_name, e_dtype, e_shape, e_idx, e_val))
+            if is_group:
+                bkt.add_atomic(sized)
+            else:
+                for piece, nbytes in sized:
+                    bkt.add(piece, nbytes)
 
         gq = _GatherQueue(batch_k, self.bucket_size, is_r0, _bucket_slot_delta)
 
@@ -730,6 +910,21 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         for slots, dtype_str, counts, hf_idx, hf_val, pg in weights:
             gq.put(pg, slots, dtype_str, counts, hf_idx, hf_val)
         gq.flush_all()
+        # A half still parked here means its sibling never came through the export
+        # stream, so the receiver would have been handed an unpairable member and
+        # died inside sglang's loader with a far less informative message.
+        stager.assert_drained()
+        # Log unconditionally, including the zero case: if the export ever renames
+        # these params, every suffix stops matching and the staging silently
+        # degrades to a no-op -- which looks exactly like "no fused params in this
+        # model". The count is the only thing that tells the two apart. DSv4 should
+        # report 4 groups x 43 layers.
+        if is_r0:
+            logger.info(
+                "delta fusion staging: groups=%d nan_filled_halves=%d",
+                stager.n_groups,
+                stager.n_filled,
+            )
 
         # verify_every=K (engine kwarg) appends a full state-verification sweep to
         # every K-th steady sync, inside the SAME receive session: the steady
