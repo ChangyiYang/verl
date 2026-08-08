@@ -163,6 +163,11 @@ async def get_named_tensor_buckets(
         tensor_size = tensor.element_size() * tensor.numel()
         key = fusion_key(name)
         if key is None and any(tok in name for tok in _member_tokens):
+            # Log AT DETECTION, not at the end: the receiver can die mid-stream,
+            # in which case this generator is abandoned and any end-of-loop
+            # summary never runs. That is exactly what happened on delta13.
+            if len(unmatched) < 8:
+                logger.warning("fusion table MISSED param %r (bucketed ungrouped)", name)
             unmatched.append(name)
         if key is not None:
             slot = staged.setdefault(key, [])
