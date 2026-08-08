@@ -56,6 +56,78 @@ logger = logging.getLogger(__name__)
 # SGLang's own delta-apply chunking default.
 CHUNK_BYTES = 512 << 20
 
+# Destination params that SGLang's DSv4 loader rebuilds by torch.cat-ing two
+# separately-named tensors, buffering the first half in a cache it creates inside
+# ``load_weights`` and asserts empty on return. Both halves therefore have to be
+# in the SAME ``load_weights`` call -- and this chunk loop is the LAST place that
+# can split them: the sender keeps a group inside one flush, but a flush is
+# re-cut here by CHUNK_BYTES, so without this the group can still straddle two
+# calls and the assert fires.
+#
+# Deliberately duplicated from ``delta_checkpoint_engine._FUSION_GROUPS`` rather
+# than imported: this module is loaded inside the SGLang server process via
+# LOADER_FQN and keeps its imports to torch alone. ``test_fusion_stager.py``
+# asserts the two tables stay in agreement.
+_FUSION_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
+    tuple(attn + m for m in members)
+    for attn in (".self_attn.", ".attn.")
+    for members in (
+        ("wq_a.weight", "wkv.weight"),
+        ("wq_a.weight_scale_inv", "wkv.weight_scale_inv"),
+        ("compressor.wkv.weight", "compressor.wgate.weight"),
+        ("indexer.compressor.wkv.weight", "indexer.compressor.wgate.weight"),
+    )
+)
+
+
+def _fusion_key(name: str):
+    """``(prefix, group_index)`` if this param is half of a fused destination."""
+    hits = [
+        (name[: -len(sfx)], gi)
+        for gi, sfxs in enumerate(_FUSION_SUFFIXES)
+        for sfx in sfxs
+        if name.endswith(sfx)
+    ]
+    assert len(hits) <= 1, f"{name!r} matches multiple fusion groups: {hits}"
+    return hits[0] if hits else None
+
+
+def _atomic_units(params: list[dict]) -> list[list[dict]]:
+    """Partition params so that members of one fusion group stay in one unit.
+
+    Order follows first appearance, so a stream that already keeps a group
+    adjacent is left untouched; a group split apart by the sender still gets
+    reunited here.
+    """
+    units: list[list[dict]] = []
+    at: dict = {}
+    for p in params:
+        key = _fusion_key(p["name"])
+        if key is not None and key in at:
+            units[at[key]].append(p)
+            continue
+        if key is not None:
+            at[key] = len(units)
+        units.append([p])
+    return units
+
+
+def _load_in_chunks(model, params: list[dict], materialize) -> None:
+    """Feed params to ``model.load_weights`` in <= CHUNK_BYTES chunks, cutting
+    only BETWEEN fusion groups. ``materialize(p) -> Tensor`` builds one param."""
+    chunk: list[tuple[str, torch.Tensor]] = []
+    chunk_bytes = 0
+    for unit in _atomic_units(params):
+        built = [(p["name"], materialize(p)) for p in unit]
+        unit_bytes = sum(t.numel() * t.element_size() for _, t in built)
+        if chunk and chunk_bytes + unit_bytes > CHUNK_BYTES:
+            model.load_weights(chunk)
+            chunk, chunk_bytes = [], 0
+        chunk.extend(built)
+        chunk_bytes += unit_bytes
+    if chunk:
+        model.load_weights(chunk)
+
 # Import path callers pass as both --custom-weight-loader and load_format.
 LOADER_FQN = "verl.workers.rollout.sglang_rollout.delta_loader.apply_delta"
 
@@ -189,18 +261,11 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
     encoding = spec["encoding"]
     values_bytes = bool(spec.get("values_bytes"))
     with _masked_copy(_param_storage_index(model)):
-        chunk: list[tuple[str, torch.Tensor]] = []
-        chunk_bytes = 0
-        for p in spec["params"]:
-            t = _decode_one(encoding, positions, values, p, values_bytes)
-            nbytes = t.numel() * t.element_size()
-            if chunk and chunk_bytes + nbytes > CHUNK_BYTES:
-                model.load_weights(chunk)
-                chunk, chunk_bytes = [], 0
-            chunk.append((p["name"], t))
-            chunk_bytes += nbytes
-        if chunk:
-            model.load_weights(chunk)
+        _load_in_chunks(
+            model,
+            spec["params"],
+            lambda p: _decode_one(encoding, positions, values, p, values_bytes),
+        )
 
     # Derived tensors (fp8 scales after requant, MLA w_kc/w_vc, MoE biases)
     # recompute from the now-final weights. Outside the masked-copy patch on
@@ -220,23 +285,18 @@ def _apply_dense(
     ``values_bytes`` marks a mixed-dtype flush (fp8 codes + fp32 scales + bf16
     leftovers): offsets are BYTE offsets into a uint8 blob and each param is
     reinterpreted, not cast. The ``.clone()`` re-bases the slice to storage
-    offset 0 so the dtype view never trips torch's alignment check."""
-    chunk: list[tuple[str, torch.Tensor]] = []
-    chunk_bytes = 0
-    for p in params:
+    offset 0 so the dtype view never trips torch's alignment check.
+
+    This is the path the SEED takes, and it is where the fused-param assert
+    actually fired -- hence the same atomic chunking as the sparse path."""
+
+    def _materialize(p: dict) -> torch.Tensor:
         dtype = getattr(torch, p["dtype"])
         if values_bytes:
-            t = values[p["val_start"] : p["val_end"]].clone().view(dtype).view(p["shape"])
-        else:
-            t = values[p["val_start"] : p["val_end"]].to(dtype).view(p["shape"])
-        nbytes = t.numel() * t.element_size()
-        if chunk and chunk_bytes + nbytes > CHUNK_BYTES:
-            model.load_weights(chunk)
-            chunk, chunk_bytes = [], 0
-        chunk.append((p["name"], t))
-        chunk_bytes += nbytes
-    if chunk:
-        model.load_weights(chunk)
+            return values[p["val_start"] : p["val_end"]].clone().view(dtype).view(p["shape"])
+        return values[p["val_start"] : p["val_end"]].to(dtype).view(p["shape"])
+
+    _load_in_chunks(model, params, _materialize)
 
 
 _VERIFY_STATS: dict = {"params": 0, "pieces": []}
