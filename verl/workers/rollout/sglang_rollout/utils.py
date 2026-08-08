@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import pickle
 from typing import Any, Iterator, Optional
 
@@ -22,6 +23,8 @@ import torch.distributed as dist
 
 from verl.utils.device import get_device_name
 from verl.workers.rollout.utils import ensure_async_iterator
+
+logger = logging.getLogger(__name__)
 
 SGLANG_LORA_NAME = "verl_actor_lora_name"
 
@@ -148,15 +151,26 @@ async def get_named_tensor_buckets(
             return out, entries
         return None, entries
 
+    n_groups = 0
+    # Names SGLang's DSv4 loader will treat as fusion members. If one of these
+    # reaches us but fusion_key() does not match it, the grouping silently does
+    # nothing for that param and the loader's assert fires later with no clue
+    # why -- so name them here instead of inferring from the crash.
+    unmatched: list[str] = []
+    _member_tokens = (".wq_a.", ".wkv.", ".wgate.")
+
     async for name, tensor in ensure_async_iterator(iterable):
         tensor_size = tensor.element_size() * tensor.numel()
         key = fusion_key(name)
+        if key is None and any(tok in name for tok in _member_tokens):
+            unmatched.append(name)
         if key is not None:
             slot = staged.setdefault(key, [])
             slot.append((name, _compact_for_bucket(tensor), tensor_size))
             if len(slot) < group_size(key[1]):
                 continue
             entries = staged.pop(key)
+            n_groups += 1
         else:
             entries = [(name, _compact_for_bucket(tensor), tensor_size)]
 
@@ -167,6 +181,18 @@ async def get_named_tensor_buckets(
             current_bucket.append((n, t))
             current_size += sz
 
+    if unmatched:
+        # loud on purpose: this is the difference between "this model has no
+        # fused params" and "the suffix table missed them", which otherwise look
+        # identical from the outside.
+        logger.warning(
+            "fusion table MISSED %d param(s) the DSv4 loader will try to fuse; "
+            "they will be bucketed ungrouped. First 8: %s",
+            len(unmatched),
+            unmatched[:8],
+        )
+    logger.info("weight-sync bucketing: fusion groups kept together=%d, unmatched members=%d",
+                n_groups, len(unmatched))
     assert not staged, (
         f"fused param groups never completed in this sync: {sorted(staged)}. "
         f"Every member must appear in the weight stream."
