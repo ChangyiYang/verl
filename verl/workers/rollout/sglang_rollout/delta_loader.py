@@ -56,40 +56,12 @@ logger = logging.getLogger(__name__)
 # SGLang's own delta-apply chunking default.
 CHUNK_BYTES = 512 << 20
 
-# Destination params that SGLang's DSv4 loader rebuilds by torch.cat-ing two
-# separately-named tensors, buffering the first half in a cache it creates inside
-# ``load_weights`` and asserts empty on return. Both halves therefore have to be
-# in the SAME ``load_weights`` call -- and this chunk loop is the LAST place that
-# can split them: the sender keeps a group inside one flush, but a flush is
-# re-cut here by CHUNK_BYTES, so without this the group can still straddle two
-# calls and the assert fires.
-#
-# Deliberately duplicated from ``delta_checkpoint_engine._FUSION_GROUPS`` rather
-# than imported: this module is loaded inside the SGLang server process via
-# LOADER_FQN and keeps its imports to torch alone. ``test_fusion_stager.py``
-# asserts the two tables stay in agreement.
-_FUSION_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
-    tuple(attn + m for m in members)
-    for attn in (".self_attn.", ".attn.")
-    for members in (
-        ("wq_a.weight", "wkv.weight"),
-        ("wq_a.weight_scale_inv", "wkv.weight_scale_inv"),
-        ("compressor.wkv.weight", "compressor.wgate.weight"),
-        ("indexer.compressor.wkv.weight", "indexer.compressor.wgate.weight"),
-    )
-)
-
-
-def _fusion_key(name: str):
-    """``(prefix, group_index)`` if this param is half of a fused destination."""
-    hits = [
-        (name[: -len(sfx)], gi)
-        for gi, sfxs in enumerate(_FUSION_SUFFIXES)
-        for sfx in sfxs
-        if name.endswith(sfx)
-    ]
-    assert len(hits) <= 1, f"{name!r} matches multiple fusion groups: {hits}"
-    return hits[0] if hits else None
+# The membership table lives in verl.utils.fusion_groups so the three split
+# points (this chunk loop, the delta engine's two streams, and
+# get_named_tensor_buckets) cannot drift apart. This chunk loop is the LAST
+# place that can split a group: the sender keeps one inside a flush, but a flush
+# is re-cut here by CHUNK_BYTES.
+from verl.utils.fusion_groups import fusion_key as _fusion_key  # noqa: E402
 
 
 def _atomic_units(params: list[dict]) -> list[list[dict]]:

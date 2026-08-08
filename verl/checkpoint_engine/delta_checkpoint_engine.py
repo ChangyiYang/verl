@@ -154,50 +154,10 @@ class _FlushBucket:
             self.pending = None
 
 
-# Destination params that the ROLLOUT-side loader rebuilds by concatenating two
-# separately-named checkpoint tensors. sglang's DSv4 loader buffers the halves in
-# a cache created inside ``load_weights`` and asserts it empty on return, so both
-# members have to arrive in the SAME call -- i.e. the same flush. Bucketing by
-# bytes alone splits them sooner or later and the assert fires; that is not
-# delta-specific, plain full NCCL sync hits it too.
-#
-# Suffixes are spelled out through ``.self_attn.`` on purpose: a bare
-# ``.wkv.weight`` would also match ``.compressor.wkv.weight`` and
-# ``.indexer.compressor.wkv.weight``. ``_FusionStager._match`` asserts a name
-# never matches two groups, so an ambiguity introduced later fails loudly here
-# rather than silently mis-grouping.
-#
-# fp8 splits into two groups because sglang keys its cache on the destination
-# param name: ``wqkv_a.weight`` and ``wqkv_a.weight_scale_inv`` are separate
-# entries and each needs its own pair.
-# The attention block is spelled ``self_attn`` in the names that reach sglang
-# (the loader's cache key ``model.layers.N.self_attn.wqkv_a.weight`` back-derives
-# an incoming ``...self_attn.wq_a.weight``), but Megatron-Bridge's DSv4 mapping
-# writes ``layers.N.attn.*``. Carry both rather than bet on which layer renames:
-# the two are mutually exclusive under ``endswith`` (``self_attn`` has no dot
-# before ``attn``), so listing both cannot create an ambiguity.
-_ATTN_SPELLINGS = (".self_attn.", ".attn.")
-
-
-def _fusion_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
-    families = (
-        ("wqkv_a", ("wq_a.weight", "wkv.weight")),
-        ("wqkv_a_scale", ("wq_a.weight_scale_inv", "wkv.weight_scale_inv")),
-        ("compressor_wkv_gate", ("compressor.wkv.weight", "compressor.wgate.weight")),
-        (
-            "indexer_compressor_wkv_gate",
-            ("indexer.compressor.wkv.weight", "indexer.compressor.wgate.weight"),
-        ),
-    )
-    out = []
-    for attn in _ATTN_SPELLINGS:
-        tag = "" if attn == ".self_attn." else "@attn"
-        for key, members in families:
-            out.append((key + tag, tuple(attn + m for m in members)))
-    return tuple(out)
-
-
-_FUSION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = _fusion_groups()
+# Membership table shared with the rollout-side splitters -- see
+# verl.utils.fusion_groups for why this exists and which loader needs it.
+from verl.utils.fusion_groups import FUSION_GROUPS as _FUSION_GROUPS  # noqa: E402
+from verl.utils.fusion_groups import fusion_match as _fusion_match  # noqa: E402
 
 
 class _FusionStager:
@@ -227,11 +187,7 @@ class _FusionStager:
         self.n_groups = 0  # groups released with at least one changed member
         self.n_filled = 0  # halves materialised as all-NaN because nothing changed
 
-    @staticmethod
-    def _match(name: str):
-        hits = [(key, sfx) for key, sfxs in _FUSION_GROUPS for sfx in sfxs if name.endswith(sfx)]
-        assert len(hits) <= 1, f"{name!r} matches multiple fusion groups: {hits}"
-        return hits[0] if hits else None
+    _match = staticmethod(_fusion_match)
 
     def offer(self, name: str, dtype_str: str, shape, aidx, aval):
         """Return ``(entries, is_group)``, or ``None`` while a group is incomplete.
