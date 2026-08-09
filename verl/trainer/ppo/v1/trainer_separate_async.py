@@ -130,10 +130,27 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         # get server client from standalone rollout
         return self.standalone_server_manager.get_client(client_cls=FullyAsyncLLMServerClient)
 
+    def _hybrid_sync_masked(self) -> bool:
+        """Whether to skip the hybrid replicas' full weight sync.
+
+        ``separate_async`` builds two rollout stacks. Only the standalone one
+        serves generation and only it is inside the ``update_weights`` timer;
+        the hybrid stack is fused into the trainer processes and, because
+        ``_setup`` leaves ``current_mode = ROLLOUT``, every ``switch_to_rollout``
+        call site is guarded by ``current_mode == TRAINER`` and never fires. Its
+        weight sync therefore happens exactly once, at init, and feeds an engine
+        that never generates -- pure cost, and it takes the plain bucketed path
+        rather than the delta wire.
+        """
+        return os.environ.get("VERL_MASK_HYBRID_WEIGHT_SYNC") == "1"
+
     def on_init_end(self):
         # update weights after loading checkpoint
         self.standalone_checkpoint_manager.update_weights(self.global_steps)
-        self.checkpoint_manager.update_weights(self.global_steps)
+        if self._hybrid_sync_masked():
+            logger.info("VERL_MASK_HYBRID_WEIGHT_SYNC=1: skipping the hybrid replicas' init weight sync")
+        else:
+            self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
         if self.config.skip.rollout_tq.enable:
@@ -179,6 +196,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
     def switch_to_rollout(self):
         # TODO: disable auto offload in config and offload according to the switch strategy
+        # Masking assumes this never runs. If it does, the hybrid engine is about
+        # to generate with weights that were never synced -- fail loudly rather
+        # than silently serve a stale model.
+        assert not self._hybrid_sync_masked(), (
+            "VERL_MASK_HYBRID_WEIGHT_SYNC=1 but switch_to_rollout() fired: the hybrid engine "
+            "IS being used for generation, so its weight sync cannot be masked. Unset the env var."
+        )
         self.checkpoint_manager.update_weights(self.global_steps)
         self.checkpoint_manager.resume_generation_replicas()
         self.add_replicas_to_balancer()
