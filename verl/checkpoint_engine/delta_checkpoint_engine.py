@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
@@ -582,6 +583,25 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         verification is off (verify_every=0 keeps only that one mandatory sweep)."""
         self._steady_count = getattr(self, "_steady_count", 0) + 1
         if self._steady_count == 1:
+            # The mandatory first-sync sweep is a correctness fuse, but it is
+            # expensive in two ways that matter when the point of the run is a
+            # NUMBER rather than a check:
+            #   * it runs INSIDE the region trainer_separate_async times as
+            #     ``update_weights``, so it inflates the reported figure by a
+            #     full extra dense pass;
+            #   * it calls load_weights once per unit, and SGLang logs its entire
+            #     "Some weights are not initialized from checkpoints: {...}" set
+            #     (~60 KB) on every one of them -- 58,904 such lines and 771 MB on
+            #     the head node in run ddp16d, which then killed the job with
+            #     "RaySystemError: Sent message larger than max (536878753 vs
+            #     536870912)" from ray's log-forwarding thread.
+            # So it stays on by default and is opt-out, never opt-in.
+            if os.environ.get("VERL_DELTA_SKIP_FIRST_VERIFY") == "1":
+                logger.warning(
+                    "VERL_DELTA_SKIP_FIRST_VERIFY=1: skipping the mandatory first-sync verify sweep. "
+                    "timing_s/update_weights now measures the sync alone; correctness is NOT checked."
+                )
+                return False
             return True
         if self.verify_every <= 0:
             return False
