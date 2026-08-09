@@ -18,16 +18,18 @@ SGLang's DeepSeek-V4 loader rebuilds ``wqkv_a`` / ``compressor.wkv_gate`` /
 buffering the first arrival in a cache it creates inside ``load_weights`` and asserts
 empty on return. Both halves must therefore reach the SAME ``load_weights`` call.
 
-verl splits weights by accumulated bytes in FOUR independent places, and each one can
-break that on its own:
+verl splits weights in FIVE independent places, and each one can break that on its own:
 
 1. ``delta_checkpoint_engine`` steady stream  -- ``_FusionStager`` + ``add_atomic``
 2. ``delta_checkpoint_engine`` seed stream    -- ``_FusionStager.offer_piece``
 3. ``delta_loader`` chunking                  -- ``_load_in_chunks``
 4. ``sglang_rollout.get_named_tensor_buckets`` -- the plain full-sync path, used by the
    NCCL engine and by ``separate_async``'s hybrid replicas
+5. ``delta_loader._verify_dense`` -- the odd one out: it split per PARAM by design,
+   not by bytes, so no bucket size could avoid it. ``_verify_due()`` always returns
+   True on the first steady sync, so it fired on every run that got that far.
 
-These tests pin all four, plus the shared membership table in
+These tests pin all five, plus the shared membership table in
 ``verl.utils.fusion_groups``. Run: ``pytest tests/checkpoint_engine/test_fusion_groups.py``
 """
 
@@ -277,3 +279,40 @@ def test_full_sync_bucketer_leaves_non_members_alone():
 def test_full_sync_bucketer_fails_loudly_on_an_incomplete_group():
     with pytest.raises(AssertionError, match="never completed"):
         _run_buckets([(f"{L}.wq_a.weight", _t(64)), ("x", _t(64))], 1024)
+
+
+def test_verify_sweep_feeds_whole_units_not_single_params():
+    """The verify sweep is the FIFTH splitter and the only structural one.
+
+    It used to call _apply_dense(model, [p]) once per param, which hands the DSv4
+    loader half of a fused destination. _verify_due() always returns True on the
+    first steady sync, so this fired on every run that got that far -- regardless
+    of any byte-size setting, which is what makes it different from the other four.
+    """
+    from verl.workers.rollout.sglang_rollout import delta_loader
+
+    seen = []
+
+    def fake_apply_dense(model, params, values, values_bytes=False):
+        seen.append([p["name"] for p in params])
+
+    orig = delta_loader._apply_dense
+    delta_loader._apply_dense = fake_apply_dense
+    try:
+        delta_loader._verify_dense(
+            _FakeModel(),
+            [
+                {"name": f"{L}.wq_a.weight"},
+                {"name": "model.embed_tokens.weight"},
+                {"name": f"{L}.wkv.weight"},
+            ],
+            torch.empty(0),
+            is_last=False,
+        )
+    finally:
+        delta_loader._apply_dense = orig
+
+    assert any(f"{L}.wq_a.weight" in c and f"{L}.wkv.weight" in c for c in seen), (
+        f"fused pair must be verified in one call, got {seen}"
+    )
+    assert ["model.embed_tokens.weight"] in seen, "non-members still go one at a time"

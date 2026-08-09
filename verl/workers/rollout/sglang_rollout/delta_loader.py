@@ -291,7 +291,16 @@ def _verify_dense(
     orig_copy = torch.Tensor.copy_
 
     by_param = _VERIFY_STATS.setdefault("by_param", {})
-    for p in params:
+    # Verify one ATOMIC UNIT at a time, not one param at a time. Feeding a single
+    # param to _apply_dense hands SGLang's DSv4 loader half of a fused destination
+    # (wqkv_a / wkv_gate), which it buffers and then asserts on at the end of
+    # load_weights. That is the fifth place in verl that can split a fusion group,
+    # and the only one that is structural rather than byte-driven -- it fires on
+    # the FIRST steady sync of every run (_verify_due always returns True there),
+    # which is why nothing hit it until a run finally got that far.
+    # Snapshot/compare semantics are unchanged: the hook records every copy_
+    # destination touched during the call, so a 2-param unit simply verifies both.
+    for unit in _atomic_units(params):
         touched: dict = {}
 
         def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, _touched=touched, **kwargs) -> torch.Tensor:
@@ -302,7 +311,7 @@ def _verify_dense(
 
         torch.Tensor.copy_ = snap_then_copy_
         try:
-            _apply_dense(model, [p], values, values_bytes)
+            _apply_dense(model, unit, values, values_bytes)
         finally:
             torch.Tensor.copy_ = orig_copy
         bad = 0
@@ -315,7 +324,9 @@ def _verify_dense(
             else:
                 bad += int((dst != pre).sum())
         if bad:
-            by_param[p["name"]] = by_param.get(p["name"], 0) + bad
+            # attribute to the whole unit; a fused pair is verified as one write
+            label = unit[0]["name"] if len(unit) == 1 else "+".join(q["name"] for q in unit)
+            by_param[label] = by_param.get(label, 0) + bad
         _VERIFY_STATS["pieces"].append(bad)
     _VERIFY_STATS["params"] += len(params)
     if is_last:
