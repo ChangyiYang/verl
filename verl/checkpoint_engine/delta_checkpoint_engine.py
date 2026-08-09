@@ -861,6 +861,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
         bkt = _FlushBucket(self.bucket_size, self._assemble_flush, _publish_steady)
         stager = _FusionStager()
+        nonlocal_missed: list[str] = []
 
         batch_k = self.batch_gather
 
@@ -883,6 +884,16 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             if offered is None:
                 return
             released, is_group = offered
+            # Same diagnostic as get_named_tensor_buckets: a name the DSv4 loader
+            # will try to fuse but that our table does not match makes the grouping
+            # silently do nothing, and the failure then surfaces far away as
+            # "cache_wqkv_a_weight not empty" with no hint which name was missed.
+            # The quantized steady path keys entries as "{megatron_name}::{c|s}",
+            # so this is exactly where a naming surprise is likely.
+            if not is_group and any(t in name for t in (".wq_a.", ".wkv.", ".wgate.")):
+                nonlocal_missed.append(name)
+                if len(nonlocal_missed) <= 8:
+                    logger.warning("delta fusion table MISSED param %r (bucketed ungrouped)", name)
             sized: list[tuple] = []
             for e_name, e_dtype, e_shape, e_idx, e_val in released:
                 if e_idx is None or (e_idx.numel() == 0 and not is_group):
@@ -910,6 +921,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # stream, so the receiver would have been handed an unpairable member and
         # died inside sglang's loader with a far less informative message.
         stager.assert_drained()
+        if nonlocal_missed:
+            logger.warning(
+                "delta fusion table MISSED %d param(s) the DSv4 loader will try to fuse; first 8: %s",
+                len(nonlocal_missed),
+                nonlocal_missed[:8],
+            )
         # Log unconditionally, including the zero case: if the export ever renames
         # these params, every suffix stops matching and the staging silently
         # degrades to a no-op -- which looks exactly like "no fused params in this
