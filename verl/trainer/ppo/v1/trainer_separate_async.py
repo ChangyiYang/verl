@@ -148,7 +148,18 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         # update weights after loading checkpoint
         self.standalone_checkpoint_manager.update_weights(self.global_steps)
         if self._hybrid_sync_masked():
-            logger.info("VERL_MASK_HYBRID_WEIGHT_SYNC=1: skipping the hybrid replicas' init weight sync")
+            # Skip the transfer, NOT the wake-up. _setup() ends with
+            # checkpoint_manager.sleep_replicas() to free memory for the checkpoint
+            # load, and update_weights() is what normally resumes them (its last two
+            # steps). Masking the whole call left them asleep forever, which measured
+            # strictly worse than not masking at all: 0 prefills vs 34, 0 decodes vs
+            # 31, 6 scheduler crashes vs 1 (runs dsv4_delta21 vs dsv4_delta19).
+            logger.info(
+                "VERL_MASK_HYBRID_WEIGHT_SYNC=1: skipping the hybrid replicas' weight transfer, "
+                "still resuming them so they do not stay asleep"
+            )
+            self.checkpoint_manager.resume_kv_cache_replicas()
+            self.checkpoint_manager.resume_generation_replicas()
         else:
             self.checkpoint_manager.update_weights(self.global_steps)
 
