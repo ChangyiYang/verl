@@ -694,6 +694,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         *args,
         encoding: str = "indices",
         batch_gather: int = 32,
+        gather_round_mbytes: int = 0,
         verify_every: int = 0,
         quantize_fp8: bool = False,
         **kwargs,
@@ -714,6 +715,13 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # (one count-matrix all_gather + two padded gathers per group instead of
         # three collectives per parameter).
         self.batch_gather = int(batch_gather)
+        # Bytes per gather round. Profiling put 82.7 s of a 129 s sync in the
+        # gather -- 218 rounds at 380 ms each, moving only ~200 MB per round,
+        # while the same 42.9 GiB broadcast in 5.4 s (0.52 vs 7.9 GiB/s). The
+        # rounds were bounded by the ENTRY COUNT (batch_gather=32), never by the
+        # byte budget, so each one was small and paid full collective latency.
+        # 0 keeps the old behaviour (budget = the flush bucket size).
+        self.gather_round_bytes = int(gather_round_mbytes) << 20 if gather_round_mbytes else 0
 
     def _verify_due(self) -> bool:
         """True on every K-th steady sync (``verify_every=K``), and ALWAYS on the
@@ -1197,7 +1205,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                         bkt.add(piece, nbytes)
             ship_t["consume"] += time.perf_counter() - _t_consume
 
-        gq = _GatherQueue(batch_k, self.bucket_size, is_r0, _bucket_slot_delta, timers=ship_t)
+        gq = _GatherQueue(
+            batch_k, self.gather_round_bytes or self.bucket_size, is_r0, _bucket_slot_delta, timers=ship_t
+        )
 
         # ``weights`` is the BACKEND's HF delta stream (hf_delta_export): entries
         # already carry final HF coordinates -- naming, conversion, diff and
