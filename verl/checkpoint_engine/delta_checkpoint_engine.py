@@ -377,13 +377,14 @@ class _GatherQueue:
     and deadlocks NCCL). Byte bounding happens INSIDE the batched gather via
     ``max_round_bytes``, decided from the all-gathered counts every rank sees."""
 
-    __slots__ = ("batch_k", "max_round_bytes", "is_r0", "_consume", "_queues")
+    __slots__ = ("batch_k", "max_round_bytes", "is_r0", "_consume", "_queues", "timers")
 
-    def __init__(self, batch_k: int, max_round_bytes: int, is_r0: bool, consume):
+    def __init__(self, batch_k: int, max_round_bytes: int, is_r0: bool, consume, timers=None):
         self.batch_k = max(int(batch_k), 1)
         self.max_round_bytes = int(max_round_bytes)
         self.is_r0 = is_r0
         self._consume = consume
+        self.timers = timers
         self._queues: dict[int, tuple] = {}  # id(pg) -> (pg, [entries])
 
     def put(self, pg, slots: list, dtype_str: str, counts: torch.Tensor, idx: torch.Tensor, val: torch.Tensor):
@@ -421,9 +422,16 @@ class _GatherQueue:
         counts_concat = torch.cat([c for _, _, c, _, _ in batch]).to(dev)
         idx_concat = torch.cat([i for _, _, _, i, _ in batch])
         val_concat = torch.cat([v for _, _, _, _, v in batch])
+        # Time the collective alone. ship_s is 79% of update_weights while the
+        # wire is only 45 GiB (0.42 GiB/s), so the cost is structural, not
+        # bandwidth -- but gather, rank-0 encoding and publish are folded together
+        # and want completely different fixes. Measure before choosing one.
+        _t = time.perf_counter()
         gathered = gather_slot_entries_to_rank0(
             idx_concat, val_concat, counts_concat, group=pg, max_round_bytes=self.max_round_bytes
         )
+        if self.timers is not None:
+            self.timers["gather"] += time.perf_counter() - _t
         if self.is_r0 and gathered is not None:
             slot_i = 0
             for slots, dtype_str, _counts, _i, _v in batch:
@@ -992,10 +1000,16 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
         def _publish_steady(flush, is_last: bool) -> None:
             nonlocal n_flushes
+            _t = time.perf_counter()
             self._publish_flush(flush, first=False, is_last=is_last)
+            ship_t["publish"] += time.perf_counter() - _t
             n_flushes += 1
 
         bkt = _FlushBucket(self.bucket_size, self._assemble_flush, _publish_steady)
+        # gather / consume(rank0 encode) / publish are the three costs inside
+        # ship_s. publish is nested inside consume (bkt.add triggers it), so the
+        # encode share is consume minus publish.
+        ship_t = {"gather": 0.0, "consume": 0.0, "publish": 0.0}
         stager = _FusionStager()
         nonlocal_missed: list[str] = []
         nonlocal_dupes = [0, 0]  # [total dropped, warnings emitted]
@@ -1011,6 +1025,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             aval: torch.Tensor | None,
         ) -> None:
             nonlocal total_elems, changed_elems, wire_bytes
+            _t_consume = time.perf_counter()
             total_elems += int(full_numel)
             # Assert the sender's own invariant: positions must address the shape
             # this entry declares. They are two different derivations -- the bf16
@@ -1077,6 +1092,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # and 0 wire bytes -- it costs one entry, not one tensor.
             offered = stager.offer(name, dtype_str, full_shape, aidx, aval)
             if offered is None:
+                ship_t["consume"] += time.perf_counter() - _t_consume
                 return
             released, is_group = offered
             # Same diagnostic as get_named_tensor_buckets: a name the DSv4 loader
@@ -1108,8 +1124,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             else:
                 for piece, nbytes in sized:
                     bkt.add(piece, nbytes)
+            ship_t["consume"] += time.perf_counter() - _t_consume
 
-        gq = _GatherQueue(batch_k, self.bucket_size, is_r0, _bucket_slot_delta)
+        gq = _GatherQueue(batch_k, self.bucket_size, is_r0, _bucket_slot_delta, timers=ship_t)
 
         # ``weights`` is the BACKEND's HF delta stream (hf_delta_export): entries
         # already carry final HF coordinates -- naming, conversion, diff and
@@ -1207,4 +1224,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # ship  = gather + sort + encode + bucket + broadcast, scales with the delta.
             "checkpoint_engine/export_s": t_export,
             "checkpoint_engine/ship_s": t_ship,
+            "checkpoint_engine/gather_s": ship_t["gather"],
+            "checkpoint_engine/encode_s": ship_t["consume"] - ship_t["publish"],
+            "checkpoint_engine/publish_s": ship_t["publish"],
         }
