@@ -60,6 +60,27 @@ def test_width_is_chosen_per_parameter_from_the_largest_gap():
     assert _gap_encode(sparse)[1] == 4
 
 
+@pytest.mark.parametrize("gap", [0xFF, 0x100, 0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF])
+def test_every_tier_boundary_round_trips(gap):
+    """One value per tier is not enough -- the bug this pins lived in the BAND
+    between two tiers' natural limits. The 2-byte carrier is torch.int16, so it
+    stops at 0x7FFF, not 0xFFFF; gaps in [0x8000, 0xFFFF] used to wrap negative,
+    decode to negative positions, and scatter out of bounds on the GPU (a device
+    fault that kills the process instead of raising). Boundaries, not samples."""
+    idx = torch.tensor([0, gap + 1], dtype=torch.int64)
+    gaps, width = _gap_encode(idx)
+    assert torch.equal(_decode(gaps), idx), f"gap {gap} at width {width} did not round-trip"
+
+
+def test_no_tier_can_emit_a_negative_gap():
+    """The failure mode was silent: encoding produced a valid-looking tensor.
+    Positions are non-negative and strictly increasing, so gaps are >= 0 --
+    a negative anywhere means the carrier wrapped."""
+    for gap in (0xFF, 0x7FFF, 0x8000, 0xFFFF, 0x10000, 1 << 20):
+        gaps, width = _gap_encode(torch.tensor([0, gap + 1], dtype=torch.int64))
+        assert (gaps.to(torch.int64) >= 0).all(), f"gap {gap} wrapped negative at width {width}"
+
+
 def test_widest_widths_still_round_trip():
     """The fallbacks are what make narrowing safe, so they must actually work."""
     for idx in ([0, 1000], [0, 100_000], [7, 70_000, 700_000]):

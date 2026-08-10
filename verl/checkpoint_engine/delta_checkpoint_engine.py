@@ -116,17 +116,25 @@ def _gap_encode(idx: torch.Tensor) -> tuple[torch.Tensor, int]:
     fallbacks, so a sparser-than-expected parameter costs bytes, never
     correctness.
 
-    Returns uint8/uint16/int32 gaps; int32 for the widest so the existing
-    ``.view(torch.uint8)`` packing stays byte-identical in layout.
+    Thresholds are the SIGNED limits of the carrier types, not the byte widths:
+    uint8 is unsigned so it holds 0xFF, but the 2-byte carrier is torch.int16,
+    which stops at 0x7FFF. Using 0xFFFF there wrapped gaps in [0x8000, 0xFFFF]
+    to negative, and the receiver's ``cumsum`` then produced negative positions
+    that scattered out of bounds -- a CUDA device-side fault that kills the
+    SGLang scheduler outright rather than raising. torch.uint16 exists but too
+    few ops accept it to carry through view/cumsum safely, so the 32768..65535
+    band pays 4 bytes instead of 2. Correctness over a byte.
+
+    Returns uint8/int16/int32 gaps; each is viewed as raw bytes by the caller.
     """
     if idx.numel() == 0:
         return idx.to(torch.int32), 4
     prev = torch.cat([idx.new_full((1,), -1), idx[:-1]])
     gaps = idx - prev - 1
     max_gap = int(gaps.max().item())
-    if max_gap <= 0xFF:
+    if max_gap <= 0xFF:  # uint8 is unsigned
         return gaps.to(torch.uint8), 1
-    if max_gap <= 0xFFFF:
+    if max_gap <= 0x7FFF:  # int16 is SIGNED -- 0xFFFF here silently wrapped
         return gaps.to(torch.int16), 2
     return gaps.to(torch.int32), 4
 

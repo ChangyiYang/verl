@@ -382,6 +382,27 @@ def _decode_one(
         gaps = pos_b.view(view_dtype).to(torch.int64)
         # inverse of the gap encoding
         idx = torch.cumsum(gaps + 1, dim=0) - 1
+        # Guard the decode, because the way this fails otherwise is a process
+        # kill, not an exception: positions feed a scatter, so one negative or
+        # oversized index is an out-of-bounds device write that takes the SGLang
+        # scheduler down with a CUDA fault and surfaces upstream only as
+        # "Server disconnected". A signed-carrier overflow in the sender did
+        # exactly that. Two reductions per parameter, against a multi-GB wire.
+        if gaps.numel():
+            if int(gaps.min()) < 0:
+                raise ValueError(
+                    f"{p['name']!r}: negative gap in the position stream "
+                    f"(pos_width={width}) -- sender/receiver disagree on the encoding"
+                )
+            n_elem = 1
+            for d in p["shape"]:
+                n_elem *= int(d)
+            hi = int(idx[-1])  # gaps are non-negative, so this is the max
+            if hi >= n_elem:
+                raise ValueError(
+                    f"{p['name']!r}: decoded position {hi} exceeds the parameter's "
+                    f"{n_elem} elements (pos_width={width})"
+                )
     else:
         raise ValueError(f"unsupported delta encoding: {encoding!r}")
 
