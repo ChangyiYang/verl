@@ -363,8 +363,25 @@ def _decode_one(
 
     pos_b = positions[p["pos_start"] : p["pos_end"]]
     if encoding == "indices":
-        # pos_start is always int32-aligned (each entry packs nnz * 4 bytes).
-        idx = pos_b.view(torch.int32).to(torch.int64)
+        # Positions ride the wire GAP-ENCODED at a per-parameter width: the sender
+        # stores idx[k] - idx[k-1] - 1 (with idx[-1] := -1) and picks 1, 2 or 4
+        # bytes from the largest gap in that parameter. A DSv4 delta is 12-17% of
+        # elements, so gaps are small and an absolute int32 position cost four
+        # times the fp8 code it pointed at.
+        #
+        # pos_width must be read, not assumed: this decoder used to hardcode
+        # int32. Note the wire is NOT backward compatible -- a pre-gap sender
+        # wrote absolute int32 positions, which this reads as gaps and decodes
+        # to garbage without erroring. Sender and receiver ship together and the
+        # payload is never persisted across versions, so the fix is to keep them
+        # on one commit, not to sniff the format.
+        width = int(p.get("pos_width", 4))
+        view_dtype = {1: torch.uint8, 2: torch.int16, 4: torch.int32}.get(width)
+        if view_dtype is None:
+            raise ValueError(f"unsupported pos_width={width} for {p['name']!r}")
+        gaps = pos_b.view(view_dtype).to(torch.int64)
+        # inverse of the gap encoding
+        idx = torch.cumsum(gaps + 1, dim=0) - 1
     else:
         raise ValueError(f"unsupported delta encoding: {encoding!r}")
 

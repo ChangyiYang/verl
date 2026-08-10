@@ -97,6 +97,40 @@ class _ValuesPiece:
     flat: torch.Tensor
 
 
+
+def _gap_encode(idx: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Sorted absolute positions -> gap bytes + the width used, per parameter.
+
+    Stores ``idx[k] - idx[k-1] - 1`` with ``idx[-1] := -1``, so the first entry is
+    the first absolute position and the receiver inverts with
+    ``cumsum(gap + 1) - 1``. Same scheme as slime's ``encode_deltas``.
+
+    Why it matters here: a measured DSv4 delta is 12-17% of elements and the wire
+    was still 72% of a full sync, because each fp8 code (1 byte) carried an int32
+    position (4 bytes) -- the position cost four times the data.
+
+    Width is chosen PER PARAMETER, and 1 byte is on the table where slime offers
+    only 2 or 4. That is not a guess: at the densities we measure, gaps are far
+    smaller than at the ~2% slime's comment assumes. P(gap > 255) per position is
+    3.4e-15 at 12.25% density and 2.5e-21 at 16.97%. The wider widths remain as
+    fallbacks, so a sparser-than-expected parameter costs bytes, never
+    correctness.
+
+    Returns uint8/uint16/int32 gaps; int32 for the widest so the existing
+    ``.view(torch.uint8)`` packing stays byte-identical in layout.
+    """
+    if idx.numel() == 0:
+        return idx.to(torch.int32), 4
+    prev = torch.cat([idx.new_full((1,), -1), idx[:-1]])
+    gaps = idx - prev - 1
+    max_gap = int(gaps.max().item())
+    if max_gap <= 0xFF:
+        return gaps.to(torch.uint8), 1
+    if max_gap <= 0xFFFF:
+        return gaps.to(torch.int16), 2
+    return gaps.to(torch.int32), 4
+
+
 class _FlushBucket:
     """One-flush-lookahead bucket pipeline, shared by the steady loop and both
     seed streams. Pieces accumulate until ``cap`` bytes; ``seal`` assembles them
@@ -698,13 +732,23 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         pos_off = val_off = 0
         for piece in per_param:
             nnz = int(piece.idx.numel())
-            # positions ride the wire as int32 (pos_width=4); a parameter bigger than
-            # 2^31 elements would silently wrap, so fail loud instead. DeltaParam
-            # carries pos_width for a future 8-byte escalation if a model needs it.
             assert _prodshape(piece.shape) < (1 << 31), (
                 f"{piece.name}: {_prodshape(piece.shape)} elements exceeds the int32 position encoding"
             )
-            idx_pieces.append(piece.idx.to(torch.int32))
+            gaps, width = _gap_encode(piece.idx)
+            # Widths are chosen per parameter, so two invariants that held while
+            # every position was int32 have to be re-established by hand:
+            #   1. pieces are cat-ed as raw bytes -- torch.cat on mixed dtypes
+            #      type-promotes (a uint8 piece beside an int32 one silently
+            #      becomes int32), which would rewrite the byte layout.
+            #   2. pos_start is padded up to the width, because the receiver
+            #      views the slice as int16/int32 and a storage offset that is
+            #      not a multiple of the element size cannot be viewed.
+            pad = (-pos_off) % width
+            if pad:
+                idx_pieces.append(torch.zeros(pad, dtype=torch.uint8, device=gaps.device))
+                pos_off += pad
+            idx_pieces.append(gaps.contiguous().view(torch.uint8))
             val = piece.val.contiguous().view(torch.uint8) if bytes_wire else piece.val
             val_pieces.append(val)
             n_val = int(val.numel())  # elements, or bytes in bytes_wire mode
@@ -714,18 +758,18 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     dtype=piece.dtype_str,
                     shape=list(piece.shape),
                     pos_start=pos_off,
-                    pos_end=pos_off + nnz * 4,
-                    pos_width=4,
+                    pos_end=pos_off + nnz * width,
+                    pos_width=width,
                     val_start=val_off,
                     val_end=val_off + n_val,
                 )
             )
-            pos_off += nnz * 4
+            pos_off += nnz * width
             val_off += n_val
 
         values_gpu = torch.cat(val_pieces) if val_pieces else torch.empty(0, dtype=self.rollout_dtype, device="cuda")
         positions_u8 = (
-            torch.cat(idx_pieces).contiguous().view(torch.uint8)
+            torch.cat(idx_pieces).contiguous()  # already uint8 bytes, per-piece
             if idx_pieces
             else torch.empty(0, dtype=torch.uint8, device=values_gpu.device)
         )

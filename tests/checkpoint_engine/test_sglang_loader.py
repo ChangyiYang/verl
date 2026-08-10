@@ -27,6 +27,7 @@ import json
 
 import torch
 
+from verl.checkpoint_engine.delta_checkpoint_engine import _gap_encode
 from verl.checkpoint_engine.delta_sync import DeltaParam, checksum
 from verl.workers.rollout.sglang_rollout.delta_loader import apply_delta
 
@@ -40,6 +41,12 @@ class _FakeModel:
     def load_weights(self, chunk):
         for name, tensor in chunk:
             self.params[name].copy_(tensor)
+
+    def named_parameters(self):
+        return iter(self.params.items())
+
+    def named_buffers(self):
+        return iter(())
 
 
 def _make_named(dtype=torch.bfloat16) -> list[tuple[str, torch.Tensor]]:
@@ -62,7 +69,14 @@ def _sparse_indices_flush(old_named, new_named):
         if idx.numel() == 0:
             continue
         nnz = int(idx.numel())
-        idx_pieces.append(idx.to(torch.int32))
+        # Encode through the real sender helper, so this stays a round-trip
+        # against production and not against a second copy of the format.
+        gaps, width = _gap_encode(idx)
+        pad = (-pos_off) % width  # pos_start must be viewable at this width
+        if pad:
+            idx_pieces.append(torch.zeros(pad, dtype=torch.uint8))
+            pos_off += pad
+        idx_pieces.append(gaps.contiguous().view(torch.uint8))
         val_pieces.append(fn[idx])
         params.append(
             DeltaParam(
@@ -70,15 +84,15 @@ def _sparse_indices_flush(old_named, new_named):
                 dtype=str(new.dtype).replace("torch.", ""),
                 shape=list(new.shape),
                 pos_start=pos_off,
-                pos_end=pos_off + nnz * 4,
-                pos_width=4,
+                pos_end=pos_off + nnz * width,
+                pos_width=width,
                 val_start=val_off,
                 val_end=val_off + nnz,
             )
         )
-        pos_off += nnz * 4
+        pos_off += nnz * width
         val_off += nnz
-    positions = torch.cat(idx_pieces).contiguous().view(torch.uint8)
+    positions = torch.cat(idx_pieces).contiguous()
     values = torch.cat(val_pieces)
     return params, positions, values
 
@@ -227,3 +241,32 @@ def test_verify_sweep_fails_loud_on_divergence():
     model = _FakeModel(diverged)
     with pytest.raises(RuntimeError, match="verification FAILED"):
         apply_delta(model, _dense_verify_flush(named))
+
+
+def test_mixed_widths_across_params_round_trip():
+    """Per-parameter widths break two invariants that held under uniform int32:
+    pieces can no longer be cat-ed as typed tensors (torch.cat promotes), and
+    pos_start is no longer naturally aligned for an int16/int32 view. A dense
+    param (width 1) followed by a sparse one (width > 1) hits both."""
+    named = [
+        ("dense.weight", torch.randn(64, 32, dtype=torch.bfloat16)),
+        ("sparse.weight", torch.randn(64, 32, dtype=torch.bfloat16)),
+    ]
+    model = _FakeModel(named)
+
+    new_named = []
+    for i, (name, t) in enumerate(named):
+        new = t.clone()
+        flat = new.view(-1)
+        # dense: every 3rd element (gap 2, width 1, odd nnz -> misaligns the next)
+        # sparse: two elements 1000 apart (gap 999, needs width 2)
+        idx = torch.arange(0, 999, 3) if i == 0 else torch.tensor([0, 1000])
+        flat[idx] = flat[idx] + 0.5
+        new_named.append((name, new))
+
+    params, positions, values = _sparse_indices_flush(named, new_named)
+    assert {p.pos_width for p in params} == {1, 2}, "test did not produce mixed widths"
+
+    apply_delta(model, _named_tensors(params, positions, values))
+    for name, expected in new_named:
+        assert torch.equal(model.params[name].view(torch.int16), expected.view(torch.int16)), name
