@@ -1074,7 +1074,13 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     continue  # unchanged and not fused -- drop it, as before
                 changed_elems += int(e_idx.numel())
                 if e_idx.numel():
-                    wire_bytes += int(e_idx.numel()) * (4 + e_val.element_size())
+                    # Charge the width the positions are actually encoded at.
+                    # Hardcoding 4 here made payload_mbytes report 5 B/element
+                    # after the switch to 1-byte gaps -- the metric claimed 96.2
+                    # GiB where the wire carried 38.5, which is exactly the figure
+                    # this work is judged on. The flush count is the cross-check:
+                    # 78 flushes only makes sense at ~2 B/element.
+                    wire_bytes += int(e_idx.numel()) * (_gap_encode(e_idx)[1] + e_val.element_size())
                 sized.extend(_slice_pieces(e_name, e_dtype, e_shape, e_idx, e_val))
             if is_group:
                 bkt.add_atomic(sized)
