@@ -979,6 +979,23 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         ) -> None:
             nonlocal total_elems, changed_elems, wire_bytes
             total_elems += int(full_numel)
+            # Assert the sender's own invariant: positions must address the shape
+            # this entry declares. They are two different derivations -- the bf16
+            # path translates shard-local indices to within-param coordinates
+            # (_hf_entry_identity) and takes shape from spec.full_shape, while the
+            # quant path takes both from _quant_group_meta -- so nothing forces
+            # them to agree. When they disagree the receiver index_copy_s out of
+            # bounds, which is a device-side fault 11 nodes away that names
+            # nothing. Fail here instead, where the offending name and both
+            # numbers are in hand. One max() per entry against a multi-GB wire.
+            if aidx is not None and aidx.numel():
+                hi = int(aidx.max())
+                assert hi < int(full_numel), (
+                    f"{name}: delta position {hi} does not address the declared shape "
+                    f"{tuple(full_shape)} ({full_numel} elements); positions and shape "
+                    f"come from different derivations and have diverged "
+                    f"(ratio {hi / max(int(full_numel), 1):.2f})"
+                )
             # Members of a fused destination param are held back until the group
             # is whole, then emitted as one indivisible run of pieces. Everything
             # else falls through unchanged. Note the accounting below runs on the
