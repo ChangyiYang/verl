@@ -279,6 +279,29 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    # BENCHMARK-ONLY escape hatch (VERL_HACK_ADVANTAGE_STD=<float>).
+    #
+    # A delta-weight-sync measurement needs the weights to actually MOVE. With a
+    # base model on a dataset it cannot solve, every sample in a GRPO group gets
+    # the same reward, so advantages are identically zero and so is the gradient:
+    # runs ddp16e/ddp16f measured changed_ratio 7e-09 and a 14 KB payload -- an
+    # empty pipe wearing a very flattering number (15 s vs a 240 s full sync).
+    #
+    # Replacing the advantages with noise gives a gradient of a realistic
+    # MAGNITUDE without pretending to learn anything. That is legitimate for
+    # timing the transport and illegitimate for anything else, so it is
+    # env-gated, off by default, and logs loudly every time it fires: a run that
+    # trained on noise must never be mistaken for a training result.
+    _hack = os.environ.get("VERL_HACK_ADVANTAGE_STD")
+    if _hack:
+        std = float(_hack)
+        adv = data.batch["advantages"]
+        data.batch["advantages"] = torch.randn_like(adv) * std * data.batch["response_mask"]
+        data.batch["returns"] = data.batch["advantages"].clone()
+        print(
+            f"[VERL_HACK_ADVANTAGE_STD={std}] advantages REPLACED WITH NOISE. "
+            f"This run measures weight-sync cost only; its loss/reward/metrics are meaningless."
+        )
     return data
 
 
