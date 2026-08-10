@@ -114,3 +114,33 @@ def test_bytes_per_element_drops_from_five_to_two():
     after = width + 1
     assert after == 2
     assert after / before == pytest.approx(0.4)
+
+
+def test_unsorted_input_is_rejected_not_wrapped():
+    """The bug that cost three cluster runs. gather_slot_entries_to_rank0
+    concatenates each rank's ascending block back to back, so the result is
+    ascending WITHIN blocks and descending at every seam. Absolute int32
+    positions did not care -- each stood alone -- so nothing upstream ever had
+    to guarantee order, and switching to a stateful encoding quietly inherited a
+    requirement no one was meeting.
+
+    It has to ASSERT, not wrap: a descending step is a negative gap, and a
+    negative gap in a uint8/int16 carrier becomes a large positive one. Then the
+    sender's range check passes (raw positions are in range), the receiver sees
+    only non-negative gaps, and the positions just silently land out of bounds."""
+    seam = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=torch.int64)
+    with pytest.raises(AssertionError, match="strictly increasing"):
+        _gap_encode(seam)
+
+
+def test_the_wrap_this_prevents_would_have_been_invisible():
+    """Pin why the assert is the fix and a guard downstream is not: encode the
+    seam by hand and observe that every symptom looks healthy."""
+    idx = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=torch.int64)
+    prev = torch.cat([idx.new_full((1,), -1), idx[:-1]])
+    gaps = idx - prev - 1
+    assert int(gaps.max()) <= 0xFF  # width 1 would be chosen from max alone
+    wrapped = gaps.to(torch.uint8)
+    assert (wrapped.to(torch.int64) >= 0).all()  # receiver's negative check passes
+    decoded = _decode(wrapped)
+    assert int(decoded.max()) > int(idx.max())  # ...yet positions overshoot

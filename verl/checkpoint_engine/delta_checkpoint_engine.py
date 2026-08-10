@@ -131,6 +131,18 @@ def _gap_encode(idx: torch.Tensor) -> tuple[torch.Tensor, int]:
         return idx.to(torch.int32), 4
     prev = torch.cat([idx.new_full((1,), -1), idx[:-1]])
     gaps = idx - prev - 1
+    # Gap encoding REQUIRES strictly increasing positions; absolute int32 did not,
+    # which is why nothing upstream ever had to guarantee it. Assert rather than
+    # trust: a descending step makes a negative gap, and a negative gap in an
+    # unsigned or narrow carrier wraps to a large positive one. Nothing then looks
+    # wrong -- the sender's own range check passes (the raw positions are fine),
+    # the receiver sees only non-negative gaps -- and the decoded positions
+    # silently overshoot into an out-of-bounds scatter.
+    min_gap = int(gaps.min().item())
+    assert min_gap >= 0, (
+        f"gap encoding needs strictly increasing positions, got a step of {min_gap - 1}; "
+        "sort (idx, val) together before encoding"
+    )
     max_gap = int(gaps.max().item())
     if max_gap <= 0xFF:  # uint8 is unsigned
         return gaps.to(torch.uint8), 1
@@ -988,6 +1000,16 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # bounds, which is a device-side fault 11 nodes away that names
             # nothing. Fail here instead, where the offending name and both
             # numbers are in hand. One max() per entry against a multi-GB wire.
+            if aidx is not None and aidx.numel() > 1:
+                # Establish the ordering the gap encoding needs. Positions arrive
+                # from gather_slot_entries_to_rank0, which concatenates each rank's
+                # block back to back; every block is ascending but their
+                # concatenation is not. That was harmless while positions were
+                # absolute -- each one stood alone -- and is not harmless now.
+                # Sort here, the last point where idx and val are still paired.
+                if bool((aidx[1:] < aidx[:-1]).any()):
+                    order = torch.argsort(aidx)
+                    aidx, aval = aidx[order], aval[order]
             if aidx is not None and aidx.numel():
                 hi = int(aidx.max())
                 assert hi < int(full_numel), (
