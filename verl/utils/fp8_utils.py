@@ -51,6 +51,17 @@ class FP8QuantizerHelper:
             "ln_",  # LayerNorm variants
             "embeddings",  # Embeddings
             "mlp.gate.weight",  # MoE router
+            # DeepSeek-V4 names its MoE router "ffn.gate.weight" and keeps these
+            # in BF16 even though the model is otherwise fp8. Verified against the
+            # checkpoint headers of DeepSeek-V4-Flash-FP8, not guessed:
+            #   BF16   attn.wo_a.weight   attn.q_norm.weight   attn.kv_norm.weight
+            #          attn_norm.weight   ffn_norm.weight      ffn.gate.weight
+            #   F8E4M3 attn.wq_a/wq_b/wkv/wo_b.weight  ffn.*experts*.w1/w2/w3.weight
+            # Note wo_a is BF16 while wo_b is FP8 -- same prefix, opposite dtype,
+            # so ".wo_" as a pattern would be wrong.
+            "ffn.gate.weight",  # DSv4 MoE router
+            ".wo_a.weight",  # DSv4 factored o-proj, first half stays BF16
+            "compressor.",  # DSv4 compressor/indexer linears are BF16 in sglang
         ]
 
         # Check if matches exclude patterns
@@ -71,6 +82,23 @@ class FP8QuantizerHelper:
             "fc1",  # Fully connected 1
             "fc2",  # Fully connected 2
             "mlp",  # MLP layers
+            # DeepSeek-V4 linear names. The allowlist below is why DSv4 silently
+            # shipped BF16 into fp8 params: none of the Llama-style patterns match
+            # wq_a/wq_b/wkv/wo_b/w1/w2/w3, and the default is "do not quantize",
+            # so every attention and expert weight went out unquantized and SGLang
+            # rejected it with
+            #   ValueError: Downcasting not allowed:
+            #     target.dtype=torch.float8_e4m3fn, loaded_weight.dtype=torch.bfloat16
+            # (run ddp16g, model.layers.0.self_attn.wq_b.weight). It only surfaced
+            # once a delta was non-empty; the earlier empty-delta runs never wrote
+            # these params at all and so hid it.
+            ".wq_a.weight",
+            ".wq_b.weight",
+            ".wkv.weight",  # attention KV proj; compressor.wkv is excluded above
+            ".wo_b.weight",  # NOT wo_a -- see the exclude list
+            ".w1.weight",  # expert / shared-expert MLP
+            ".w2.weight",
+            ".w3.weight",
         ]
 
         # Check if matches include patterns
