@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -57,6 +59,52 @@ def shard_delta_indices(
     values = local_new[local_idx]
     global_idx = local_idx.to(torch.int64) + offset
     return global_idx, values
+
+
+def _gather_p2p(idx_concat, val_concat, totals, world, rank, dst, group, dev):
+    """Variable-length gather to rank 0: each rank sends exactly what it holds.
+
+    ``totals[r]`` comes from the counts matrix every rank already all-gathered,
+    so senders and receivers agree on every length without another collective.
+    Ranks with nothing to contribute post no ops at all -- the padded path had
+    them send a full max_n of zeros.
+
+    Returns ``(idx_list, val_list)`` on rank 0 (rank r's slot holds exactly
+    ``totals[r]`` elements, so the caller's per-rank offset arithmetic is
+    unchanged), and ``(None, None)`` elsewhere.
+    """
+    if rank == 0:
+        idx_list = [
+            idx_concat
+            if r == 0
+            else torch.empty(totals[r], dtype=idx_concat.dtype, device=dev)
+            for r in range(world)
+        ]
+        val_list = [
+            val_concat
+            if r == 0
+            else torch.empty(totals[r], dtype=val_concat.dtype, device=dev)
+            for r in range(world)
+        ]
+        ops = []
+        for r in range(1, world):
+            if not totals[r]:
+                continue
+            peer = dist.get_global_rank(group, r) if group is not None else r
+            ops.append(dist.P2POp(dist.irecv, idx_list[r], peer, group))
+            ops.append(dist.P2POp(dist.irecv, val_list[r], peer, group))
+        for w in dist.batch_isend_irecv(ops) if ops else []:
+            w.wait()
+        return idx_list, val_list
+
+    if totals[rank]:
+        ops = [
+            dist.P2POp(dist.isend, idx_concat.contiguous(), dst, group),
+            dist.P2POp(dist.isend, val_concat.contiguous(), dst, group),
+        ]
+        for w in dist.batch_isend_irecv(ops):
+            w.wait()
+    return None, None
 
 
 def gather_slot_entries_to_rank0(
@@ -125,18 +173,35 @@ def gather_slot_entries_to_rank0(
         empty_v = torch.empty(0, dtype=val_concat.dtype, device=dev)
         return [(empty_i, empty_v) for _ in range(k)]
 
-    idx_pad = torch.zeros(max_n, dtype=idx_concat.dtype, device=dev)
-    val_pad = torch.zeros(max_n, dtype=val_concat.dtype, device=dev)
-    n = int(idx_concat.numel())
-    idx_pad[:n] = idx_concat
-    val_pad[:n] = val_concat
+    # dist.gather requires every rank to send the SAME length, so the padded path
+    # below sends max_n from each rank regardless of what it actually holds. The
+    # profile showed what that costs: 42.9 GiB of real delta moved as ~686 GiB
+    # (world=16) and took 82.7 s, while the same bytes broadcast in 5.4 s. Rank 0
+    # also has to allocate 2 x world x max_n, which is what caps the round size at
+    # ~200 MB and made "just use bigger rounds" OOM at 1 GiB.
+    #
+    # counts_cpu is already all-gathered, so both sides know every exact length:
+    # point-to-point moves precisely the real bytes. Off by default because it
+    # replaces a collective with matched sends/receives, and a mismatch there
+    # deadlocks rather than errors -- the counts matrix is what makes the match
+    # safe, and it is the same object the padded path already trusts.
+    if os.environ.get("VERL_DELTA_GATHER_P2P") == "1":
+        idx_list, val_list = _gather_p2p(idx_concat, val_concat, totals, world, rank, dst, group, dev)
+        if rank != 0:
+            return None
+    else:
+        idx_pad = torch.zeros(max_n, dtype=idx_concat.dtype, device=dev)
+        val_pad = torch.zeros(max_n, dtype=val_concat.dtype, device=dev)
+        n = int(idx_concat.numel())
+        idx_pad[:n] = idx_concat
+        val_pad[:n] = val_concat
 
-    idx_list = [torch.zeros(max_n, dtype=idx_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
-    val_list = [torch.zeros(max_n, dtype=val_concat.dtype, device=dev) for _ in range(world)] if rank == 0 else None
-    dist.gather(idx_pad, idx_list, dst=dst, group=group)
-    dist.gather(val_pad, val_list, dst=dst, group=group)
-    if rank != 0:
-        return None
+        idx_list = [torch.zeros(max_n, dtype=idx_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
+        val_list = [torch.zeros(max_n, dtype=val_concat.dtype, device=dev) for _ in range(world)] if rank == 0 else None
+        dist.gather(idx_pad, idx_list, dst=dst, group=group)
+        dist.gather(val_pad, val_list, dst=dst, group=group)
+        if rank != 0:
+            return None
 
     # per-rank cumulative offsets into each blob, sliced per param then stitched across ranks
     offs = [[0] * (k + 1) for _ in range(world)]
