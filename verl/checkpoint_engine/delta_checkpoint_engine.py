@@ -615,8 +615,40 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         h = self._fp8_helper(engine)
         return QuantSpec(
             weight_block_size=tuple(h.quant_config.get("weight_block_size", [128, 128])),
-            should_quantize=h.should_quantize_param,
+            should_quantize=self._quant_predicate(h),
         )
+
+    def _quant_predicate(self, helper):
+        """Which params to fp8-quantize: from the checkpoint, or from name patterns.
+
+        ``VERL_FP8_SELECT_FROM_CKPT=1`` reads the safetensors headers of the model
+        being served and asks each tensor's real dtype, which is what vLLM does on
+        its side of the wire (``module.weight.dtype``) and what the name allowlist
+        can only approximate. Off by default so the two can be compared on the same
+        model before either is made the rule.
+
+        Falls back to the allowlist -- loudly -- if the checkpoint cannot answer,
+        because "selected nothing" is precisely the failure this exists to prevent.
+        """
+        if os.environ.get("VERL_FP8_SELECT_FROM_CKPT") != "1":
+            return helper.should_quantize_param
+        from verl.utils.fp8_ckpt_dtypes import build_ckpt_fp8_predicate
+
+        path = getattr(getattr(self, "model_config", None), "local_path", None) or os.environ.get(
+            "VERL_FP8_CKPT_PATH"
+        )
+        if not path:
+            logger.warning(
+                "VERL_FP8_SELECT_FROM_CKPT=1 but no model path is reachable here; "
+                "falling back to the name allowlist. Set VERL_FP8_CKPT_PATH."
+            )
+            return helper.should_quantize_param
+        pred = build_ckpt_fp8_predicate(path)
+        if pred is None:
+            logger.warning("fp8 selection: checkpoint at %s could not answer; using the name allowlist", path)
+            return helper.should_quantize_param
+        logger.warning("fp8 selection: using CHECKPOINT dtypes from %s (not the name allowlist)", path)
+        return pred
 
     def _fp8_helper(self, engine=None):
         """Build the quantizer helper from the SAME inputs the rollout used --

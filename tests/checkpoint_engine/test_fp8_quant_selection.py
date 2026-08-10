@@ -29,6 +29,8 @@ headers, not inferred from the code. The trap worth remembering: ``wo_a`` is
 BF16 while ``wo_b`` is FP8 -- same prefix, opposite dtype.
 """
 
+import os
+
 import pytest
 
 from verl.utils.fp8_utils import FP8QuantizerHelper
@@ -87,3 +89,42 @@ LLAMA = [
 def test_llama_selection_unchanged(helper, name, expected):
     """The DSv4 additions must not disturb the models this already served."""
     assert helper.should_quantize_param(name) is expected
+
+
+# --------------------------------------------------------- checkpoint-driven route
+
+CKPT = "/home/changyi/models/DeepSeek-V4-Flash-FP8"
+
+
+@pytest.mark.skipif(not os.path.isdir(CKPT), reason="DSv4-Flash-FP8 checkpoint not present")
+def test_checkpoint_predicate_agrees_with_the_name_list_on_dsv4():
+    """The two selection routes must agree on the model we have, or one is wrong.
+
+    The name list was hand-built from these same headers, so disagreement means a
+    transcription slip -- exactly the failure mode the checkpoint route removes.
+    """
+    from verl.utils.fp8_ckpt_dtypes import build_ckpt_fp8_predicate
+
+    pred = build_ckpt_fp8_predicate(CKPT)
+    assert pred is not None, "checkpoint should be able to answer"
+    helper = FP8QuantizerHelper.__new__(FP8QuantizerHelper)
+    for name, expected in DSV4:
+        assert pred(name) is expected, f"checkpoint route disagrees on {name}"
+        assert helper.should_quantize_param(name) is expected, f"name route disagrees on {name}"
+
+
+@pytest.mark.skipif(not os.path.isdir(CKPT), reason="DSv4-Flash-FP8 checkpoint not present")
+def test_checkpoint_predicate_separates_attn_wkv_from_compressor_wkv():
+    """Two components of tail would collapse these two, and their dtypes differ."""
+    from verl.utils.fp8_ckpt_dtypes import build_ckpt_fp8_predicate
+
+    pred = build_ckpt_fp8_predicate(CKPT)
+    assert pred("model.layers.0.self_attn.wkv.weight") is True
+    assert pred("model.layers.0.self_attn.compressor.wkv.weight") is False
+
+
+def test_missing_checkpoint_returns_none_not_a_false_predicate():
+    """"could not read" must not masquerade as "nothing is fp8"."""
+    from verl.utils.fp8_ckpt_dtypes import build_ckpt_fp8_predicate
+
+    assert build_ckpt_fp8_predicate("/nonexistent/path/for/this/test") is None
