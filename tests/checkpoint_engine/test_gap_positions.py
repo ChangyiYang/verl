@@ -179,3 +179,48 @@ def test_normalised_seam_input_encodes():
     assert sval.tolist() == [6, 7, 8]  # last rank's contribution wins
     gaps, width = _gap_encode(sidx)
     assert torch.equal(_decode(gaps), sidx) and width == 1
+
+
+def test_gap_encode_reads_the_device_once():
+    """Guards the fix, not the feature. Each device->host read stalls the CUDA
+    stream, and rank 0 runs this per parameter -- ~8 reads/param turned a 4x
+    smaller wire into a SLOWER sync (2.00 -> 0.42 GiB/s measured). Asking for
+    min and max separately is two stalls; one stacked read is one.
+
+    Counting .item()/.tolist() calls is crude but it is the property that
+    regressed, and a plausible-looking `int(gaps.min())` edit would silently
+    bring the cost back."""
+    import torch as _t
+
+    calls = []
+    real_tolist, real_item = _t.Tensor.tolist, _t.Tensor.item
+
+    def spy_tolist(self):
+        calls.append("tolist")
+        return real_tolist(self)
+
+    def spy_item(self):
+        calls.append("item")
+        return real_item(self)
+
+    _t.Tensor.tolist, _t.Tensor.item = spy_tolist, spy_item
+    try:
+        _gap_encode(torch.arange(0, 4096, 3, dtype=torch.int64))
+    finally:
+        _t.Tensor.tolist, _t.Tensor.item = real_tolist, real_item
+
+    assert len(calls) == 1, f"expected one device read, got {len(calls)}: {calls}"
+
+
+def test_slice_pieces_encodes_each_piece_once():
+    """The width was being computed to size the bucket and then thrown away, so
+    _assemble_flush encoded the same piece again. Pieces now carry their gaps."""
+    from verl.checkpoint_engine.delta_checkpoint_engine import _slice_pieces
+
+    idx = torch.arange(0, 3000, 3, dtype=torch.int64)
+    val = torch.zeros(idx.numel(), dtype=torch.bfloat16)
+    pieces = _slice_pieces("p", "bfloat16", [4096], idx, val)
+    for piece, nbytes in pieces:
+        assert piece.gaps is not None, "piece must carry its encoded gaps"
+        assert nbytes == piece.idx.numel() * (piece.pos_width + val.element_size())
+        assert torch.equal(_decode(piece.gaps), piece.idx), "carried gaps must decode to the piece"

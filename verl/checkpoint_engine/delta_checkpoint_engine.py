@@ -85,6 +85,13 @@ class _FlushPiece:
     shape: list
     idx: torch.Tensor
     val: torch.Tensor
+    # Gap bytes and their width, encoded ONCE where the piece is cut. Every
+    # consumer (bucket accounting, the payload metric, the flush assembly) reads
+    # these instead of re-encoding: each _gap_encode call ends in a device->host
+    # read, and on rank 0's per-parameter path those reads serialise the CUDA
+    # stream. Recomputing turned a 4x smaller wire into a slower sync.
+    gaps: torch.Tensor = None
+    pos_width: int = 4
 
 
 @dataclass(slots=True)
@@ -138,12 +145,13 @@ def _gap_encode(idx: torch.Tensor) -> tuple[torch.Tensor, int]:
     # wrong -- the sender's own range check passes (the raw positions are fine),
     # the receiver sees only non-negative gaps -- and the decoded positions
     # silently overshoot into an out-of-bounds scatter.
-    min_gap = int(gaps.min().item())
+    # ONE sync for both bounds: two .item() calls are two stream stalls, and this
+    # runs per parameter on rank 0.
+    min_gap, max_gap = torch.stack([gaps.min(), gaps.max()]).tolist()
     assert min_gap >= 0, (
         f"gap encoding needs strictly increasing positions, got a step of {min_gap - 1}; "
         "sort (idx, val) together before encoding"
     )
-    max_gap = int(gaps.max().item())
     if max_gap <= 0xFF:  # uint8 is unsigned
         return gaps.to(torch.uint8), 1
     if max_gap <= 0x7FFF:  # int16 is SIGNED -- 0xFFFF here silently wrapped
@@ -330,16 +338,20 @@ def _slice_pieces(name: str, dtype_str: str, shape, aidx: torch.Tensor, aval: to
     widths can only be narrower, so this is a safe upper bound.
     """
     if aidx.numel() == 0:
-        return [(_FlushPiece(name, dtype_str, list(shape), aidx, aval), 0)]
-    pos_bytes = _gap_encode(aidx)[1]
+        return [(_FlushPiece(name, dtype_str, list(shape), aidx, aval, aidx.to(torch.int32), 4), 0)]
     max_elems = DeltaShardedCheckpointEngine.MAX_ENTRY_ELEMS
     out = []
     for s in range(0, aidx.numel(), max_elems):
         e = min(s + max_elems, aidx.numel())
+        # Encode here, once. A piece's first gap is its absolute start, which can
+        # exceed every interior gap, so a piece's width is not derivable from the
+        # parameter's -- it has to be per piece. What we avoid is doing it TWICE
+        # (once to size the bucket, again to assemble the flush).
+        gaps, width = _gap_encode(aidx[s:e])
         out.append(
             (
-                _FlushPiece(name, dtype_str, list(shape), aidx[s:e], aval[s:e]),
-                (e - s) * (pos_bytes + aval.element_size()),
+                _FlushPiece(name, dtype_str, list(shape), aidx[s:e], aval[s:e], gaps, width),
+                (e - s) * (width + aval.element_size()),
             )
         )
     return out
@@ -763,7 +775,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             assert _prodshape(piece.shape) < (1 << 31), (
                 f"{piece.name}: {_prodshape(piece.shape)} elements exceeds the int32 position encoding"
             )
-            gaps, width = _gap_encode(piece.idx)
+            gaps, width = piece.gaps, piece.pos_width  # encoded in _slice_pieces
             # Widths are chosen per parameter, so two invariants that held while
             # every position was int32 have to be re-established by hand:
             #   1. pieces are cat-ed as raw bytes -- torch.cat on mixed dtypes
@@ -1009,6 +1021,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # bounds, which is a device-side fault 11 nodes away that names
             # nothing. Fail here instead, where the offending name and both
             # numbers are in hand. One max() per entry against a multi-GB wire.
+            hi = -1
+            if aidx is not None and aidx.numel() == 1:
+                hi = int(aidx[0])
             if aidx is not None and aidx.numel() > 1:
                 # Establish the ordering the gap encoding needs. Positions arrive
                 # from gather_slot_entries_to_rank0, which concatenates each rank's
@@ -1025,24 +1040,30 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # simply let the last writer win. The stable sort preserves gather
                 # order among equal indices, so keeping the LAST occurrence
                 # reproduces exactly that behaviour rather than inventing a new one.
-                if bool((aidx[1:] <= aidx[:-1]).any()):
+                # ONE device->host read decides everything: whether the block
+                # needs normalising, and the max position for the range assert
+                # below. Asking those as separate .item()/bool() calls is separate
+                # stream stalls, per parameter, and rank 0 walks every parameter.
+                disordered, hi = torch.stack([(aidx[1:] <= aidx[:-1]).any().long(), aidx.max()]).tolist()
+                if disordered:
                     order = torch.argsort(aidx, stable=True)
                     aidx, aval = aidx[order], aval[order]
                     keep = torch.ones_like(aidx, dtype=torch.bool)
                     keep[:-1] = aidx[1:] != aidx[:-1]  # last of each run
-                    if not bool(keep.all()):
-                        nonlocal_dupes[0] += int(aidx.numel() - int(keep.sum()))
+                    n_before = aidx.numel()
+                    aidx, aval = aidx[keep], aval[keep]  # no-op when nothing repeats
+                    dropped = n_before - aidx.numel()  # numel is host-side: free
+                    if dropped:
+                        nonlocal_dupes[0] += dropped
                         if nonlocal_dupes[1] < 4:
                             nonlocal_dupes[1] += 1
                             logger.warning(
                                 "delta: %r had %d duplicate positions across the gather group "
                                 "(keeping the last, as index_copy_ did)",
                                 name,
-                                int(aidx.numel() - int(keep.sum())),
+                                dropped,
                             )
-                        aidx, aval = aidx[keep], aval[keep]
             if aidx is not None and aidx.numel():
-                hi = int(aidx.max())
                 assert hi < int(full_numel), (
                     f"{name}: delta position {hi} does not address the declared shape "
                     f"{tuple(full_shape)} ({full_numel} elements); positions and shape "
@@ -1073,15 +1094,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 if e_idx is None or (e_idx.numel() == 0 and not is_group):
                     continue  # unchanged and not fused -- drop it, as before
                 changed_elems += int(e_idx.numel())
-                if e_idx.numel():
-                    # Charge the width the positions are actually encoded at.
-                    # Hardcoding 4 here made payload_mbytes report 5 B/element
-                    # after the switch to 1-byte gaps -- the metric claimed 96.2
-                    # GiB where the wire carried 38.5, which is exactly the figure
-                    # this work is judged on. The flush count is the cross-check:
-                    # 78 flushes only makes sense at ~2 B/element.
-                    wire_bytes += int(e_idx.numel()) * (_gap_encode(e_idx)[1] + e_val.element_size())
-                sized.extend(_slice_pieces(e_name, e_dtype, e_shape, e_idx, e_val))
+                # payload_mbytes reads the per-piece byte counts _slice_pieces
+                # already computed, rather than re-encoding to ask the width.
+                # Hardcoding 4 here made the metric report 5 B/element after the
+                # switch to 1-byte gaps -- 96.2 GiB where the wire carried 38.5,
+                # which is exactly the figure this work is judged on. The flush
+                # count is the cross-check: 78 flushes only makes sense at ~2 B.
+                pieces = _slice_pieces(e_name, e_dtype, e_shape, e_idx, e_val)
+                wire_bytes += sum(nb for _, nb in pieces)
+                sized.extend(pieces)
             if is_group:
                 bkt.add_atomic(sized)
             else:
