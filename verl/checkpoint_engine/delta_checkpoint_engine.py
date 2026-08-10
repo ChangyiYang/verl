@@ -1115,9 +1115,31 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # already carry final HF coordinates -- naming, conversion, diff and
         # snapshot all happened on the backend side. This engine only batches,
         # gathers and ships.
-        for slots, dtype_str, counts, hf_idx, hf_val, pg in weights:
-            gq.put(pg, slots, dtype_str, counts, hf_idx, hf_val)
+        # Split the wall clock where the two costs actually live, because
+        # update_weights is currently one number and every explanation for it has
+        # been a guess. Pulling the generator runs the BACKEND's work -- quantize
+        # the whole model, diff every parameter against the snapshot, refresh it
+        # -- which is O(total params) and indifferent to how much changed.
+        # Everything else (gather, sort, encode, bucket, broadcast) scales with
+        # the delta. Measured: at 12-17% density time tracked payload; at 7-8% it
+        # stopped tracking payload entirely, so one of these two terms grew and
+        # the folded number cannot say which.
+        t_export = t_ship = 0.0
+        _it = iter(weights)
+        while True:
+            _t = time.perf_counter()
+            try:
+                item = next(_it)
+            except StopIteration:
+                t_export += time.perf_counter() - _t
+                break
+            t_export += time.perf_counter() - _t
+            _t = time.perf_counter()
+            gq.put(item[5], item[0], item[1], item[2], item[3], item[4])
+            t_ship += time.perf_counter() - _t
+        _t = time.perf_counter()
         gq.flush_all()
+        t_ship += time.perf_counter() - _t
         # A half still parked here means its sibling never came through the export
         # stream, so the receiver would have been handed an unpairable member and
         # died inside sglang's loader with a far less informative message.
@@ -1181,4 +1203,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "checkpoint_engine/changed_elems": float(changed_elems),
             "checkpoint_engine/payload_mbytes": wire_bytes / (1 << 20),
             "checkpoint_engine/flushes": float(n_flushes),
+            # export = backend quantize + diff, O(total params), payload-blind.
+            # ship  = gather + sort + encode + bucket + broadcast, scales with the delta.
+            "checkpoint_engine/export_s": t_export,
+            "checkpoint_engine/ship_s": t_ship,
         }
