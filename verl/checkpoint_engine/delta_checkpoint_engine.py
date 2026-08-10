@@ -45,6 +45,7 @@ protocol continuity with the receiver's delta_loader.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -103,6 +104,50 @@ class _ValuesPiece:
     shape: list
     flat: torch.Tensor
 
+
+
+class _Phase:
+    """Wall-clock and count accumulator for one weight sync's send path.
+
+    update_weights was a single number, and three separate explanations for it
+    (fp8 amplification, per-parameter device reads, the backend's O(N) scan) were
+    each refuted or corrected by measurement. Splitting it one layer per cluster
+    run costs 70 minutes a layer, so this instruments every step of the path at
+    once: whichever line owns the time, this run names it.
+
+    ``sync=True`` brackets a span with device synchronisation, which is required
+    for anything that only ENQUEUES GPU work (the broadcasts, the staging copies)
+    -- otherwise the cost lands on whichever unrelated call happens to block
+    next. It does remove some overlap, so the instrumented total runs slightly
+    high; attribution is the point here, not the headline number.
+    """
+
+    __slots__ = ("t", "n")
+
+    def __init__(self):
+        self.t: dict[str, float] = {}
+        self.n: dict[str, int] = {}
+
+    @contextlib.contextmanager
+    def span(self, key: str, sync: bool = False):
+        cuda = sync and torch.cuda.is_available()
+        if cuda:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if cuda:
+                torch.cuda.synchronize()
+            self.t[key] = self.t.get(key, 0.0) + (time.perf_counter() - t0)
+
+    def bump(self, key: str, k: int = 1) -> None:
+        self.n[key] = self.n.get(key, 0) + k
+
+    def metrics(self) -> dict[str, float]:
+        out = {f"checkpoint_engine/t_{k}_s": v for k, v in sorted(self.t.items())}
+        out.update({f"checkpoint_engine/n_{k}": float(v) for k, v in sorted(self.n.items())})
+        return out
 
 
 def _gap_encode(idx: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -432,6 +477,7 @@ class _GatherQueue:
         )
         if self.timers is not None:
             self.timers["gather"] += time.perf_counter() - _t
+            self.timers["rounds"] = self.timers.get("rounds", 0) + 1
         if self.is_r0 and gathered is not None:
             slot_i = 0
             for slots, dtype_str, _counts, _i, _v in batch:
@@ -508,19 +554,29 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 "checksum": int(flush.checksum),
             },
         }
-        self.socket.send_string(self.topic, flags=zmq.SNDMORE)
-        self.socket.send_pyobj(meta)
+        ph = getattr(self, "_phase", None) or _Phase()
+        # The manifest pickles one dict per param in the flush -- thousands of
+        # them -- so this is not obviously free either.
+        with ph.span("pub_zmq"):
+            self.socket.send_string(self.topic, flags=zmq.SNDMORE)
+            self.socket.send_pyobj(meta)
         pos_u8 = flush.positions_cpu.to("cuda", non_blocking=True).contiguous().view(torch.uint8)
         val_u8 = flush.values_gpu.contiguous().view(torch.uint8)
         # Stage into cupy-owned buffers: ray's NCCL broadcast is enqueued on a separate
         # stream with no recordStream on its inputs, so broadcasting a zero-copy view of
         # these torch tensors (freed right after this call) would race with allocator reuse.
-        pos_cp = cp.empty(pos_u8.numel(), dtype=cp.uint8)
-        val_cp = cp.empty(val_u8.numel(), dtype=cp.uint8)
-        pos_cp[:] = cp.asarray(pos_u8)
-        val_cp[:] = cp.asarray(val_u8)
-        collective.broadcast(pos_cp, src_rank=0, group_name=self.group_name)
-        collective.broadcast(val_cp, src_rank=0, group_name=self.group_name)
+        with ph.span("pub_stage", sync=True):
+            pos_cp = cp.empty(pos_u8.numel(), dtype=cp.uint8)
+            val_cp = cp.empty(val_u8.numel(), dtype=cp.uint8)
+            pos_cp[:] = cp.asarray(pos_u8)
+            val_cp[:] = cp.asarray(val_u8)
+        # Two broadcasts per flush. sync=True is required: these only enqueue, so
+        # without it the cost lands on an unrelated later call.
+        with ph.span("pub_bcast", sync=True):
+            collective.broadcast(pos_cp, src_rank=0, group_name=self.group_name)
+            collective.broadcast(val_cp, src_rank=0, group_name=self.group_name)
+        ph.bump("pub_bcast_calls", 2)
+        ph.bump("pub_flushes")
 
     def _publish_values_flush(
         self,
@@ -815,13 +871,19 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             pos_off += nnz * width
             val_off += n_val
 
-        values_gpu = torch.cat(val_pieces) if val_pieces else torch.empty(0, dtype=self.rollout_dtype, device="cuda")
-        positions_u8 = (
-            torch.cat(idx_pieces).contiguous()  # already uint8 bytes, per-piece
-            if idx_pieces
-            else torch.empty(0, dtype=torch.uint8, device=values_gpu.device)
-        )
-        cks = _checksum(positions_u8, values_gpu)
+        ph = getattr(self, "_phase", None) or _Phase()
+        with ph.span("asm_cat", sync=True):
+            values_gpu = torch.cat(val_pieces) if val_pieces else torch.empty(0, dtype=self.rollout_dtype, device="cuda")
+            positions_u8 = (
+                torch.cat(idx_pieces).contiguous()  # already uint8 bytes, per-piece
+                if idx_pieces
+                else torch.empty(0, dtype=torch.uint8, device=values_gpu.device)
+            )
+        # A reduction over the whole flush (~500 MB), once per flush. Cheap per
+        # byte, but it is on the critical path and nothing had measured it.
+        with ph.span("asm_checksum", sync=True):
+            cks = _checksum(positions_u8, values_gpu)
+        ph.bump("asm_params", len(params))
         return DeltaFlush(
             encoding=self.encoding, params=params, positions_cpu=positions_u8, values_gpu=values_gpu, checksum=cks
         )
@@ -1010,6 +1072,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # ship_s. publish is nested inside consume (bkt.add triggers it), so the
         # encode share is consume minus publish.
         ship_t = {"gather": 0.0, "consume": 0.0, "publish": 0.0}
+        ph = self._phase = _Phase()
         stager = _FusionStager()
         nonlocal_missed: list[str] = []
         nonlocal_dupes = [0, 0]  # [total dropped, warnings emitted]
@@ -1059,14 +1122,17 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # needs normalising, and the max position for the range assert
                 # below. Asking those as separate .item()/bool() calls is separate
                 # stream stalls, per parameter, and rank 0 walks every parameter.
-                disordered, hi = torch.stack([(aidx[1:] <= aidx[:-1]).any().long(), aidx.max()]).tolist()
+                with ph.span("p_stats"):
+                    disordered, hi = torch.stack([(aidx[1:] <= aidx[:-1]).any().long(), aidx.max()]).tolist()
                 if disordered:
-                    order = torch.argsort(aidx, stable=True)
-                    aidx, aval = aidx[order], aval[order]
-                    keep = torch.ones_like(aidx, dtype=torch.bool)
-                    keep[:-1] = aidx[1:] != aidx[:-1]  # last of each run
-                    n_before = aidx.numel()
-                    aidx, aval = aidx[keep], aval[keep]  # no-op when nothing repeats
+                    ph.bump("p_sorted")
+                    with ph.span("p_sort", sync=True):
+                        order = torch.argsort(aidx, stable=True)
+                        aidx, aval = aidx[order], aval[order]
+                        keep = torch.ones_like(aidx, dtype=torch.bool)
+                        keep[:-1] = aidx[1:] != aidx[:-1]  # last of each run
+                        n_before = aidx.numel()
+                        aidx, aval = aidx[keep], aval[keep]  # no-op when nothing repeats
                     dropped = n_before - aidx.numel()  # numel is host-side: free
                     if dropped:
                         nonlocal_dupes[0] += dropped
@@ -1090,7 +1156,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # else falls through unchanged. Note the accounting below runs on the
             # RELEASED entries, so an empty half contributes 0 changed elements
             # and 0 wire bytes -- it costs one entry, not one tensor.
-            offered = stager.offer(name, dtype_str, full_shape, aidx, aval)
+            ph.bump("p_params")
+            with ph.span("p_stage"):
+                offered = stager.offer(name, dtype_str, full_shape, aidx, aval)
             if offered is None:
                 ship_t["consume"] += time.perf_counter() - _t_consume
                 return
@@ -1116,14 +1184,17 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # switch to 1-byte gaps -- 96.2 GiB where the wire carried 38.5,
                 # which is exactly the figure this work is judged on. The flush
                 # count is the cross-check: 78 flushes only makes sense at ~2 B.
-                pieces = _slice_pieces(e_name, e_dtype, e_shape, e_idx, e_val)
+                with ph.span("p_slice_encode", sync=True):
+                    pieces = _slice_pieces(e_name, e_dtype, e_shape, e_idx, e_val)
+                ph.bump("p_pieces", len(pieces))
                 wire_bytes += sum(nb for _, nb in pieces)
                 sized.extend(pieces)
-            if is_group:
-                bkt.add_atomic(sized)
-            else:
-                for piece, nbytes in sized:
-                    bkt.add(piece, nbytes)
+            with ph.span("p_bucket"):
+                if is_group:
+                    bkt.add_atomic(sized)
+                else:
+                    for piece, nbytes in sized:
+                        bkt.add(piece, nbytes)
             ship_t["consume"] += time.perf_counter() - _t_consume
 
         gq = _GatherQueue(batch_k, self.bucket_size, is_r0, _bucket_slot_delta, timers=ship_t)
@@ -1227,4 +1298,6 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "checkpoint_engine/gather_s": ship_t["gather"],
             "checkpoint_engine/encode_s": ship_t["consume"] - ship_t["publish"],
             "checkpoint_engine/publish_s": ship_t["publish"],
+            "checkpoint_engine/n_gather_rounds": float(ship_t.get("rounds", 0)),
+            **ph.metrics(),
         }
