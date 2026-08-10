@@ -144,3 +144,38 @@ def test_the_wrap_this_prevents_would_have_been_invisible():
     assert (wrapped.to(torch.int64) >= 0).all()  # receiver's negative check passes
     decoded = _decode(wrapped)
     assert int(decoded.max()) > int(idx.max())  # ...yet positions overshoot
+
+
+def _sort_dedupe(idx, val):
+    """Mirror of the sender's normalisation in _bucket_slot_delta."""
+    order = torch.argsort(idx, stable=True)
+    idx, val = idx[order], val[order]
+    keep = torch.ones_like(idx, dtype=torch.bool)
+    keep[:-1] = idx[1:] != idx[:-1]
+    return idx[keep], val[keep]
+
+
+def test_duplicate_positions_are_dropped_keeping_the_last():
+    """Ranks report the same position twice for a replicated param. Absolute
+    positions tolerated it -- index_copy_ let the last writer win -- but a
+    repeat is a gap of -1, so gaps cannot. Keeping the LAST of each run
+    reproduces the old behaviour instead of inventing a new one."""
+    idx = torch.tensor([5, 1, 5, 1, 9], dtype=torch.int64)
+    val = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int64)  # later = wins
+    sidx, sval = _sort_dedupe(idx, val)
+    assert sidx.tolist() == [1, 5, 9]
+    assert sval.tolist() == [40, 30, 50], "must keep the last occurrence, not the first"
+    gaps, _ = _gap_encode(sidx)  # and the result must now encode
+    assert torch.equal(_decode(gaps), sidx)
+
+
+def test_normalised_seam_input_encodes():
+    """End to end on the shape the gather actually produces: per-rank ascending
+    blocks concatenated, with repeats across blocks."""
+    idx = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=torch.int64)
+    val = torch.arange(9, dtype=torch.int64)
+    sidx, sval = _sort_dedupe(idx, val)
+    assert sidx.tolist() == [0, 1, 2]
+    assert sval.tolist() == [6, 7, 8]  # last rank's contribution wins
+    gaps, width = _gap_encode(sidx)
+    assert torch.equal(_decode(gaps), sidx) and width == 1

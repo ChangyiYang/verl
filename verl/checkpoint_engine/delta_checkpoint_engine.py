@@ -321,9 +321,17 @@ def _slice_pieces(name: str, dtype_str: str, shape, aidx: torch.Tensor, aval: to
     An empty delta yields ONE empty piece rather than none: a zero-length range()
     would emit nothing, but fusion-group members with no changed elements must
     still reach the receiver so it can densify them to all-NaN (see _FusionStager).
+
+    Bucket bytes must track the width the positions will ACTUALLY be encoded at.
+    Charging the old flat 4 bytes while gaps cost 1 makes every bucket seal at
+    roughly 40% of its size, so the same payload is split into ~2.5x the flushes
+    -- pure per-flush overhead, and it lands directly on the number this encoding
+    exists to improve. One max() per parameter buys the right figure; per-piece
+    widths can only be narrower, so this is a safe upper bound.
     """
     if aidx.numel() == 0:
         return [(_FlushPiece(name, dtype_str, list(shape), aidx, aval), 0)]
+    pos_bytes = _gap_encode(aidx)[1]
     max_elems = DeltaShardedCheckpointEngine.MAX_ENTRY_ELEMS
     out = []
     for s in range(0, aidx.numel(), max_elems):
@@ -331,7 +339,7 @@ def _slice_pieces(name: str, dtype_str: str, shape, aidx: torch.Tensor, aval: to
         out.append(
             (
                 _FlushPiece(name, dtype_str, list(shape), aidx[s:e], aval[s:e]),
-                (e - s) * (4 + aval.element_size()),
+                (e - s) * (pos_bytes + aval.element_size()),
             )
         )
     return out
@@ -978,6 +986,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         bkt = _FlushBucket(self.bucket_size, self._assemble_flush, _publish_steady)
         stager = _FusionStager()
         nonlocal_missed: list[str] = []
+        nonlocal_dupes = [0, 0]  # [total dropped, warnings emitted]
 
         batch_k = self.batch_gather
 
@@ -1007,9 +1016,31 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # concatenation is not. That was harmless while positions were
                 # absolute -- each one stood alone -- and is not harmless now.
                 # Sort here, the last point where idx and val are still paired.
-                if bool((aidx[1:] < aidx[:-1]).any()):
-                    order = torch.argsort(aidx)
+                #
+                # Duplicates have to go too, and for the same reason: gaps need
+                # STRICTLY increasing positions, and a repeated position is a gap
+                # of -1. Ranks really do report the same position twice (a
+                # replicated param is held whole by every rank in the gather
+                # group), which absolute positions tolerated because index_copy_
+                # simply let the last writer win. The stable sort preserves gather
+                # order among equal indices, so keeping the LAST occurrence
+                # reproduces exactly that behaviour rather than inventing a new one.
+                if bool((aidx[1:] <= aidx[:-1]).any()):
+                    order = torch.argsort(aidx, stable=True)
                     aidx, aval = aidx[order], aval[order]
+                    keep = torch.ones_like(aidx, dtype=torch.bool)
+                    keep[:-1] = aidx[1:] != aidx[:-1]  # last of each run
+                    if not bool(keep.all()):
+                        nonlocal_dupes[0] += int(aidx.numel() - int(keep.sum()))
+                        if nonlocal_dupes[1] < 4:
+                            nonlocal_dupes[1] += 1
+                            logger.warning(
+                                "delta: %r had %d duplicate positions across the gather group "
+                                "(keeping the last, as index_copy_ did)",
+                                name,
+                                int(aidx.numel() - int(keep.sum())),
+                            )
+                        aidx, aval = aidx[keep], aval[keep]
             if aidx is not None and aidx.numel():
                 hi = int(aidx.max())
                 assert hi < int(full_numel), (
