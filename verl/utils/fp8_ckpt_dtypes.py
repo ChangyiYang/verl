@@ -36,6 +36,7 @@ describes the destination and a real receiver-side handshake would be needed.
 back rather than silently quantizing nothing.
 """
 
+import functools
 import glob
 import json
 import logging
@@ -47,6 +48,16 @@ logger = logging.getLogger(__name__)
 _FP8_DTYPES = {"F8_E4M3", "F8_E5M2"}
 
 
+# Both entry points are memoised per model path. They walk EVERY shard of the
+# checkpoint and read its safetensors header -- 46 shards for DSv4-FP8 -- and
+# nothing upstream cached the result: _quant_predicate rebuilt the predicate on
+# every _fp8_spec call, which happens on the seed, on EVERY steady sync, and in
+# the verify path, on every trainer rank. That is 80 ranks x 46 shards = 3680
+# NFS opens per sync, landing on the same nodes that host the SGLang servers.
+# The route-B run took 451 ActorDiedErrors and stalled with 16 requests never
+# finishing; the name-allowlist route reads no files at all and took zero.
+
+@functools.lru_cache(maxsize=4)
 def read_checkpoint_dtypes(model_path: str) -> dict[str, str]:
     """``{tensor_name: safetensors_dtype_string}`` from the shard headers alone."""
     out: dict[str, str] = {}
@@ -65,6 +76,7 @@ def read_checkpoint_dtypes(model_path: str) -> dict[str, str]:
     return out
 
 
+@functools.lru_cache(maxsize=4)
 def build_ckpt_fp8_predicate(model_path: str):
     """A ``name -> bool`` predicate, or None if the checkpoint cannot answer.
 
