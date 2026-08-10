@@ -113,6 +113,7 @@ def _spec_tensor(spec: dict) -> torch.Tensor:
 
 def _sparse_flush(old: dict, new: dict):
     """Encode changed elements exactly like the sender's indices wire."""
+    from verl.checkpoint_engine.delta_checkpoint_engine import _gap_encode
     from verl.checkpoint_engine.delta_sync import DeltaParam, checksum
     from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
 
@@ -123,23 +124,31 @@ def _sparse_flush(old: dict, new: dict):
         nnz = int(lidx.numel())
         if nnz == 0:
             continue
+        # Positions are gap-encoded at a per-parameter width; go through the real
+        # sender helper so this exercises production rather than a stale copy of
+        # the format (absolute int32 would decode as gaps, silently, to garbage).
+        gaps, width = _gap_encode(lidx)
+        pad = (-pos_off) % width  # pos_start must be viewable at this width
+        if pad:
+            idx_pieces.append(torch.zeros(pad, dtype=torch.uint8, device=gaps.device))
+            pos_off += pad
         params.append(
             DeltaParam(
                 name=name,
                 dtype="bfloat16",
                 shape=list(t_new.shape),
                 pos_start=pos_off,
-                pos_end=pos_off + nnz * 4,
-                pos_width=4,
+                pos_end=pos_off + nnz * width,
+                pos_width=width,
                 val_start=val_off,
                 val_end=val_off + nnz,
             )
         )
-        idx_pieces.append(lidx.to(torch.int32))
+        idx_pieces.append(gaps.contiguous().view(torch.uint8))
         val_pieces.append(lval)
-        pos_off += nnz * 4
+        pos_off += nnz * width
         val_off += nnz
-    positions = torch.cat(idx_pieces).contiguous().view(torch.uint8)
+    positions = torch.cat(idx_pieces).contiguous()
     values = torch.cat(val_pieces)
     spec = {
         "encoding": "indices",
