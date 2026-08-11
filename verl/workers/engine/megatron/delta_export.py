@@ -458,7 +458,6 @@ def quant_shard_stream(engine, quant_spec):
     """
     import torch.distributed as dist
 
-    from megatron.core import parallel_state as mpu
     from verl.utils.fp8_sharded import _ABSMAX_EPS, local_blockwise_absmax, quantize_shard_with_descale
     from verl.utils.kernel.fp8_kernel import FP8_DTYPE, FP8_MAX, ceil_div
 
