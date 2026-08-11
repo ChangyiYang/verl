@@ -1,0 +1,102 @@
+"""The verify sweep must compare the state the server actually serves with.
+
+The first successful full sweep reported 4.34M mismatched elements: 8,481
+tensors each fully wrong, every one of them an fp8 scale. The cause was the
+reference frame, not the delta. ``post_load_weights`` recomputes derived tensors
+("fp8 scales after requant", MLA w_kc/w_vc, MoE biases), the normal apply path
+calls it and the verify path returned before it -- so the sweep was comparing the
+trainer's TRANSPORTED scale against the server's RECOMPUTED one, and
+weight_scale_inv/scale being reciprocals makes that differ almost by definition.
+
+These tests pin the fix and, more importantly, pin that the check can still FAIL.
+Making the mismatch disappear by excluding derived tensors would have been the
+easy fix and the wrong one.
+"""
+
+import pytest
+import torch
+
+from verl.workers.rollout.sglang_rollout.delta_loader import _VERIFY_STATS, _model_state_hashes
+
+
+class FakeModel(torch.nn.Module):
+    """Model whose post_load_weights recomputes a derived tensor, like sglang's."""
+
+    def __init__(self, recompute=True, drift=False):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.arange(16, dtype=torch.float32), requires_grad=False)
+        self.register_buffer("w_scale_inv", torch.zeros(4))
+        self.recompute = recompute
+        self.drift = drift
+        self._calls = 0
+
+    def post_load_weights(self):
+        self._calls += 1
+        if not self.recompute:
+            return
+        # derived from the current weights -- deterministic unless drift is set
+        base = self.w.detach().reshape(4, 4).abs().amax(dim=1)
+        self.w_scale_inv.copy_(base + (self._calls if self.drift else 0))
+
+
+@pytest.fixture(autouse=True)
+def _clean_stats():
+    _VERIFY_STATS.pop("baseline", None)
+    _VERIFY_STATS["params"] = 0
+    yield
+    _VERIFY_STATS.pop("baseline", None)
+    _VERIFY_STATS["params"] = 0
+
+
+def test_hashes_cover_parameters_and_buffers():
+    """A check that skipped buffers would miss the scales entirely."""
+    m = FakeModel()
+    h = _model_state_hashes(m)
+    assert "w" in h and "w_scale_inv" in h
+
+
+def test_hashes_change_when_a_tensor_changes():
+    """If the hash cannot notice a change, the whole sweep is decorative."""
+    m = FakeModel()
+    before = _model_state_hashes(m)
+    with torch.no_grad():
+        m.w[3] += 1.0
+    after = _model_state_hashes(m)
+    assert before["w"] != after["w"]
+
+
+def test_hashes_are_stable_for_an_unchanged_tensor():
+    m = FakeModel()
+    assert _model_state_hashes(m)["w"] == _model_state_hashes(m)["w"]
+
+
+def test_deterministic_recompute_is_not_flagged():
+    """The actual fix: post_load_weights on BOTH sides, so a derived tensor that
+    recomputes to the same value is identical, not a mismatch."""
+    m = FakeModel(recompute=True)
+    m.post_load_weights()
+    before = _model_state_hashes(m)
+    m.post_load_weights()  # replay: same weights -> same derived value
+    after = _model_state_hashes(m)
+    assert before == after, "a deterministic recompute must not read as a mismatch"
+
+
+def test_a_drifting_derived_tensor_is_still_caught():
+    """Guard against 'fixing' this by ignoring derived tensors: if the recompute
+    is NOT idempotent, the sweep must still notice."""
+    m = FakeModel(recompute=True, drift=True)
+    m.post_load_weights()
+    before = _model_state_hashes(m)
+    m.post_load_weights()
+    after = _model_state_hashes(m)
+    changed = [k for k in before if before[k] != after[k]]
+    assert "w_scale_inv" in changed, "a non-idempotent derived tensor must still be caught"
+
+
+def test_a_real_weight_change_is_caught():
+    m = FakeModel()
+    before = _model_state_hashes(m)
+    with torch.no_grad():
+        m.w[0] = 999.0
+    after = _model_state_hashes(m)
+    assert [k for k in before if before[k] != after[k]] == ["w"]

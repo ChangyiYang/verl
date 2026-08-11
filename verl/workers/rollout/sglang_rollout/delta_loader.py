@@ -343,38 +343,106 @@ def _quiet_uninit_warning():
             )
 
 
+def _model_state_hashes(model) -> dict:
+    """One hash per parameter/buffer, with a SINGLE device sync for all of them.
+
+    torch.hash_tensor is the same XOR-reduce the wire checksum uses. Hashes
+    rather than clones because the alternative is a full copy of the server's
+    shard (GBs) held across the whole sweep, and an OOM here costs a 45-minute
+    run. The tradeoff is that we learn WHICH tensor changed but not how many of
+    its elements did -- the tensor identity is the actionable half.
+
+    The .item() calls are batched into one stack().tolist(): per-tensor .item()
+    would be ~100k device syncs, which is the same mistake that made the verify
+    sweep unrunnable in the first place.
+    """
+    import itertools
+
+    names, hs = [], []
+    for name, t in itertools.chain(model.named_parameters(), model.named_buffers()):
+        if t is None or not t.numel():
+            continue
+        names.append(name)
+        hs.append(torch.hash_tensor(t.detach()).reshape(()))
+    if not hs:
+        return {}
+    vals = torch.stack(hs).tolist()
+    return dict(zip(names, vals, strict=True))
+
+
+def _post_load(model) -> None:
+    if hasattr(model, "post_load_weights"):
+        model.post_load_weights()
+
+
 def _verify_dense(
     model: torch.nn.Module, params: list[dict], values: torch.Tensor, is_last: bool, values_bytes: bool = False
 ) -> None:
     """State-equivalence sweep, phrased as an IDEMPOTENCE check: replaying the
-    trainer's FULL current weights onto an in-sync server must be a no-op. For
-    each parameter we snapshot every ``copy_`` destination (the exact internal
-    slices sglang's own ``load_weights`` name-mapping resolves) BEFORE the
-    load, run the real load path -- including multi-stage loaders that first
-    write raw values and then transform in place (e.g. mamba's
-    ``A = -exp(A_log)`` composed loader) -- and bit-compare the post-load state
-    against the snapshot. Any changed element means the server's
-    delta-accumulated state disagreed with the trainer's; that fails loud.
-    Comparing per copy_ call instead would false-positive on every
-    transform-loaded param (raw-vs-transformed at each stage)."""
-    orig_copy = torch.Tensor.copy_
-    by_param = _VERIFY_STATS.setdefault("by_param", {})
-    # Verify one ATOMIC UNIT at a time, not one param at a time. Feeding a single
-    # param to _apply_dense hands SGLang's DSv4 loader half of a fused destination
-    # (wqkv_a / wkv_gate), which it buffers and then asserts on at the end of
-    # load_weights. That is the fifth place in verl that can split a fusion group,
-    # and the only one that is structural rather than byte-driven -- it fires on
-    # the FIRST steady sync of every run (_verify_due always returns True there),
-    # which is why nothing hit it until a run finally got that far.
-    # Snapshot/compare semantics are unchanged: the hook records every copy_
-    # destination touched during the call, so a 2-param unit simply verifies both.
+    trainer's FULL current weights onto an in-sync server must be a no-op.
+
+    The comparison is taken on the state the server actually SERVES with, which
+    means after ``post_load_weights``. The previous version compared before it,
+    and that was the bug: post_load_weights recomputes derived tensors ("fp8
+    scales after requant", MLA w_kc/w_vc, MoE biases), so the sweep was checking
+    the trainer's TRANSPORTED scale against the server's RECOMPUTED one. With
+    weight_scale_inv and scale being reciprocals a bit-level difference is
+    near-certain, and the first successful sweep duly reported 4.34M mismatched
+    elements -- 8,481 tensors each fully wrong, every one of them a scale.
+
+    Both sides of the comparison now run post_load_weights, so the check is
+    symmetric. Note this makes it STRICTER, not looser: excluding the derived
+    tensors would have made the failure disappear without learning anything, and
+    that is the one fix this must not be.
+    """
+    st = _VERIFY_STATS
+    if "baseline" not in st:
+        # Finish the steady sync's semantics before snapshotting, or the baseline
+        # would be a state the server never actually serves from.
+        _post_load(model)
+        st["baseline"] = _model_state_hashes(model)
+
     _quiet = _quiet_uninit_warning()
     _quiet.__enter__()
     try:
-        _verify_units(model, params, values, values_bytes, orig_copy, by_param)
+        for unit in _verify_batches(params):
+            _apply_dense(model, unit, values, values_bytes)
     finally:
         _quiet.__exit__(None, None, None)
-    _verify_finish(is_last)
+
+    st["params"] += len(params)
+    if not is_last:
+        return
+
+    _post_load(model)
+    after = _model_state_hashes(model)
+    base = st.pop("baseline", {})
+    n = st["params"]
+    st["params"] = 0
+
+    changed = [k for k in base if k in after and base[k] != after[k]]
+    missing = sorted(set(base) - set(after))
+    logger.warning(
+        "DELTA-VERIFY sweep: params=%d tensors=%d changed=%d missing=%d first=%s",
+        n,
+        len(base),
+        len(changed),
+        len(missing),
+        sorted(changed)[:12],
+    )
+    if changed or missing:
+        by_suffix: dict = {}
+        for k in changed:
+            by_suffix[k.rsplit(".", 1)[-1]] = by_suffix.get(k.rsplit(".", 1)[-1], 0) + 1
+        logger.warning(
+            "DELTA-VERIFY distribution: by_suffix=%s",
+            sorted(by_suffix.items(), key=lambda kv: -kv[1])[:15],
+        )
+        raise RuntimeError(
+            f"delta state verification FAILED: {len(changed)} tensors differ between the "
+            f"server's delta-accumulated state and the trainer's full export "
+            f"(both compared after post_load_weights); first: {sorted(changed)[:12]}"
+        )
 
 
 def _verify_batches(params):
@@ -402,85 +470,6 @@ def _verify_batches(params):
     if os.environ.get("VERL_DELTA_VERIFY_BATCH") == "1":
         return [list(params)]
     return _atomic_units(params)
-
-
-def _verify_units(model, params, values, values_bytes, orig_copy, by_param):
-    """The per-unit snapshot/compare loop (extracted so the log filter wraps it)."""
-    for unit in _verify_batches(params):
-        touched: dict = {}
-
-        def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, _touched=touched, **kwargs) -> torch.Tensor:
-            key = (self.data_ptr(), self.numel(), self.dtype)
-            if key not in _touched:
-                _touched[key] = (self, self.detach().clone())
-            return orig_copy(self, src, *args, **kwargs)
-
-        torch.Tensor.copy_ = snap_then_copy_
-        try:
-            _apply_dense(model, unit, values, values_bytes)
-        finally:
-            torch.Tensor.copy_ = orig_copy
-        bad = 0
-        for dst, pre in touched.values():
-            if dst.is_floating_point() and dst.element_size() == 2:
-                bad += int((dst.view(torch.int16) != pre.view(torch.int16)).sum())
-            elif dst.element_size() == 1:
-                # fp8 codes: bit compare via uint8 (eq on float8 is not portable)
-                bad += int((dst.view(torch.uint8) != pre.view(torch.uint8)).sum())
-            else:
-                bad += int((dst != pre).sum())
-        if bad:
-            # attribute to the whole unit; a fused pair is verified as one write
-            label = unit[0]["name"] if len(unit) == 1 else "+".join(q["name"] for q in unit)
-            by_param[label] = by_param.get(label, 0) + bad
-        _VERIFY_STATS["pieces"].append(bad)
-    _VERIFY_STATS["params"] += len(params)
-
-
-def _verify_finish(is_last: bool) -> None:
-    """Report and fail loud once the sweep's final flush has been verified."""
-    if is_last:
-        total = sum(_VERIFY_STATS["pieces"])
-        n = _VERIFY_STATS["params"]
-        _VERIFY_STATS["params"] = 0
-        _VERIFY_STATS["pieces"] = []
-        offenders = _VERIFY_STATS.pop("by_param", {})
-        top = sorted(offenders.items(), key=lambda kv: -kv[1])[:12]
-        logger.warning("DELTA-VERIFY sweep: params=%d mismatch_elems=%d offenders=%s", n, total, top)
-        if offenders:
-            # top-12 alone cannot tell a whole-class failure from a few bad
-            # tensors. The first sweep reported 4.34M mismatched elements whose
-            # top 12 were all exactly 512 -- meaning thousands of params each
-            # fully wrong, not a handful badly wrong. That shape is only visible
-            # in the distribution, so print it: how many params, what the counts
-            # look like, and which name suffixes they cluster under. The suffix
-            # histogram is the part that separates "the scale tensors are
-            # desynced" from "the codes are wrong too", which are very different
-            # bugs.
-            counts = sorted(offenders.values())
-            by_suffix: dict = {}
-            for name, c in offenders.items():
-                sfx = name.rsplit(".", 1)[-1]
-                agg = by_suffix.setdefault(sfx, [0, 0])
-                agg[0] += 1
-                agg[1] += c
-            logger.warning(
-                "DELTA-VERIFY distribution: offending_params=%d/%d min=%d median=%d max=%d "
-                "distinct_counts=%s by_suffix=%s",
-                len(offenders),
-                n,
-                counts[0],
-                counts[len(counts) // 2],
-                counts[-1],
-                sorted(set(counts))[:10],
-                sorted(((k, v[0], v[1]) for k, v in by_suffix.items()), key=lambda t: -t[2])[:15],
-            )
-        if total:
-            raise RuntimeError(
-                f"delta state verification FAILED: {total} elements differ between the "
-                f"server's delta-accumulated weights and the trainer's full export; "
-                f"top offenders: {top}"
-            )
 
 
 def _decode_one(
