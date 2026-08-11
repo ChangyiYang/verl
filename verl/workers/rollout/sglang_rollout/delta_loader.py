@@ -380,8 +380,13 @@ def _decode_one(
         if view_dtype is None:
             raise ValueError(f"unsupported pos_width={width} for {p['name']!r}")
         gaps = pos_b.view(view_dtype).to(torch.int64)
-        # inverse of the gap encoding
-        idx = torch.cumsum(gaps + 1, dim=0) - 1
+        # inverse of the gap encoding: gap is idx - prev with idx[-1] := -1, so a
+        # repeated position rides as gap 0. Duplicates are legal on purpose --
+        # deduplicating them on the sender needed a boolean mask per parameter,
+        # and that mask's data-dependent size forced a device->host sync inside
+        # the send loop. index_copy_ below applies them last-writer-wins, which
+        # is exactly what the absolute-position wire did.
+        idx = torch.cumsum(gaps, dim=0) - 1
         # Guard the decode, because the way this fails otherwise is a process
         # kill, not an exception: positions feed a scatter, so one negative or
         # oversized index is an out-of-bounds device write that takes the SGLang

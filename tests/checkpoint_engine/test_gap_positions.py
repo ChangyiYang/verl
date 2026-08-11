@@ -31,7 +31,7 @@ from verl.checkpoint_engine.delta_checkpoint_engine import _gap_encode
 
 def _decode(gaps: torch.Tensor) -> torch.Tensor:
     """Receiver's inverse, mirroring delta_loader._decode_one."""
-    return torch.cumsum(gaps.to(torch.int64) + 1, dim=0) - 1
+    return torch.cumsum(gaps.to(torch.int64), dim=0) - 1
 
 
 @pytest.mark.parametrize(
@@ -67,8 +67,11 @@ def test_every_tier_boundary_round_trips(gap):
     stops at 0x7FFF, not 0xFFFF; gaps in [0x8000, 0xFFFF] used to wrap negative,
     decode to negative positions, and scatter out of bounds on the GPU (a device
     fault that kills the process instead of raising). Boundaries, not samples."""
-    idx = torch.tensor([0, gap + 1], dtype=torch.int64)
+    # gap = idx - prev now (prev of the first entry is -1), so a step of `gap`
+    # is produced by idx = [0, gap], not [0, gap + 1].
+    idx = torch.tensor([0, gap], dtype=torch.int64)
     gaps, width = _gap_encode(idx)
+    assert int(gaps.max()) == gap, f"meant to exercise a gap of {gap}, got {int(gaps.max())}"
     assert torch.equal(_decode(gaps), idx), f"gap {gap} at width {width} did not round-trip"
 
 
@@ -77,7 +80,7 @@ def test_no_tier_can_emit_a_negative_gap():
     Positions are non-negative and strictly increasing, so gaps are >= 0 --
     a negative anywhere means the carrier wrapped."""
     for gap in (0xFF, 0x7FFF, 0x8000, 0xFFFF, 0x10000, 1 << 20):
-        gaps, width = _gap_encode(torch.tensor([0, gap + 1], dtype=torch.int64))
+        gaps, width = _gap_encode(torch.tensor([0, gap], dtype=torch.int64))
         assert (gaps.to(torch.int64) >= 0).all(), f"gap {gap} wrapped negative at width {width}"
 
 
@@ -129,7 +132,7 @@ def test_unsorted_input_is_rejected_not_wrapped():
     sender's range check passes (raw positions are in range), the receiver sees
     only non-negative gaps, and the positions just silently land out of bounds."""
     seam = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=torch.int64)
-    with pytest.raises(AssertionError, match="strictly increasing"):
+    with pytest.raises(AssertionError, match="non-decreasing"):
         _gap_encode(seam)
 
 
@@ -155,18 +158,16 @@ def _sort_dedupe(idx, val):
     return idx[keep], val[keep]
 
 
-def test_duplicate_positions_are_dropped_keeping_the_last():
-    """Ranks report the same position twice for a replicated param. Absolute
-    positions tolerated it -- index_copy_ let the last writer win -- but a
-    repeat is a gap of -1, so gaps cannot. Keeping the LAST of each run
-    reproduces the old behaviour instead of inventing a new one."""
-    idx = torch.tensor([5, 1, 5, 1, 9], dtype=torch.int64)
-    val = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int64)  # later = wins
-    sidx, sval = _sort_dedupe(idx, val)
-    assert sidx.tolist() == [1, 5, 9]
-    assert sval.tolist() == [40, 30, 50], "must keep the last occurrence, not the first"
-    gaps, _ = _gap_encode(sidx)  # and the result must now encode
-    assert torch.equal(_decode(gaps), sidx)
+def test_duplicate_positions_encode_as_gap_zero():
+    """Ranks report the same position twice for a replicated param. The encoding
+    now carries that as gap 0 rather than requiring the sender to deduplicate:
+    the dedup was a boolean mask, and its data-dependent output size forced a
+    device->host sync per parameter inside the send loop. index_copy_ applies
+    duplicates last-writer-wins, which is what the absolute wire did anyway."""
+    idx = torch.tensor([1, 1, 5, 5, 9], dtype=torch.int64)  # sorted, with repeats
+    gaps, _ = _gap_encode(idx)
+    assert int(gaps.min()) == 0, "a repeat must be legal, not negative"
+    assert torch.equal(_decode(gaps), idx)
 
 
 def test_normalised_seam_input_encodes():
@@ -174,11 +175,11 @@ def test_normalised_seam_input_encodes():
     blocks concatenated, with repeats across blocks."""
     idx = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=torch.int64)
     val = torch.arange(9, dtype=torch.int64)
-    sidx, sval = _sort_dedupe(idx, val)
-    assert sidx.tolist() == [0, 1, 2]
-    assert sval.tolist() == [6, 7, 8]  # last rank's contribution wins
+    order = torch.argsort(idx, stable=True)
+    sidx, sval = idx[order], val[order]
     gaps, width = _gap_encode(sidx)
     assert torch.equal(_decode(gaps), sidx) and width == 1
+    assert int(gaps.min()) == 0, "repeats across ranks ride as gap 0"
 
 
 def test_gap_encode_reads_the_device_once():

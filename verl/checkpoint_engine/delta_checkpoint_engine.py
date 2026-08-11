@@ -221,7 +221,14 @@ def _gap_encode(idx: torch.Tensor) -> tuple[torch.Tensor, int]:
     if idx.numel() == 0:
         return idx.to(torch.int32), 4
     prev = torch.cat([idx.new_full((1,), -1), idx[:-1]])
-    gaps = idx - prev - 1
+    # gap = idx - prev, NOT idx - prev - 1. The extra -1 packed a little tighter
+    # but made a repeated position encode as -1, so every parameter had to be
+    # deduplicated first -- and dedup is a boolean mask, whose output size is
+    # data-dependent, so it forced a device->host sync PER PARAMETER inside the
+    # send loop. Letting a duplicate ride as gap 0 removes that sync entirely and
+    # restores index_copy_'s old last-writer-wins semantics for free. The cost is
+    # one larger unit of max_gap, which almost never changes the width tier.
+    gaps = idx - prev
     # Gap encoding REQUIRES strictly increasing positions; absolute int32 did not,
     # which is why nothing upstream ever had to guarantee it. Assert rather than
     # trust: a descending step makes a negative gap, and a negative gap in an
@@ -233,7 +240,7 @@ def _gap_encode(idx: torch.Tensor) -> tuple[torch.Tensor, int]:
     # runs per parameter on rank 0.
     min_gap, max_gap = torch.stack([gaps.min(), gaps.max()]).tolist()
     assert min_gap >= 0, (
-        f"gap encoding needs strictly increasing positions, got a step of {min_gap - 1}; "
+        f"gap encoding needs non-decreasing positions, got a step of {min_gap}; "
         "sort (idx, val) together before encoding"
     )
     if max_gap <= 0xFF:  # uint8 is unsigned
@@ -1124,10 +1131,23 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # ship_s. publish is nested inside consume (bkt.add triggers it), so the
         # encode share is consume minus publish.
         ship_t = {"gather": 0.0, "consume": 0.0, "publish": 0.0, "imbalance": {}}
+        pending_hi: list[tuple] = []
+
+        def _drain_hi() -> None:
+            """One device read for a batch of range checks instead of one each."""
+            if not pending_hi:
+                return
+            highs = torch.stack([h for *_, h in pending_hi]).tolist()
+            for (nm, shp, numel, _), hi in zip(pending_hi, highs, strict=True):
+                assert hi < numel, (
+                    f"{nm}: delta position {hi} does not address the declared shape "
+                    f"{shp} ({numel} elements); positions and shape come from different "
+                    f"derivations and have diverged (ratio {hi / max(numel, 1):.2f})"
+                )
+            pending_hi.clear()
         ph = self._phase = _Phase()
         stager = _FusionStager()
         nonlocal_missed: list[str] = []
-        nonlocal_dupes = [0, 0]  # [total dropped, warnings emitted]
 
         batch_k = self.batch_gather
 
@@ -1151,58 +1171,27 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # bounds, which is a device-side fault 11 nodes away that names
             # nothing. Fail here instead, where the offending name and both
             # numbers are in hand. One max() per entry against a multi-GB wire.
-            hi = -1
-            if aidx is not None and aidx.numel() == 1:
-                hi = int(aidx[0])
+            # Sort, unconditionally. The old code first asked "is this block
+            # already ordered?" and skipped the sort if so -- but the measurement
+            # says 28875 of 28875 parameters were unordered, because the gather
+            # concatenates per-rank blocks and every seam steps backwards. The
+            # branch was never taken, and asking cost a device->host read inside
+            # a per-parameter loop: 28875 pipeline stalls to answer a question
+            # whose answer is always yes.
+            #
+            # No dedup either: duplicates now encode as gap 0 (see _gap_encode),
+            # so the boolean mask -- whose data-dependent size was a second
+            # per-parameter sync -- is gone as well.
             if aidx is not None and aidx.numel() > 1:
-                # Establish the ordering the gap encoding needs. Positions arrive
-                # from gather_slot_entries_to_rank0, which concatenates each rank's
-                # block back to back; every block is ascending but their
-                # concatenation is not. That was harmless while positions were
-                # absolute -- each one stood alone -- and is not harmless now.
-                # Sort here, the last point where idx and val are still paired.
-                #
-                # Duplicates have to go too, and for the same reason: gaps need
-                # STRICTLY increasing positions, and a repeated position is a gap
-                # of -1. Ranks really do report the same position twice (a
-                # replicated param is held whole by every rank in the gather
-                # group), which absolute positions tolerated because index_copy_
-                # simply let the last writer win. The stable sort preserves gather
-                # order among equal indices, so keeping the LAST occurrence
-                # reproduces exactly that behaviour rather than inventing a new one.
-                # ONE device->host read decides everything: whether the block
-                # needs normalising, and the max position for the range assert
-                # below. Asking those as separate .item()/bool() calls is separate
-                # stream stalls, per parameter, and rank 0 walks every parameter.
-                with ph.span("p_stats"):
-                    disordered, hi = torch.stack([(aidx[1:] <= aidx[:-1]).any().long(), aidx.max()]).tolist()
-                if disordered:
-                    ph.bump("p_sorted")
-                    with ph.span("p_sort", sync=True):
-                        order = torch.argsort(aidx, stable=True)
-                        aidx, aval = aidx[order], aval[order]
-                        keep = torch.ones_like(aidx, dtype=torch.bool)
-                        keep[:-1] = aidx[1:] != aidx[:-1]  # last of each run
-                        n_before = aidx.numel()
-                        aidx, aval = aidx[keep], aval[keep]  # no-op when nothing repeats
-                    dropped = n_before - aidx.numel()  # numel is host-side: free
-                    if dropped:
-                        nonlocal_dupes[0] += dropped
-                        if nonlocal_dupes[1] < 4:
-                            nonlocal_dupes[1] += 1
-                            logger.warning(
-                                "delta: %r had %d duplicate positions across the gather group "
-                                "(keeping the last, as index_copy_ did)",
-                                name,
-                                dropped,
-                            )
+                order = torch.argsort(aidx, stable=True)
+                aidx, aval = aidx[order], aval[order]
+            # The range check moves off the per-parameter path: collect the max
+            # position as a device scalar and read a whole batch of them at once.
+            # Same guard, 300x fewer stalls.
             if aidx is not None and aidx.numel():
-                assert hi < int(full_numel), (
-                    f"{name}: delta position {hi} does not address the declared shape "
-                    f"{tuple(full_shape)} ({full_numel} elements); positions and shape "
-                    f"come from different derivations and have diverged "
-                    f"(ratio {hi / max(int(full_numel), 1):.2f})"
-                )
+                pending_hi.append((name, tuple(full_shape), int(full_numel), aidx[-1]))
+                if len(pending_hi) >= 256:
+                    _drain_hi()
             # Members of a fused destination param are held back until the group
             # is whole, then emitted as one indivisible run of pieces. Everything
             # else falls through unchanged. Note the accounting below runs on the
@@ -1282,6 +1271,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         _t = time.perf_counter()
         gq.flush_all()
         t_ship += time.perf_counter() - _t
+        _drain_hi()
         # A half still parked here means its sibling never came through the export
         # stream, so the receiver would have been handed an unpairable member and
         # died inside sglang's loader with a far less informative message.
