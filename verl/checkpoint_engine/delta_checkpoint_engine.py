@@ -108,6 +108,87 @@ class _ValuesPiece:
 
 
 
+def _selfcheck_on():
+    """Sender-side self-check: dump dir, or None when off (the default)."""
+    return os.environ.get("VERL_DELTA_SELFCHECK_DIR") or None
+
+
+def _selfcheck_sampled(key):
+    """Deterministic fraction sample, keyed so a fusion group is kept whole.
+
+    Same rule as the verify sweep, for the same reason: half a fused pair is a
+    broken sample, not a smaller one -- that mistake is what took down the last
+    verification run.
+    """
+    frac = float(os.environ.get("VERL_DELTA_SELFCHECK_FRACTION", "0.002"))
+    return (zlib.crc32(key.encode()) & 0xFFFFFFFF) / 0x100000000 < frac
+
+
+def _selfcheck_key(name):
+    from verl.utils.fusion_groups import fusion_match
+
+    hit = fusion_match(name)
+    return f"{name[: -len(hit[1])]}{hit[0]}" if hit else name
+
+
+def _selfcheck_record_piece(store, piece):
+    """Record one ENCODED wire piece for a sampled parameter.
+
+    Deliberately hooked after ``_slice_pieces`` rather than on the backend's
+    entry stream: the gap encoding is part of what needs checking (the int16
+    signed-limit bug lived exactly there, and it produced a perfectly plausible
+    tensor), so the dump has to hold the bytes that actually ship, not the
+    positions before they were encoded.
+    """
+    if store is None or not _selfcheck_sampled(_selfcheck_key(piece.name)):
+        return
+    store.setdefault(piece.name, []).append(
+        {
+            "dtype_str": piece.dtype_str,
+            "shape": list(piece.shape),
+            "pos_width": piece.pos_width,
+            "gaps": piece.gaps.detach().cpu().clone(),
+            "val": piece.val.detach().reshape(-1).cpu().clone(),
+        }
+    )
+
+
+def _selfcheck_write(engine, spec_fn, quantize_fp8, step, pieces_store, out_dir, is_r0):
+    """Dump this sync's sampled wire pieces AND the dense state they produce.
+
+    The correctness question on DSv4 -- "does the delta actually describe the
+    change?" -- is still open because both in-line attempts took the SGLang
+    server down mid-sync. Nothing here touches the server: with two consecutive
+    syncs' dumps, an offline script can check that dense[N] equals dense[N-1]
+    with this sync's decoded delta applied, and that no byte outside the delta's
+    positions moved. The second half is the one that catches a delta which is
+    merely incomplete -- a dropped replica or half a fused pair passes the first
+    check on its own.
+    """
+    full, _ = engine.get_per_tensor_param(raw_master=quantize_fp8, quant_spec=spec_fn())
+    dense = {}
+    for name, tensor in full:  # drained in full on EVERY rank: the assembly is collective
+        if is_r0 and _selfcheck_sampled(_selfcheck_key(name)):
+            dense[name] = tensor.detach().reshape(-1).view(torch.uint8).cpu().clone()
+    if not is_r0:
+        return
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        torch.save(
+            {"step": step, "dense": dense, "pieces": pieces_store},
+            os.path.join(out_dir, f"selfcheck_step{step}.pt"),
+        )
+        logger.warning(
+            "delta selfcheck: step=%s dense_params=%d wire_params=%d -> %s",
+            step,
+            len(dense),
+            len(pieces_store),
+            out_dir,
+        )
+    except OSError as e:
+        logger.warning("delta selfcheck: could not write dump: %s", e)
+
+
 def _verify_sample(gen):
     """Ship only a sampled share of the verification sweep.
 
@@ -1159,6 +1240,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         ph = self._phase = _Phase()
         stager = _FusionStager()
         nonlocal_missed: list[str] = []
+        # Sampled encoded wire pieces, when the sender-side self-check is on.
+        # None (the default) makes the hook in _bucket_slot_delta a single
+        # identity test per piece, so an off self-check costs nothing measurable.
+        selfcheck_dir = _selfcheck_on()
+        selfcheck_pieces = {} if selfcheck_dir else None
 
         batch_k = self.batch_gather
 
@@ -1239,6 +1325,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 with ph.span("p_slice_encode", sync=True):
                     pieces = _slice_pieces(e_name, e_dtype, e_shape, e_idx, e_val)
                 ph.bump("p_pieces", len(pieces))
+                for _piece, _ in pieces:
+                    _selfcheck_record_piece(selfcheck_pieces, _piece)
                 wire_bytes += sum(nb for _, nb in pieces)
                 sized.extend(pieces)
             with ph.span("p_bucket"):
@@ -1325,6 +1413,21 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             else:
                 full, _ = engine.get_per_tensor_param()
                 self._send_full_seed(_verify_sample(full), global_steps, verify=True)
+        # Sender-side self-check, off by default. Placed here on purpose: the
+        # dense re-export is collective, so it has to run on every rank BEFORE
+        # the rank-0 early return, and it has to run after the delta was
+        # produced so the dense state it records is the one this sync's delta
+        # is supposed to yield from the previous sync's.
+        if selfcheck_dir:
+            _selfcheck_write(
+                engine,
+                lambda: self._fp8_spec(engine) if self.quantize_fp8 else None,
+                self.quantize_fp8,
+                global_steps,
+                selfcheck_pieces,
+                selfcheck_dir,
+                is_r0,
+            )
         if not is_r0:
             return
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
