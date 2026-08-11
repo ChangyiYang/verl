@@ -1303,8 +1303,17 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # mid-loop publishes that seal() triggers, while encode_s
                 # subtracts ALL publishes including the terminal flush. Add the
                 # publish total back and both steps agree at 9.8-10.6 s.
+                # Split on purpose: the two halves point at different fixes. The
+                # input is ~3.75 already-ascending runs (one per contributing
+                # rank), concatenated -- so if the ARGSORT dominates, a k-way
+                # merge of the runs recovers most of it. If the PERMUTE
+                # dominates, no smarter sort helps, because the data movement is
+                # the cost, and the only way out is not needing a global order at
+                # all (gap-encode per run). Optimising the wrong half is the
+                # default outcome of measuring them together.
                 with ph.span("p_sort", sync=True):
                     order = torch.argsort(aidx, stable=True)
+                with ph.span("p_permute", sync=True):
                     aidx, aval = aidx[order], aval[order]
             # The range check moves off the per-parameter path: collect the max
             # position as a device scalar and read a whole batch of them at once.
