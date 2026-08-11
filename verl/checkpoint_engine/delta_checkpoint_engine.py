@@ -1295,8 +1295,17 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # so the boolean mask -- whose data-dependent size was a second
             # per-parameter sync -- is gone as well.
             if aidx is not None and aidx.numel() > 1:
-                order = torch.argsort(aidx, stable=True)
-                aidx, aval = aidx[order], aval[order]
+                # Spanned because it was the biggest term in ship and nothing was
+                # measuring it. encode_s is a SUBTRACTION (consume - publish), not
+                # a phase, so this sort hid inside it: the sub-spans left +4.72 s
+                # unattributed in one step and -0.00 in the next, which reads as
+                # broken instrumentation. It is not -- p_bucket contains the
+                # mid-loop publishes that seal() triggers, while encode_s
+                # subtracts ALL publishes including the terminal flush. Add the
+                # publish total back and both steps agree at 9.8-10.6 s.
+                with ph.span("p_sort", sync=True):
+                    order = torch.argsort(aidx, stable=True)
+                    aidx, aval = aidx[order], aval[order]
             # The range check moves off the per-parameter path: collect the max
             # position as a device scalar and read a whole batch of them at once.
             # Same guard, 300x fewer stalls.
@@ -1489,6 +1498,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "checkpoint_engine/t_delta_open_s": t_delta_open,
             "checkpoint_engine/t_release_pool_s": t_release,
             "checkpoint_engine/gather_s": ship_t["gather"],
+            # NOT a phase: consume minus publish, where publish includes the
+            # terminal flush that happens outside the consume region. Kept for
+            # continuity with earlier runs; prefer the explicit spans below,
+            # which now sum to the real thing.
             "checkpoint_engine/encode_s": ship_t["consume"] - ship_t["publish"],
             "checkpoint_engine/publish_s": ship_t["publish"],
             "checkpoint_engine/n_gather_rounds": float(ship_t.get("rounds", 0)),
