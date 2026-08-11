@@ -131,10 +131,21 @@ def _verify_sample(gen):
     if frac >= 1.0:
         yield from gen
         return
+    from verl.utils.fusion_groups import fusion_match
+
     kept = total = 0
     for name, tensor in gen:
         total += 1
-        if (zlib.crc32(name.encode()) & 0xFFFFFFFF) / 0x100000000 < frac:
+        # Hash the FUSION GROUP, not the bare name. DSv4's loader rebuilds some
+        # params by cat-ing two separately-named halves and asserts its cache is
+        # empty on return, so the halves must travel together. Sampling by name
+        # kept one half and dropped the other, and the sender's own
+        # assert_drained caught it as "fusion groups never completed" -- the same
+        # class as the five byte-level splitters this path already had to fix,
+        # only this time the splitter was a sampling filter.
+        hit = fusion_match(name)
+        key = f"{name[: -len(hit[1])]}{hit[0]}" if hit else name
+        if (zlib.crc32(key.encode()) & 0xFFFFFFFF) / 0x100000000 < frac:
             kept += 1
             yield name, tensor
     logger.warning(

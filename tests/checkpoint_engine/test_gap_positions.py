@@ -259,3 +259,28 @@ def test_verify_sampling_defaults_to_everything(monkeypatch):
     names = [f"p{i}" for i in range(50)]
     kept = [n for n, _ in _verify_sample((n, torch.zeros(1)) for n in names)]
     assert kept == names
+
+
+def test_verify_sampling_keeps_fusion_groups_whole(monkeypatch):
+    """A sampled sweep must not split a fusion pair. DSv4's loader rebuilds some
+    params by cat-ing two separately-named halves and asserts its cache is empty
+    when load_weights returns, so keeping one half and dropping the other leaves
+    the sender's stager holding it -- which is exactly the
+    "fusion groups never completed" assertion a cluster run hit."""
+    from verl.checkpoint_engine.delta_checkpoint_engine import _verify_sample
+    from verl.utils.fusion_groups import fusion_match
+
+    names = []
+    for layer in range(60):
+        names.append(f"model.layers.{layer}.self_attn.wq_a.weight_scale_inv")
+        names.append(f"model.layers.{layer}.self_attn.wkv.weight_scale_inv")
+    assert all(fusion_match(n) for n in names), "test fixture must use real fusion names"
+
+    monkeypatch.setenv("VERL_DELTA_VERIFY_FRACTION", "0.3")
+    kept = {n for n, _ in _verify_sample((n, torch.zeros(1)) for n in names)}
+    assert 0 < len(kept) < len(names), f"expected a sample, got {len(kept)}"
+
+    for layer in range(60):
+        a = f"model.layers.{layer}.self_attn.wq_a.weight_scale_inv"
+        b = f"model.layers.{layer}.self_attn.wkv.weight_scale_inv"
+        assert (a in kept) == (b in kept), f"layer {layer}: fusion halves must be kept or dropped together"
