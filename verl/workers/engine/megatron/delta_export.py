@@ -509,39 +509,10 @@ def quant_shard_stream(engine, quant_spec):
                 grids[i2] = flatg[off : off + n2].view_as(g)
                 off += n2
 
-        # Replica dedup, the same rule the bf16 path applies at line ~260. The
-        # codes and the bf16 passthrough used to be contributes=True for every
-        # rank, so a parameter held whole by several ranks of the gather group
-        # was reported by all of them: rank 0 received each changed position
-        # twice and dropped the copies AFTER the transfer. Measured on DSv4,
-        # 49.2% of the gathered entries were these duplicates -- 23.2e9 of
-        # 47.1e9 crossing the network to be discarded on arrival.
-        #
-        # ``contributes`` exists precisely to stop that, and the quant path
-        # simply never used it for the data groups. Scales already did.
-        # Same classification the bf16 path derives at line ~253, from this
-        # record's own parameter rather than a mapping object.
-        _tp_world = torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group())
-        _ep_size = mpu.get_expert_model_parallel_world_size()
-        _is_expert = ".experts." in rec.megatron_name and (_ep_size > 1 or _tp_world > 1)
-        _is_tp_sharded = (
-            rec.param is not None
-            and getattr(rec.param, "tensor_model_parallel", False)
-            and _tp_world > 1
-        )
-        if _is_expert:
-            owns_replica = mpu.get_expert_data_parallel_rank() == 0
-        elif _is_tp_sharded:
-            owns_replica = mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-        else:
-            owns_replica = (
-                mpu.get_tensor_model_parallel_rank() == 0
-                and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            )
         groups = {
-            "c": {"slots": [], "pieces": [], "dtype": FP8_DTYPE, "contributes": owns_replica},
+            "c": {"slots": [], "pieces": [], "dtype": FP8_DTYPE, "contributes": True},
             "s": {"slots": [], "pieces": [], "dtype": torch.float32, "contributes": group_rank == 0},
-            "b": {"slots": [], "pieces": [], "dtype": torch.bfloat16, "contributes": owns_replica},
+            "b": {"slots": [], "pieces": [], "dtype": torch.bfloat16, "contributes": True},
         }
         qi = 0
         for sname, sshape in slots:
