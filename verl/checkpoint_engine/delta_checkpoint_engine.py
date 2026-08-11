@@ -712,6 +712,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             },
         }
         ph = getattr(self, "_phase", None) or _Phase()
+        # Collect the PREVIOUS flush before touching the allocator for this one.
+        # Everything between that broadcast and this line ran overlapped with it.
+        self._await_publish_inflight(ph)
         # The manifest pickles one dict per param in the flush -- thousands of
         # them -- so this is not obviously free either.
         with ph.span("pub_zmq"):
@@ -727,11 +730,23 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             val_cp = cp.empty(val_u8.numel(), dtype=cp.uint8)
             pos_cp[:] = cp.asarray(pos_u8)
             val_cp[:] = cp.asarray(val_u8)
-        # Two broadcasts per flush. sync=True is required: these only enqueue, so
-        # without it the cost lands on an unrelated later call.
-        with ph.span("pub_bcast", sync=True):
+        # Two broadcasts per flush. With the overlap on they are ENQUEUED ONLY --
+        # the wait happens in _await_publish_inflight, either before the next
+        # flush stages or at the end of the sync -- and pos_cp/val_cp are parked
+        # on self until then, because dropping them here would let the allocator
+        # reuse the memory mid-broadcast.
+        #
+        # The kill switch is not ceremony: parking a flush's staging buffers
+        # raises peak cupy staging from one flush to two, and the cupy pool does
+        # not return blocks to CUDA on its own. If a run OOMs, this separates "the
+        # overlap costs too much memory" from "something else broke" without
+        # rebuilding the frozen tree and paying another 45 minutes to find out.
+        overlap = os.environ.get("VERL_DELTA_PUBLISH_OVERLAP", "1") == "1"
+        with ph.span("pub_bcast_enqueue", sync=not overlap):
             collective.broadcast(pos_cp, src_rank=0, group_name=self.group_name)
             collective.broadcast(val_cp, src_rank=0, group_name=self.group_name)
+        if overlap:
+            self._pub_inflight = (pos_cp, val_cp)
         ph.bump("pub_bcast_calls", 2)
         ph.bump("pub_flushes")
 
@@ -793,6 +808,39 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             free_before / (1 << 30),
             free_after / (1 << 30),
         )
+
+    def _await_publish_inflight(self, ph=None) -> None:
+        """Block until the previous flush's broadcasts have landed, then let its
+        staging buffers go.
+
+        This is the whole of the publish/build overlap: ``_publish_flush`` used to
+        synchronise immediately after enqueueing its two broadcasts, so 5.9-9.8 s
+        of the sync was rank 0 sitting idle while 79 other ranks also sat idle.
+        Deferring the wait to just before the NEXT flush stages lets rank 0 build
+        that flush -- sort, encode, bucket -- while the previous one is still on
+        the wire.
+
+        Two things make the deferral safe rather than a race:
+          - the cupy staging buffers are held on ``self`` until the wait, because
+            ray's broadcast keeps no reference to them and the allocator would
+            otherwise be free to hand that memory to the next flush mid-transfer.
+            That is the same hazard the staging copy exists for, one step later.
+          - the wait is a FULL device synchronise, not a torch event: ray enqueues
+            the broadcast on its own stream, so an event recorded on torch's
+            current stream would not cover it and would return early.
+
+        ``t_pub_await_s`` is therefore the publish time that could NOT be hidden --
+        the metric that says whether this worked, where ``t_pub_bcast_enqueue_s``
+        alone would only report how long it takes to hand work to NCCL.
+        """
+        if getattr(self, "_pub_inflight", None) is None:
+            return
+        ph = ph or getattr(self, "_phase", None) or _Phase()
+        with ph.span("pub_await"):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        self._pub_inflight = None
+        ph.bump("pub_awaits")
 
     def _publish_terminal(self, first: bool) -> None:
         """End-of-stream marker when zero flushes were produced (no broadcast, just a signal)."""
@@ -1460,6 +1508,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             else:
                 full, _ = engine.get_per_tensor_param()
                 self._send_full_seed(_verify_sample(full), global_steps, verify=True)
+        # The last flush is still on the wire at this point: nothing after the
+        # loop waits for it, so drain it before reporting or returning.
+        self._await_publish_inflight(ph)
         # Sender-side self-check, off by default. Placed here on purpose: the
         # dense re-export is collective, so it has to run on every rank BEFORE
         # the rank-0 early return, and it has to run after the delta was
