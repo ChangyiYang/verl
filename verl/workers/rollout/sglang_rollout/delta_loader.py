@@ -43,6 +43,7 @@ from __future__ import annotations
 import bisect
 import itertools
 import json
+import contextlib
 import logging
 import math
 from collections.abc import Iterable, Iterator
@@ -274,6 +275,73 @@ def _apply_dense(
 _VERIFY_STATS: dict = {"params": 0, "pieces": []}
 
 
+class _DedupUninitWarning(logging.Filter):
+    """Drop repeats of SGLang's "weights are not initialized" warning.
+
+    That single record is 65 KB (it inlines the whole name set) and SGLang emits
+    one per ``load_weights`` call. The seed calls load_weights once per flush --
+    533 times -- so it costs ~35 MB and nobody noticed. The verify sweep calls it
+    once per ATOMIC UNIT, ~24k-32k times, because it has to snapshot and compare
+    around each one: ~2 GB of log text. Ray forwards worker logs to the head node
+    with a 512 MB message cap, so the job dies with
+
+        RaySystemError: Sent message larger than max (536878753 vs 536870912)
+
+    which looks nothing like "the verification did something wrong". It is not the
+    data, the transfer, or the memory: the seed pushes the same full model through
+    the same _apply_dense path every run and is fine. Only the call granularity
+    differs, and the logging is quadratic in it.
+
+    The first occurrence is kept -- it is genuinely useful once -- and the rest are
+    counted and reported, so nothing is silently lost.
+    """
+
+    NEEDLE = "are not initialized from checkpoints"
+
+    def __init__(self):
+        super().__init__()
+        self.suppressed = 0
+        self.seen = False
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if self.NEEDLE not in msg:
+            return True
+        if not self.seen:
+            self.seen = True
+            return True
+        self.suppressed += 1
+        return False
+
+
+@contextlib.contextmanager
+def _quiet_uninit_warning():
+    """Install the dedup filter on the root logger for the duration of a sweep."""
+    filt = _DedupUninitWarning()
+    root = logging.getLogger()
+    handlers = list(root.handlers) or []
+    for h in handlers:
+        h.addFilter(filt)
+    root.addFilter(filt)
+    try:
+        yield filt
+    finally:
+        for h in handlers:
+            h.removeFilter(filt)
+        root.removeFilter(filt)
+        if filt.suppressed:
+            logger.warning(
+                "delta verify: suppressed %d repeats of SGLang's 65 KB "
+                "'not initialized from checkpoints' warning (~%.1f GB of log text). "
+                "Kept the first one.",
+                filt.suppressed,
+                filt.suppressed * 66776 / (1 << 30),
+            )
+
+
 def _verify_dense(
     model: torch.nn.Module, params: list[dict], values: torch.Tensor, is_last: bool, values_bytes: bool = False
 ) -> None:
@@ -289,7 +357,6 @@ def _verify_dense(
     Comparing per copy_ call instead would false-positive on every
     transform-loaded param (raw-vs-transformed at each stage)."""
     orig_copy = torch.Tensor.copy_
-
     by_param = _VERIFY_STATS.setdefault("by_param", {})
     # Verify one ATOMIC UNIT at a time, not one param at a time. Feeding a single
     # param to _apply_dense hands SGLang's DSv4 loader half of a fused destination
@@ -300,6 +367,17 @@ def _verify_dense(
     # which is why nothing hit it until a run finally got that far.
     # Snapshot/compare semantics are unchanged: the hook records every copy_
     # destination touched during the call, so a 2-param unit simply verifies both.
+    _quiet = _quiet_uninit_warning()
+    _quiet.__enter__()
+    try:
+        _verify_units(model, params, values, values_bytes, orig_copy, by_param)
+    finally:
+        _quiet.__exit__(None, None, None)
+    _verify_finish(is_last)
+
+
+def _verify_units(model, params, values, values_bytes, orig_copy, by_param):
+    """The per-unit snapshot/compare loop (extracted so the log filter wraps it)."""
     for unit in _atomic_units(params):
         touched: dict = {}
 
@@ -329,6 +407,10 @@ def _verify_dense(
             by_param[label] = by_param.get(label, 0) + bad
         _VERIFY_STATS["pieces"].append(bad)
     _VERIFY_STATS["params"] += len(params)
+
+
+def _verify_finish(is_last: bool) -> None:
+    """Report and fail loud once the sweep's final flush has been verified."""
     if is_last:
         total = sum(_VERIFY_STATS["pieces"])
         n = _VERIFY_STATS["params"]
