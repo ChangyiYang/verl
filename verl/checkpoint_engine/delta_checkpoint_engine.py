@@ -1302,6 +1302,16 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         if not total_elems:
             return None
         _imb = ship_t.get("imbalance", {})
+        # Dump the raw per-round x per-rank matrix when asked. 218 rounds x 16
+        # ranks is a few thousand integers -- small enough to keep whole, and an
+        # aggregate cannot answer "is it always the same rank".
+        _dump = os.environ.get("VERL_DELTA_GATHER_DUMP")
+        if _dump and is_r0 and _imb.get("rows"):
+            try:
+                with open(_dump, "a") as fh:
+                    fh.write(json.dumps({"step": global_steps, "rows": _imb["rows"]}) + "\n")
+            except OSError as e:
+                logger.warning("could not write gather dump to %s: %s", _dump, e)
         return {
             "checkpoint_engine/changed_ratio": changed_elems / total_elems,
             "checkpoint_engine/changed_elems": float(changed_elems),

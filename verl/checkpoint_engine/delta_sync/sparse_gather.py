@@ -178,6 +178,10 @@ def gather_slot_entries_to_rank0(
         stats["padded"] = stats.get("padded", 0) + max_n * world
         stats["nonzero_ranks"] = stats.get("nonzero_ranks", 0) + sum(1 for x in totals if x)
         stats["rounds"] = stats.get("rounds", 0) + 1
+        # Keep the raw per-round vector too, not just the aggregate. An average
+        # cannot show whether one rank always carries the round or whether the
+        # heavy rank moves around, and those want different fixes.
+        stats.setdefault("rows", []).append(list(totals))
     if max_n == 0:
         if rank != 0:
             return None
