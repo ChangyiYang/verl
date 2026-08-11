@@ -251,6 +251,16 @@ class _Phase:
     -- otherwise the cost lands on whichever unrelated call happens to block
     next. It does remove some overlap, so the instrumented total runs slightly
     high; attribution is the point here, not the headline number.
+
+    ``hot=True`` marks a span INSIDE the per-parameter loop, where that trade
+    stops being acceptable: at 67,569 parameters a synced span is 135k
+    ``cuda.synchronize()`` calls per sync, which does not merely inflate the
+    number -- it serialises the device and destroys the overlap the profile is
+    supposed to be measuring. Hot synced spans therefore only run under
+    ``VERL_DELTA_PROFILE_SYNC=1``, and when they are off they record NOTHING
+    rather than an unsynchronised number. A missing metric is honest; a number
+    whose cost landed on an unrelated later call is worse than no number, because
+    it reads exactly like a measurement.
     """
 
     __slots__ = ("t", "n")
@@ -260,7 +270,11 @@ class _Phase:
         self.n: dict[str, int] = {}
 
     @contextlib.contextmanager
-    def span(self, key: str, sync: bool = False):
+    def span(self, key: str, sync: bool = False, hot: bool = False):
+        if hot and sync and os.environ.get("VERL_DELTA_PROFILE_SYNC", "0") != "1":
+            self.n["hot_spans_skipped"] = self.n.get("hot_spans_skipped", 0) + 1
+            yield
+            return
         cuda = sync and torch.cuda.is_available()
         if cuda:
             torch.cuda.synchronize()
@@ -1311,9 +1325,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # the cost, and the only way out is not needing a global order at
                 # all (gap-encode per run). Optimising the wrong half is the
                 # default outcome of measuring them together.
-                with ph.span("p_sort", sync=True):
+                with ph.span("p_sort", sync=True, hot=True):
                     order = torch.argsort(aidx, stable=True)
-                with ph.span("p_permute", sync=True):
+                with ph.span("p_permute", sync=True, hot=True):
                     aidx, aval = aidx[order], aval[order]
             # The range check moves off the per-parameter path: collect the max
             # position as a device scalar and read a whole batch of them at once.
@@ -1355,7 +1369,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 # switch to 1-byte gaps -- 96.2 GiB where the wire carried 38.5,
                 # which is exactly the figure this work is judged on. The flush
                 # count is the cross-check: 78 flushes only makes sense at ~2 B.
-                with ph.span("p_slice_encode", sync=True):
+                with ph.span("p_slice_encode", sync=True, hot=True):
                     pieces = _slice_pieces(e_name, e_dtype, e_shape, e_idx, e_val)
                 ph.bump("p_pieces", len(pieces))
                 for _piece, _ in pieces:
