@@ -447,6 +447,34 @@ def _verify_finish(is_last: bool) -> None:
         offenders = _VERIFY_STATS.pop("by_param", {})
         top = sorted(offenders.items(), key=lambda kv: -kv[1])[:12]
         logger.warning("DELTA-VERIFY sweep: params=%d mismatch_elems=%d offenders=%s", n, total, top)
+        if offenders:
+            # top-12 alone cannot tell a whole-class failure from a few bad
+            # tensors. The first sweep reported 4.34M mismatched elements whose
+            # top 12 were all exactly 512 -- meaning thousands of params each
+            # fully wrong, not a handful badly wrong. That shape is only visible
+            # in the distribution, so print it: how many params, what the counts
+            # look like, and which name suffixes they cluster under. The suffix
+            # histogram is the part that separates "the scale tensors are
+            # desynced" from "the codes are wrong too", which are very different
+            # bugs.
+            counts = sorted(offenders.values())
+            by_suffix: dict = {}
+            for name, c in offenders.items():
+                sfx = name.rsplit(".", 1)[-1]
+                agg = by_suffix.setdefault(sfx, [0, 0])
+                agg[0] += 1
+                agg[1] += c
+            logger.warning(
+                "DELTA-VERIFY distribution: offending_params=%d/%d min=%d median=%d max=%d "
+                "distinct_counts=%s by_suffix=%s",
+                len(offenders),
+                n,
+                counts[0],
+                counts[len(counts) // 2],
+                counts[-1],
+                sorted(set(counts))[:10],
+                sorted(((k, v[0], v[1]) for k, v in by_suffix.items()), key=lambda t: -t[2])[:15],
+            )
         if total:
             raise RuntimeError(
                 f"delta state verification FAILED: {total} elements differ between the "
