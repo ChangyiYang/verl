@@ -50,9 +50,11 @@ oracle for both assumptions on every Megatron-Bridge upgrade.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -435,6 +437,50 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
     return slots, dtype_str, counts, hf_idx, hf_val
 
 
+# Per-step cost of the quant export, accumulated when VERL_DELTA_PROFILE is set.
+# export is 14.25 s of a DSv4 sync -- the single largest term and 63% of the
+# payload-independent floor -- and nothing had ever measured what it is MADE of.
+# Every plan for it (skip quantizing unchanged params, batch the all_reduce) is a
+# guess about which of these lines owns the time, so measure first.
+#
+# Syncs are gated on VERL_DELTA_PROFILE_SYNC for the usual reason: these regions
+# enqueue GPU work, so without a sync the cost lands on whichever call blocks
+# next, but syncing per parameter serialises the device (67,569 records here).
+_EXPORT_TIMES = {
+    "convert": 0.0,   # megatron_to_hf + bf16 cast
+    "absmax": 0.0,    # local_blockwise_absmax grids
+    "allreduce": 0.0, # the per-record global absmax collective
+    "quantize": 0.0,  # divide / clamp / cast to fp8 codes
+    "records": 0,
+}
+
+
+def take_export_times():
+    """Return the accumulated quant-export costs and reset the counters."""
+    out = dict(_EXPORT_TIMES)
+    for k in _EXPORT_TIMES:
+        _EXPORT_TIMES[k] = type(_EXPORT_TIMES[k])()
+    return out
+
+
+@contextlib.contextmanager
+def _xspan(key):
+    """Time one export sub-step. No-op unless VERL_DELTA_PROFILE is set."""
+    if not os.environ.get("VERL_DELTA_PROFILE"):
+        yield
+        return
+    sync = os.environ.get("VERL_DELTA_PROFILE_SYNC") == "1" and torch.cuda.is_available()
+    if sync:
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        if sync:
+            torch.cuda.synchronize()
+        _EXPORT_TIMES[key] += time.perf_counter() - t0
+
+
 def quant_shard_stream(engine, quant_spec):
     """Quant-domain shard exporter with the SAME contract as
     ``get_per_tensor_param_shard``: yields ``(name, local_flat, ShardSpec)``
@@ -474,7 +520,8 @@ def quant_shard_stream(engine, quant_spec):
             outs = {}
             dev = torch.device(torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         else:
-            outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
+            with _xspan("convert"):
+                outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
             dev = rec.param.device
         pg = rec.spec.gather_group
         group_rank = dist.get_rank(pg) if pg is not None else dist.get_rank()
@@ -492,18 +539,21 @@ def quant_shard_stream(engine, quant_spec):
         # aligned because every rank walks the same union order; absent rows
         # contribute zero partials without materializing shards.
         grids = []
-        for sname, sshape in quantizable:
-            t = outs.get(sname)
-            if t is None:
-                g = torch.zeros(
-                    ceil_div(int(sshape[0]), bm), ceil_div(int(sshape[1]), bn), dtype=torch.float32, device=dev
-                )
-            else:
-                g = local_blockwise_absmax(t.to(torch.bfloat16), block, 0, tuple(sshape))
-            grids.append(g)
+        _EXPORT_TIMES["records"] += 1
+        with _xspan("absmax"):
+            for sname, sshape in quantizable:
+                t = outs.get(sname)
+                if t is None:
+                    g = torch.zeros(
+                        ceil_div(int(sshape[0]), bm), ceil_div(int(sshape[1]), bn), dtype=torch.float32, device=dev
+                    )
+                else:
+                    g = local_blockwise_absmax(t.to(torch.bfloat16), block, 0, tuple(sshape))
+                grids.append(g)
         if grids and pg is not None:
-            flatg = torch.cat([g.reshape(-1) for g in grids])
-            dist.all_reduce(flatg, op=dist.ReduceOp.MAX, group=pg)
+            with _xspan("allreduce"):
+                flatg = torch.cat([g.reshape(-1) for g in grids])
+                dist.all_reduce(flatg, op=dist.ReduceOp.MAX, group=pg)
             off = 0
             for i2, g in enumerate(grids):
                 n2 = g.numel()
@@ -551,7 +601,8 @@ def quant_shard_stream(engine, quant_spec):
                 descale = grids[qi].clamp(min=_ABSMAX_EPS) / FP8_MAX
                 qi += 1
                 if t is not None:
-                    codes = quantize_shard_with_descale(t.to(torch.bfloat16), descale, block, 0)
+                    with _xspan("quantize"):
+                        codes = quantize_shard_with_descale(t.to(torch.bfloat16), descale, block, 0)
                 else:
                     codes = torch.empty(0, dtype=FP8_DTYPE, device=dev)
                 groups["c"]["slots"].append((sname, tuple(sshape)))

@@ -1294,6 +1294,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             _lt = take_load_times()
         except ImportError:
             _lt = {}
+        try:
+            from verl.workers.engine.megatron.delta_export import take_export_times
+
+            _xt = take_export_times()
+        except ImportError:
+            _xt = {}
         is_r0 = self.is_master
         n_flushes = 0
         changed_elems = 0
@@ -1584,6 +1590,13 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "checkpoint_engine/t_delta_open_s": t_delta_open,
             # NOT additive with each other: copy_enqueue is enqueue cost for a
             # non_blocking copy, not transfer time.
+            # export internals -- the biggest single term and, until now, opaque.
+            **{
+                f"checkpoint_engine/t_export_{k}_s": v
+                for k, v in _xt.items()
+                if k != "records"
+            },
+            "checkpoint_engine/n_export_records": float(_xt.get("records", 0)),
             "checkpoint_engine/t_load_resize_s": _lt.get("resize", 0.0),
             "checkpoint_engine/t_load_copy_enqueue_s": _lt.get("copy_enqueue", 0.0),
             "checkpoint_engine/n_load_buffers": float(_lt.get("buffers", 0)),
