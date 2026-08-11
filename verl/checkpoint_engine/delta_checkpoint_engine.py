@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import time
+import zlib
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from unittest.mock import patch
@@ -104,6 +105,44 @@ class _ValuesPiece:
     shape: list
     flat: torch.Tensor
 
+
+
+
+def _verify_sample(gen):
+    """Ship only a sampled share of the verification sweep.
+
+    The sweep re-sends the WHOLE model densely and the receiver materialises a
+    full-shape tensor per parameter to bit-compare before overwriting. On DSv4
+    that took the SGLang server down mid-sync, so the one run that would have
+    proved bit-correctness never produced a verdict -- leaving "it is fast"
+    measured and "it is right" not.
+
+    Sampling by name keeps the guarantee's shape (a real bit-compare against the
+    trainer's own export, on real weights) at a fraction of the transfer. It is
+    a spot check rather than a proof: a fault confined to unsampled parameters
+    slips through, so treat a pass as evidence, not a certificate.
+
+    The generator is consumed in full regardless -- the per-tensor assembly
+    behind it is collective, so every rank must walk the same sequence. Only
+    shipping is skipped. Selection hashes the name, so every rank picks the
+    same set without sharing state.
+    """
+    frac = float(os.environ.get("VERL_DELTA_VERIFY_FRACTION", "1.0"))
+    if frac >= 1.0:
+        yield from gen
+        return
+    kept = total = 0
+    for name, tensor in gen:
+        total += 1
+        if (zlib.crc32(name.encode()) & 0xFFFFFFFF) / 0x100000000 < frac:
+            kept += 1
+            yield name, tensor
+    logger.warning(
+        "delta verify: sampled %d/%d params (fraction=%.3f) -- a pass covers only what was sampled",
+        kept,
+        total,
+        frac,
+    )
 
 
 class _Phase:
@@ -1281,10 +1320,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # collective on every rank: the full export assembles per tensor.
             if self.quantize_fp8:
                 full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=self._fp8_spec(engine))
-                self._send_full_seed(full, global_steps, verify=True, bytes_wire=True)
+                self._send_full_seed(_verify_sample(full), global_steps, verify=True, bytes_wire=True)
             else:
                 full, _ = engine.get_per_tensor_param()
-                self._send_full_seed(full, global_steps, verify=True)
+                self._send_full_seed(_verify_sample(full), global_steps, verify=True)
         if not is_r0:
             return
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs

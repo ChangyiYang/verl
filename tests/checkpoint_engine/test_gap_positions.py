@@ -224,3 +224,37 @@ def test_slice_pieces_encodes_each_piece_once():
         assert piece.gaps is not None, "piece must carry its encoded gaps"
         assert nbytes == piece.idx.numel() * (piece.pos_width + val.element_size())
         assert torch.equal(_decode(piece.gaps), piece.idx), "carried gaps must decode to the piece"
+
+
+def test_verify_sampling_is_deterministic_and_consumes_everything(monkeypatch):
+    """The sweep's generator is backed by a collective per-tensor assembly, so
+    every rank must walk all of it even when only a share is shipped. And the
+    chosen set has to match across ranks without them talking, hence hashing the
+    name rather than drawing from an RNG."""
+    from verl.checkpoint_engine.delta_checkpoint_engine import _verify_sample
+
+    names = [f"layers.{i}.w" for i in range(400)]
+    seen = []
+
+    def gen():
+        for n in names:
+            seen.append(n)
+            yield n, torch.zeros(1)
+
+    monkeypatch.setenv("VERL_DELTA_VERIFY_FRACTION", "0.1")
+    kept = [n for n, _ in _verify_sample(gen())]
+
+    assert seen == names, "the generator must be drained in full -- it is collective"
+    assert 0 < len(kept) < len(names), f"expected a sample, got {len(kept)}/{len(names)}"
+    seen.clear()
+    assert [n for n, _ in _verify_sample(gen())] == kept, "selection must be reproducible"
+
+
+def test_verify_sampling_defaults_to_everything(monkeypatch):
+    """Absent the knob, behaviour is unchanged: a full sweep."""
+    from verl.checkpoint_engine.delta_checkpoint_engine import _verify_sample
+
+    monkeypatch.delenv("VERL_DELTA_VERIFY_FRACTION", raising=False)
+    names = [f"p{i}" for i in range(50)]
+    kept = [n for n, _ in _verify_sample((n, torch.zeros(1)) for n in names)]
+    assert kept == names
