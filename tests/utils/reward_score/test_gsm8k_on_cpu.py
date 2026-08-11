@@ -33,6 +33,18 @@ import pytest
 from verl.utils.reward_score.gsm8k import answers_match, compute_score, extract_solution
 
 
+@pytest.fixture(autouse=True)
+def _correct_scoring(monkeypatch):
+    """These tests describe CORRECT scoring, which is no longer the default.
+
+    The legacy (buggy) extraction is default-on because its false negatives are
+    what give GRPO its reward variance on GSM8K -- see _legacy_strict(). The
+    correctness tests therefore have to ask for the fixed path explicitly, and
+    the legacy behaviour gets its own tests below.
+    """
+    monkeypatch.setenv("VERL_GSM8K_STRICT_LEGACY", "0")
+
+
 @pytest.mark.parametrize(
     "solution,ground_truth,reason",
     [
@@ -100,3 +112,35 @@ def test_long_solution_is_still_clipped_from_the_end():
     assert compute_score("x" * 5000 + "\n#### $36", "36") == 1.0
     # a marker only in the discarded head is still invisible, as before
     assert compute_score("#### 36" + "y" * 5000, "36") == 0
+
+
+# --- the legacy path, which is the DEFAULT ------------------------------------
+# It is default-on for the reward variance, not because it is right. These tests
+# pin the exact wrongness so that "the benchmark workload" cannot drift silently:
+# if someone changes the legacy branch, the perf numbers stop being comparable
+# with every run recorded before it.
+
+
+@pytest.fixture
+def _legacy_scoring(monkeypatch):
+    monkeypatch.delenv("VERL_GSM8K_STRICT_LEGACY", raising=False)
+
+
+def test_legacy_is_the_default(_legacy_scoring):
+    """No env set -> the original pattern, currency symbol rejected."""
+    assert compute_score("#### $36", "36") == 0
+    assert compute_score("#### 36", "36") == 1.0
+
+
+def test_legacy_rejects_trailing_zero_fraction(_legacy_scoring):
+    """'10.00' vs '10' fails on string equality -- the second variance source."""
+    assert compute_score("#### 10.00", "10") == 0.0
+
+
+def test_legacy_still_accepts_a_plain_answer(_legacy_scoring):
+    assert compute_score("#### 1,234", "1234") == 1.0
+
+
+def test_flexible_is_unaffected_by_the_switch(_legacy_scoring):
+    """The switch is scoped to strict; flexible must behave identically."""
+    assert compute_score("the answer is 36", "36", method="flexible") == 1.0

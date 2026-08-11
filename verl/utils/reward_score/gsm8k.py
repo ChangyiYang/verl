@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 from decimal import Decimal, InvalidOperation
 
@@ -52,6 +53,32 @@ def answers_match(answer, ground_truth):
         return a == b
 
 
+def _legacy_strict():
+    """Whether strict mode uses the ORIGINAL (buggy) extraction.
+
+    Default ON, deliberately. The original pattern rejects correct answers that
+    carry a currency symbol -- 12 of 18 zero-scores on a DSv4 dump were right --
+    but that false-negative rate is what gives GRPO its within-group reward
+    variance on GSM8K. With the pattern fixed, ~95% of samples score 1.0, groups
+    go uniform, advantage is exactly 0, the gradient is exactly 0 and the weight
+    delta vanishes: two consecutive perf runs came back with changed_ratio 4.8e-10
+    on step 1 and were unusable as measurements.
+
+    So this knob is not "fixed vs unfixed" -- it is "which workload is the
+    benchmark running". Set VERL_GSM8K_STRICT_LEGACY=0 to score correctly, which
+    is what any real training run or reported accuracy number should use.
+    Anything comparing the two must not mix them: reward AND delta density both
+    change, so perf numbers do not carry across.
+    """
+    return os.environ.get("VERL_GSM8K_STRICT_LEGACY", "1") == "1"
+
+
+# The original pattern, kept verbatim: a digit must follow "#### " immediately,
+# so "#### $36" does not match at all and the .replace("$", "") below never gets
+# a chance to help. That is the bug -- and the variance source.
+_LEGACY_STRICT = re.compile(r"#### (\-?[0-9\.\,]+)")
+
+
 def extract_solution(solution_str, method="strict"):
     assert method in ["strict", "flexible"]
 
@@ -61,7 +88,10 @@ def extract_solution(solution_str, method="strict"):
     if len(solution_str) > _SOLUTION_CLIP_CHARS:
         solution_str = solution_str[-_SOLUTION_CLIP_CHARS:]
 
-    if method == "strict":
+    if method == "strict" and _legacy_strict():
+        solutions = _LEGACY_STRICT.findall(solution_str)
+        final_answer = solutions[-1].replace(",", "").replace("$", "") if solutions else None
+    elif method == "strict":
         # this also tests the formatting of the model: the '####' marker is still
         # required. Only the number's own decoration is tolerated (see the
         # patterns above for why).
@@ -104,7 +134,7 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
     if answer is None:
         return 0
     else:
-        if answers_match(answer, ground_truth):
+        if (answer == ground_truth) if _legacy_strict() and method == "strict" else answers_match(answer, ground_truth):
             return score
         else:
             return format_score
