@@ -45,6 +45,7 @@ import itertools
 import json
 import contextlib
 import logging
+import os
 import math
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -376,9 +377,36 @@ def _verify_dense(
     _verify_finish(is_last)
 
 
+def _verify_batches(params):
+    """Yield the groups of params to verify together.
+
+    Per ATOMIC UNIT by default: a unit is the smallest safe granularity, because
+    handing _apply_dense half a fused destination makes SGLang's loader buffer it
+    and assert at the end of load_weights. That is a LOWER bound, not the only
+    option -- the snapshot hook keys destinations by (data_ptr, numel, dtype) and
+    snapshots each once before its first write, so a larger batch verifies exactly
+    the same set. Flush boundaries never split a fusion group either (the bucket's
+    cap check runs before a group goes in), so the whole flush is a legal batch.
+
+    VERL_DELTA_VERIFY_BATCH=1 does the whole flush in one call: ~533 load_weights
+    calls per sync instead of ~24k-32k, which is a ~60x cut and removes the 65 KB
+    per-call log flood at its source rather than filtering it.
+
+    It costs two things, which is why it is not the default yet:
+      * snapshot memory -- clones of every destination the flush writes, ~514 MB
+        against one param's worth
+      * attribution -- a mismatch is reported against the batch, not the parameter
+    Turn it on only once a per-unit sweep has passed, so a regression is
+    attributable to the batching rather than to the delta.
+    """
+    if os.environ.get("VERL_DELTA_VERIFY_BATCH") == "1":
+        return [list(params)]
+    return _atomic_units(params)
+
+
 def _verify_units(model, params, values, values_bytes, orig_copy, by_param):
     """The per-unit snapshot/compare loop (extracted so the log filter wraps it)."""
-    for unit in _atomic_units(params):
+    for unit in _verify_batches(params):
         touched: dict = {}
 
         def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, _touched=touched, **kwargs) -> torch.Tensor:

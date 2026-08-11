@@ -73,3 +73,45 @@ def test_the_flood_is_actually_bounded(caplog):
                 log.warning(NEEDLE)
     hits = [r for r in caplog.records if "are not initialized from checkpoints" in r.getMessage()]
     assert len(hits) <= 1, f"flood not bounded: {len(hits)} records survived"
+
+
+# --- flush-level batching (off by default until a per-unit sweep has passed) ---
+
+
+def _p(name):
+    return {"name": name}
+
+
+def test_default_is_per_atomic_unit(monkeypatch):
+    """Default must stay per-unit: batching is only safe to enable after a green run."""
+    from verl.workers.rollout.sglang_rollout.delta_loader import _verify_batches
+
+    monkeypatch.delenv("VERL_DELTA_VERIFY_BATCH", raising=False)
+    params = [_p("layers.0.self_attn.wq_a.weight"), _p("layers.0.self_attn.wkv.weight"), _p("layers.0.mlp.w1.weight")]
+    batches = _verify_batches(params)
+    assert len(batches) > 1, "default must not batch the whole flush"
+
+
+def test_batch_mode_makes_one_call(monkeypatch):
+    from verl.workers.rollout.sglang_rollout.delta_loader import _verify_batches
+
+    monkeypatch.setenv("VERL_DELTA_VERIFY_BATCH", "1")
+    params = [_p(f"layers.{i}.mlp.w1.weight") for i in range(50)]
+    batches = _verify_batches(params)
+    assert len(batches) == 1 and len(batches[0]) == 50
+
+
+def test_no_param_is_lost_or_duplicated_in_either_mode(monkeypatch):
+    """Whatever the granularity, every param must be verified exactly once."""
+    from verl.workers.rollout.sglang_rollout.delta_loader import _verify_batches
+
+    params = [
+        _p("layers.0.self_attn.wq_a.weight"),
+        _p("layers.0.mlp.w1.weight"),
+        _p("layers.0.self_attn.wkv.weight"),  # fused sibling, deliberately not adjacent
+        _p("layers.1.mlp.w1.weight"),
+    ]
+    for mode in ("0", "1"):
+        monkeypatch.setenv("VERL_DELTA_VERIFY_BATCH", mode)
+        flat = [p["name"] for b in _verify_batches(params) for p in b]
+        assert sorted(flat) == sorted(p["name"] for p in params), f"mode={mode} lost or duplicated a param"
