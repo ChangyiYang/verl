@@ -473,7 +473,12 @@ class _GatherQueue:
         # and want completely different fixes. Measure before choosing one.
         _t = time.perf_counter()
         gathered = gather_slot_entries_to_rank0(
-            idx_concat, val_concat, counts_concat, group=pg, max_round_bytes=self.max_round_bytes
+            idx_concat,
+            val_concat,
+            counts_concat,
+            group=pg,
+            max_round_bytes=self.max_round_bytes,
+            stats=self.timers.get("imbalance") if self.timers is not None else None,
         )
         if self.timers is not None:
             self.timers["gather"] += time.perf_counter() - _t
@@ -1079,7 +1084,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # gather / consume(rank0 encode) / publish are the three costs inside
         # ship_s. publish is nested inside consume (bkt.add triggers it), so the
         # encode share is consume minus publish.
-        ship_t = {"gather": 0.0, "consume": 0.0, "publish": 0.0}
+        ship_t = {"gather": 0.0, "consume": 0.0, "publish": 0.0, "imbalance": {}}
         ph = self._phase = _Phase()
         stager = _FusionStager()
         nonlocal_missed: list[str] = []
@@ -1296,6 +1301,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
         if not total_elems:
             return None
+        _imb = ship_t.get("imbalance", {})
         return {
             "checkpoint_engine/changed_ratio": changed_elems / total_elems,
             "checkpoint_engine/changed_elems": float(changed_elems),
@@ -1309,5 +1315,14 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "checkpoint_engine/encode_s": ship_t["consume"] - ship_t["publish"],
             "checkpoint_engine/publish_s": ship_t["publish"],
             "checkpoint_engine/n_gather_rounds": float(ship_t.get("rounds", 0)),
+            # Measured, not inferred: what each rank actually contributed.
+            # waste = padded / sum; 1.0 means the ranks were balanced and padding
+            # cost nothing, world means one rank held everything.
+            "checkpoint_engine/gath_elems_useful": float(_imb.get("sum", 0)),
+            "checkpoint_engine/gath_elems_padded": float(_imb.get("padded", 0)),
+            "checkpoint_engine/gath_waste_x": (_imb.get("padded", 0) / max(_imb.get("sum", 0), 1)),
+            "checkpoint_engine/gath_ranks_with_data_avg": (
+                _imb.get("nonzero_ranks", 0) / max(_imb.get("rounds", 0), 1)
+            ),
             **ph.metrics(),
         }

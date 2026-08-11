@@ -113,6 +113,7 @@ def gather_slot_entries_to_rank0(
     counts: torch.Tensor,
     group: dist.ProcessGroup | None = None,
     max_round_bytes: int | None = None,
+    stats: dict | None = None,
 ) -> list | None:
     """Variable-length sparse gather, batched: one collective round for K parameters.
 
@@ -159,6 +160,7 @@ def gather_slot_entries_to_rank0(
                     val_concat[my_off[lo] : my_off[hi]],
                     sub_counts,
                     group=group,
+                    stats=stats,
                 )
                 if rank == 0:
                     out_all.extend(sub)
@@ -166,6 +168,16 @@ def gather_slot_entries_to_rank0(
 
     totals = [sum(c) for c in counts_cpu]
     max_n = max(totals) if totals else 0
+    # Record the imbalance directly instead of inferring it from timing. The
+    # padded gather's waste factor is max_n / mean(totals), so these are the
+    # numbers that decide whether padding costs anything at all -- balanced
+    # ranks pay nothing. counts_cpu is already here; this only reads it.
+    if stats is not None and totals:
+        stats["sum"] = stats.get("sum", 0) + sum(totals)
+        stats["max"] = stats.get("max", 0) + max_n
+        stats["padded"] = stats.get("padded", 0) + max_n * world
+        stats["nonzero_ranks"] = stats.get("nonzero_ranks", 0) + sum(1 for x in totals if x)
+        stats["rounds"] = stats.get("rounds", 0) + 1
     if max_n == 0:
         if rank != 0:
             return None
