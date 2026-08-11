@@ -1188,6 +1188,18 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # each one as soon as it fills (then frees it), so peak memory is ~2 buckets rather than the
         # whole model.
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
+        # Wall clock for the ENTIRE call. export_s + ship_s only cover the main
+        # consume loop, and on contrib2 they summed to 41.0/44.7 s against a
+        # timing_s/update_weights of 51.0/53.0 -- so 16-20% of the sync sat
+        # outside every span we had. That residual has two completely different
+        # causes with completely different fixes: work on this rank that no span
+        # covers, or time that is not on this rank at all (ray dispatch across
+        # 80 workers, or another rank straggling in the collective gather).
+        # total_s discriminates them in one number: if it lands near
+        # update_weights the residual is ours to find, and if it lands near
+        # export+ship the residual is outside this function entirely. Guessing
+        # between the two would have sent the next optimisation at the wrong half.
+        t_total0 = time.perf_counter()
         if not self._shard_seeded:
             # the BACKEND produces the seed in the rollout's exact format (with a
             # quant spec: codes + scale_inv off the raw master; without: bf16),
@@ -1202,9 +1214,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # the BACKEND owns delta production for every dtype: with a quant spec
         # it yields quant-domain entries (codes + scale grids diffed against
         # engine-held snapshots), without one the bf16 shard deltas.
-        weights, _ = engine.get_per_tensor_param_delta_shard(
-            quant_spec=self._fp8_spec(engine) if self.quantize_fp8 else None
-        )
+        _t = time.perf_counter()
+        _spec = self._fp8_spec(engine) if self.quantize_fp8 else None
+        t_spec = time.perf_counter() - _t
+        _t = time.perf_counter()
+        weights, _ = engine.get_per_tensor_param_delta_shard(quant_spec=_spec)
+        t_delta_open = time.perf_counter() - _t
         is_r0 = self.is_master
         n_flushes = 0
         changed_elems = 0
@@ -1430,7 +1445,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             )
         if not is_r0:
             return
+        _t = time.perf_counter()
         self._release_staging_pool("steady")  # return staging blocks to CUDA between syncs
+        t_release = time.perf_counter() - _t
         prof = getattr(engine, "_quant_profile", None)
         if prof is not None:
             logger.warning(
@@ -1464,6 +1481,13 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # ship  = gather + sort + encode + bucket + broadcast, scales with the delta.
             "checkpoint_engine/export_s": t_export,
             "checkpoint_engine/ship_s": t_ship,
+            # total_s - (export_s + ship_s + these) is what remains unexplained
+            # ON THIS RANK; total_s vs timing_s/update_weights is what remains
+            # outside this function. Keep both, they answer different questions.
+            "checkpoint_engine/total_s": time.perf_counter() - t_total0,
+            "checkpoint_engine/t_spec_s": t_spec,
+            "checkpoint_engine/t_delta_open_s": t_delta_open,
+            "checkpoint_engine/t_release_pool_s": t_release,
             "checkpoint_engine/gather_s": ship_t["gather"],
             "checkpoint_engine/encode_s": ship_t["consume"] - ship_t["publish"],
             "checkpoint_engine/publish_s": ship_t["publish"],
