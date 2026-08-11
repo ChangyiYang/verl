@@ -20,6 +20,7 @@ import gc
 import inspect
 import logging
 import os
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Any
@@ -728,6 +729,22 @@ def offload_megatron_model_to_cpu(models):
     get_torch_device().empty_cache()
 
 
+# Accumulated cost of bringing offloaded params back. Read and reset by the
+# caller that cares (the delta checkpoint engine reports it per sync); a plain
+# dict keeps this free when nobody looks. Timing only, no device sync -- the copy
+# is non_blocking, so "copy_enqueue" is the enqueue cost, NOT the transfer time.
+# Anyone reading these must not add them up and call it the total.
+_LOAD_TIMES = {"resize": 0.0, "copy_enqueue": 0.0, "buffers": 0, "bytes": 0}
+
+
+def take_load_times():
+    """Return the accumulated load costs and reset the counters."""
+    out = dict(_LOAD_TIMES)
+    for k in _LOAD_TIMES:
+        _LOAD_TIMES[k] = type(_LOAD_TIMES[k])()
+    return out
+
+
 @torch.no_grad()
 def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
     """
@@ -755,9 +772,23 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
                             buffer.grad_data.zero_()
 
                     if buffer.param_data.storage().size() == 0:
+                        # Split the two costs. On DSv4 this function is 6.7-7.3 s
+                        # of every delta weight sync (14%), and the two halves have
+                        # different fixes: resize_ re-allocates the whole shard
+                        # through the caching allocator every sync (fix: keep the
+                        # allocation alive across the offload), while the copy is
+                        # pinned-memory H2D (fix: overlap it, or do not offload).
+                        # cpu_data is already pinned, so "unpinned host memory" is
+                        # NOT the explanation -- that was checked, not assumed.
+                        _t = time.perf_counter()
                         buffer.param_data.storage().resize_(buffer.param_data_size)
+                        _LOAD_TIMES["resize"] += time.perf_counter() - _t
                         # copy data from cpu to cuda
+                        _t = time.perf_counter()
                         buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
+                        _LOAD_TIMES["copy_enqueue"] += time.perf_counter() - _t
+                        _LOAD_TIMES["buffers"] += 1
+                        _LOAD_TIMES["bytes"] += buffer.param_data.numel() * buffer.param_data.element_size()
 
             # Load frozen parameters that were offloaded (e.g. base model in LoRA/PEFT)
             if load_frozen_params:

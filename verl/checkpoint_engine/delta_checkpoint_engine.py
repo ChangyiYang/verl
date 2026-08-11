@@ -1282,6 +1282,18 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         _t = time.perf_counter()
         weights, _ = engine.get_per_tensor_param_delta_shard(quant_spec=_spec)
         t_delta_open = time.perf_counter() - _t
+        # t_delta_open is 14% of the sync and is essentially one call:
+        # load_megatron_model_to_gpu, bringing params back from the CPU offload
+        # that runs while the rollout has the GPU. Split it, because resize_
+        # (re-allocating the shard every sync) and the pinned H2D copy have
+        # different fixes. The generator itself is lazy, so nothing else here
+        # can account for the time.
+        try:
+            from verl.utils.megatron_utils import take_load_times
+
+            _lt = take_load_times()
+        except ImportError:
+            _lt = {}
         is_r0 = self.is_master
         n_flushes = 0
         changed_elems = 0
@@ -1570,6 +1582,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "checkpoint_engine/total_s": time.perf_counter() - t_total0,
             "checkpoint_engine/t_spec_s": t_spec,
             "checkpoint_engine/t_delta_open_s": t_delta_open,
+            # NOT additive with each other: copy_enqueue is enqueue cost for a
+            # non_blocking copy, not transfer time.
+            "checkpoint_engine/t_load_resize_s": _lt.get("resize", 0.0),
+            "checkpoint_engine/t_load_copy_enqueue_s": _lt.get("copy_enqueue", 0.0),
+            "checkpoint_engine/n_load_buffers": float(_lt.get("buffers", 0)),
+            "checkpoint_engine/load_gbytes": _lt.get("bytes", 0) / (1 << 30),
             "checkpoint_engine/t_release_pool_s": t_release,
             "checkpoint_engine/gather_s": ship_t["gather"],
             # NOT a phase: consume minus publish, where publish includes the
