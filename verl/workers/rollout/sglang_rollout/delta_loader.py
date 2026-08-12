@@ -204,6 +204,44 @@ def _check_quant_handshake(model: torch.nn.Module, spec: dict) -> None:
     model._delta_quant_handshake_done = True
 
 
+def _ladder_snapshot(model, stage: str) -> None:
+    """Hash the whole model and persist it, for the cross-run verification ladder.
+
+    The ladder anchors on the checkpoint and then compares one path at a time:
+      0. sglang's state after loading   vs the checkpoint files  (absolute anchor)
+      1. nccl full replay               vs stage 0              (nccl self-consistency)
+      2. the delta engine's seed        vs stage 1               (seed correctness)
+      3. after a steady delta           vs stage 2               (delta correctness)
+
+    Stages 1 and 2/3 CANNOT share a run: checkpoint_engine is constructed once from
+    config, and the two engines' send_weights signatures differ (nccl takes a
+    generator, delta takes an engine), so mode= cannot swap them. Hence hashes go to
+    DISK and are compared across runs -- 1547 tensors x 8 bytes is kilobytes, which
+    is exactly why this uses hashes rather than the 7 GB dense clones.
+
+    Comparison is on the ROLLOUT side on purpose: what matters is the weights sglang
+    actually holds, not the bytes the trainer believes it sent.
+    """
+    d = os.environ.get("VERL_DELTA_LADDER_DIR")
+    if not d:
+        return
+    try:
+        import json
+
+        os.makedirs(d, exist_ok=True)
+        h = _model_state_hashes(model)
+        rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+        backend = os.environ.get("VERL_DELTA_LADDER_TAG", "unknown")
+        n = _VERIFY_STATS.get("ladder_n", 0) + 1
+        _VERIFY_STATS["ladder_n"] = n
+        path = os.path.join(d, f"ladder_{backend}_{stage}{n}_rank{rank}.json")
+        with open(path, "w") as fh:
+            json.dump(h, fh)
+        logger.warning("DELTA-LADDER: wrote %d tensor hashes -> %s", len(h), path)
+    except OSError as e:
+        logger.warning("DELTA-LADDER: could not write %s stage: %s", stage, e)
+
+
 def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
     """Decode one sparse delta flush and masked-apply it onto ``model`` in place."""
     from verl.checkpoint_engine.delta_sync.encode import checksum as _checksum
