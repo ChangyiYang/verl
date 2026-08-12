@@ -248,6 +248,22 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
 
     tensors = dict(named_tensors)
     spec = json.loads(bytes(tensors["__delta_spec__"].cpu().numpy().tobytes()).decode())
+    if spec.get("hash_only"):
+        # A zero-payload update whose only purpose is to run code inside SGLang's
+        # process. The weights we need to hash live in SGLang's TP workers, and the
+        # custom loader is the only entry point that gets handed the model object --
+        # but that entry point is reached only by the delta path, so the nccl full
+        # sync would otherwise be invisible to the ladder.
+        #
+        # Sending an empty update instead of hooking the sync path is deliberate: a
+        # verification tool must not modify what it verifies. The selfcheck already
+        # showed the cost of ignoring that, by pushing update_weights past SGLang's
+        # watchdog and killing the very system under test.
+        #
+        # Returns BEFORE the checksum check on purpose: there are no positions and
+        # no values to checksum, and demanding one would mean fabricating a payload.
+        _ladder_snapshot(model, str(spec.get("stage", "x")))
+        return
     values = tensors["__values__"]
     positions = tensors.get("__positions__")
     if positions is None:  # values-only flush (the seed) carries no positions
