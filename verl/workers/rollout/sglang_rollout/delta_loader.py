@@ -363,7 +363,16 @@ def _model_state_hashes(model) -> dict:
         if t is None or not t.numel():
             continue
         names.append(name)
-        hs.append(torch.hash_tensor(t.detach()).reshape(()))
+        # Bitcast to uint8 before hashing. torch.hash_tensor is an xor-reduce and
+        # has no kernel for the fp8 dtypes -- "xor_sum_cuda not implemented for
+        # Float8_e4m3fn" -- which is most of this model. Viewing as bytes also
+        # makes the hash dtype-agnostic, which is what we want: we are asking
+        # whether the BITS changed, not whether the values compare equal (fp8 and
+        # bf16 payloads contain NaN, and nan != nan would hide a real change).
+        tt = t.detach()
+        if not tt.is_contiguous():
+            tt = tt.contiguous()
+        hs.append(torch.hash_tensor(tt.view(torch.uint8)).reshape(()))
     if not hs:
         return {}
     vals = torch.stack(hs).tolist()

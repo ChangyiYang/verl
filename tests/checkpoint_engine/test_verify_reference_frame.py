@@ -20,12 +20,20 @@ from verl.workers.rollout.sglang_rollout.delta_loader import _VERIFY_STATS, _mod
 
 
 class FakeModel(torch.nn.Module):
-    """Model whose post_load_weights recomputes a derived tensor, like sglang's."""
+    """Model whose post_load_weights recomputes a derived tensor, like sglang's.
+
+    Carries an fp8 buffer on purpose. The first version of these tests used only
+    float32 and passed, while the real run died with
+    ``NotImplementedError: "xor_sum_cuda" not implemented for 'Float8_e4m3fn'`` --
+    the model is mostly fp8, which is the entire point of this project. A fixture
+    whose dtypes do not match the system under test is not a test.
+    """
 
     def __init__(self, recompute=True, drift=False):
         super().__init__()
         self.w = torch.nn.Parameter(torch.arange(16, dtype=torch.float32), requires_grad=False)
         self.register_buffer("w_scale_inv", torch.zeros(4))
+        self.register_buffer("codes", torch.arange(8, dtype=torch.uint8).view(torch.float8_e4m3fn))
         self.recompute = recompute
         self.drift = drift
         self._calls = 0
@@ -100,3 +108,30 @@ def test_a_real_weight_change_is_caught():
         m.w[0] = 999.0
     after = _model_state_hashes(m)
     assert [k for k in before if before[k] != after[k]] == ["w"]
+
+
+def test_fp8_tensors_can_be_hashed():
+    """The regression that cost a 45-minute run: hash_tensor has no fp8 kernel."""
+    m = FakeModel()
+    h = _model_state_hashes(m)
+    assert "codes" in h, "an fp8 buffer must be hashable, not skipped"
+
+
+def test_fp8_change_is_detected():
+    m = FakeModel()
+    before = _model_state_hashes(m)
+    with torch.no_grad():
+        m.codes.view(torch.uint8)[2] = 77
+    after = _model_state_hashes(m)
+    assert before["codes"] != after["codes"]
+
+
+def test_non_contiguous_tensor_is_hashable():
+    """A transposed / sliced view would raise on .view(uint8) without the guard."""
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("t", torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).t())
+
+    assert "t" in _model_state_hashes(M())
