@@ -52,3 +52,33 @@ frame 0 的 4.9s 是 warmup。⇒ Phase 1「吞吐 ≥ 实时」验收项**通�
 frame 3 在 `P(listen)=0.5927` 的情况下仍选择了 SPEAK —— 说明策略是真随机采样，
 而非确定性 argmax。这正是 RL 需要的探索性。
 （同一条音频两次运行的打断位置与措辞不同，属预期方差。）
+
+---
+
+# train_equiv_probe —— 训练前向能否复现 rollout 前向
+
+PPO/GRPO 要求初始 `new_logprob == old_logprob`（ratio ≡ 1）。
+rollout 走**流式**路径（逐帧 prefill/generate + KV cache），训练要走**整段批量 teacher-forced 前向**。
+本探针录下 rollout 期间每次 `StreamDecoder.feed` 的 embeds，拼成完整序列后**一次性**重放，
+再逐决策点比对 logits。
+
+| dtype | 决策点 | argmax 一致 | logits 最大绝对差 | log P(listen) 最大差 | 判定 |
+|---|---|---|---|---|---|
+| bfloat16 | 29 | **29/29** | 1.000000 | 0.187498 | ❌ |
+| **float32** | 31 | **31/31** | **0.000210** | **0.000046** | ✅ **等价** |
+
+## 结论
+两条路径**数学上等价**；bf16 下的差异纯粹是数值精度（argmax 始终一致即为佐证）。
+⇒ **训练侧可用「录 embeds → 单次批量前向」重算 logprob**，不必用流式路径带梯度重放。
+
+## 但 bf16 的差异在工程上不能忽略
+bf16 下 `log P(listen)` 偏差可达 0.19 ⇒ ratio ≈ e^0.19 ≈ **1.21**，第 0 步就偏离 1 达 21%。
+**解法正是 verl 现成的做法**：verl 不直接采信 rollout 的 logprob，而是用 actor 的训练前向
+重算 `old_log_probs`（`ray_trainer.py:1306/1333/1347` 的 `compute_log_prob`；:1631 亦注明
+"Decoupled mode: Recomputes old_log_probs as proximal anchor"）。
+只要我们的 `compute_log_prob` 与训练走同一条批量前向，ratio 在第 0 步严格为 1，与 rollout 精度无关。
+
+## ⚠️ 本测试未覆盖的一点
+重放用的是**录下来的 embeds**，因此验证的是 **LLM 主干**的流式↔批量等价性，
+**未验证音频编码器**在「流式分块编码」与「整段编码」下是否一致。
+若训练侧打算**重新计算**音频 embeds（而非复用录下的），需另做一次等价性检查。

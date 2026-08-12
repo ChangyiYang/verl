@@ -1,0 +1,300 @@
+{
+  "n_decisions": 29,
+  "argmax_same": 29,
+  "max_abs_logit_diff": 1.0,
+  "max_logp_pair_diff": 0.1874980926513672,
+  "seq_len": 157,
+  "equivalent": false,
+  "rows": [
+    {
+      "k": 0,
+      "pos": 18,
+      "sampled_id": 151705,
+      "max_abs_logit_diff": 0.5,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.0007557396893389523,
+      "logp_listen_replay": -0.0008044583373703063,
+      "logp_pair_absdiff": 0.06245136260986328
+    },
+    {
+      "k": 1,
+      "pos": 31,
+      "sampled_id": 151705,
+      "max_abs_logit_diff": 0.625,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.0002165798214264214,
+      "logp_listen_replay": -0.00020990552729927003,
+      "logp_pair_absdiff": 0.031243324279785156
+    },
+    {
+      "k": 2,
+      "pos": 44,
+      "sampled_id": 151705,
+      "max_abs_logit_diff": 0.375,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.0006073061376810074,
+      "logp_listen_replay": -0.0005359405768103898,
+      "logp_pair_absdiff": 0.12492847442626953
+    },
+    {
+      "k": 3,
+      "pos": 57,
+      "sampled_id": 151706,
+      "max_abs_logit_diff": 0.375,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.5231232047080994,
+      "logp_listen_replay": -0.5490548014640808,
+      "logp_pair_absdiff": 0.036568403244018555
+    },
+    {
+      "k": 4,
+      "pos": 58,
+      "sampled_id": 1446,
+      "max_abs_logit_diff": 0.625,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.5359705686569214,
+      "logp_listen_replay": -0.5424829721450806,
+      "logp_pair_absdiff": 0.00911259651184082
+    },
+    {
+      "k": 5,
+      "pos": 59,
+      "sampled_id": 646,
+      "max_abs_logit_diff": 0.375,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.5759393572807312,
+      "logp_listen_replay": -0.5759393572807312,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 6,
+      "pos": 60,
+      "sampled_id": 22899,
+      "max_abs_logit_diff": 0.25,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.5231232047080994,
+      "logp_listen_replay": -0.5231232047080994,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 7,
+      "pos": 61,
+      "sampled_id": 264,
+      "max_abs_logit_diff": 0.25,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.45093727111816406,
+      "logp_listen_replay": -0.42870065569877625,
+      "logp_pair_absdiff": 0.04026341438293457
+    },
+    {
+      "k": 8,
+      "pos": 62,
+      "sampled_id": 63742,
+      "max_abs_logit_diff": 0.3125,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.34844455122947693,
+      "logp_listen_replay": -0.34844455122947693,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 9,
+      "pos": 63,
+      "sampled_id": 3751,
+      "max_abs_logit_diff": 0.203125,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.5490548014640808,
+      "logp_listen_replay": -0.5490548014640808,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 10,
+      "pos": 64,
+      "sampled_id": 517,
+      "max_abs_logit_diff": 0.25,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.38687101006507874,
+      "logp_listen_replay": -0.38687101006507874,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 11,
+      "pos": 65,
+      "sampled_id": 13,
+      "max_abs_logit_diff": 0.1875,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.28115013241767883,
+      "logp_listen_replay": -0.28115013241767883,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 12,
+      "pos": 66,
+      "sampled_id": 151718,
+      "max_abs_logit_diff": 0.28125,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.2131100296974182,
+      "logp_listen_replay": -0.2131100296974182,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 13,
+      "pos": 79,
+      "sampled_id": 151706,
+      "max_abs_logit_diff": 1.0,
+      "argmax_same": true,
+      "logp_listen_rollout": -6.563911437988281,
+      "logp_listen_replay": -6.563911437988281,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 14,
+      "pos": 80,
+      "sampled_id": 151717,
+      "max_abs_logit_diff": 0.25,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.407351016998291,
+      "logp_listen_replay": -0.407351016998291,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 15,
+      "pos": 81,
+      "sampled_id": 151718,
+      "max_abs_logit_diff": 0.75,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.5490548014640808,
+      "logp_listen_replay": -0.5359705686569214,
+      "logp_pair_absdiff": 0.018165767192840576
+    },
+    {
+      "k": 16,
+      "pos": 94,
+      "sampled_id": 151705,
+      "max_abs_logit_diff": 0.625,
+      "argmax_same": true,
+      "logp_listen_rollout": -3.647738049039617e-05,
+      "logp_listen_replay": -3.886147169396281e-05,
+      "logp_pair_absdiff": 0.06249713897705078
+    },
+    {
+      "k": 17,
+      "pos": 107,
+      "sampled_id": 151705,
+      "max_abs_logit_diff": 0.5,
+      "argmax_same": true,
+      "logp_listen_rollout": -9.762764966581017e-05,
+      "logp_listen_replay": -9.762764966581017e-05,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 18,
+      "pos": 120,
+      "sampled_id": 151705,
+      "max_abs_logit_diff": 0.625,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.003278478281572461,
+      "logp_listen_replay": -0.0031777145341038704,
+      "logp_pair_absdiff": 0.03114938735961914
+    },
+    {
+      "k": 19,
+      "pos": 133,
+      "sampled_id": 151706,
+      "max_abs_logit_diff": 0.5,
+      "argmax_same": true,
+      "logp_listen_rollout": -1.4536898136138916,
+      "logp_listen_replay": -1.4536898136138916,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 20,
+      "pos": 134,
+      "sampled_id": 44523,
+      "max_abs_logit_diff": 0.625,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.6623853445053101,
+      "logp_listen_replay": -0.6699843406677246,
+      "logp_pair_absdiff": 0.00802600383758545
+    },
+    {
+      "k": 21,
+      "pos": 135,
+      "sampled_id": 3940,
+      "max_abs_logit_diff": 0.5,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.8981232047080994,
+      "logp_listen_replay": -0.8259393572807312,
+      "logp_pair_absdiff": 0.07218384742736816
+    },
+    {
+      "k": 22,
+      "pos": 136,
+      "sampled_id": 151718,
+      "max_abs_logit_diff": 0.25,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.6931471824645996,
+      "logp_listen_replay": -0.6325989961624146,
+      "logp_pair_absdiff": 0.06445181369781494
+    },
+    {
+      "k": 23,
+      "pos": 149,
+      "sampled_id": 151706,
+      "max_abs_logit_diff": 0.875,
+      "argmax_same": true,
+      "logp_listen_rollout": -11.18751335144043,
+      "logp_listen_replay": -11.375011444091797,
+      "logp_pair_absdiff": 0.1874980926513672
+    },
+    {
+      "k": 24,
+      "pos": 150,
+      "sampled_id": 374,
+      "max_abs_logit_diff": 0.1875,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.7088942527770996,
+      "logp_listen_replay": -0.6931471824645996,
+      "logp_pair_absdiff": 0.0157470703125
+    },
+    {
+      "k": 25,
+      "pos": 151,
+      "sampled_id": 11406,
+      "max_abs_logit_diff": 0.1875,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.45093727111816406,
+      "logp_listen_replay": -0.4740769863128662,
+      "logp_pair_absdiff": 0.03936028480529785
+    },
+    {
+      "k": 26,
+      "pos": 152,
+      "sampled_id": 13,
+      "max_abs_logit_diff": 0.5,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.42870065569877625,
+      "logp_listen_replay": -0.42870065569877625,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 27,
+      "pos": 153,
+      "sampled_id": 358,
+      "max_abs_logit_diff": 0.25,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.4740769863128662,
+      "logp_listen_replay": -0.4740769863128662,
+      "logp_pair_absdiff": 0.0
+    },
+    {
+      "k": 28,
+      "pos": 154,
+      "sampled_id": 151718,
+      "max_abs_logit_diff": 0.25,
+      "argmax_same": true,
+      "logp_listen_rollout": -0.8259393572807312,
+      "logp_listen_replay": -0.8259393572807312,
+      "logp_pair_absdiff": 0.0
+    }
+  ]
+}
