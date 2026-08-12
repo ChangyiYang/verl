@@ -485,6 +485,25 @@ def _verify_dense(
     st["params"] = 0
 
     changed = [k for k in base if k in after and base[k] != after[k]]
+    # Dump the FULL per-rank list, not the first 12. Each rank reports a
+    # different count (39/52/54/44/50/46/55/46) and a different set, which is the
+    # opposite of a uniform encoding bug -- those make every rank report the same
+    # names. Intersecting the eight lists separates the two live hypotheses:
+    # an empty intersection means each rank only fails on shards it owns
+    # (shard/replica ownership), a large one means specific params are broken and
+    # ranks merely detect them to differing degrees. Top-12 cannot show either.
+    try:
+        import json as _json
+        import os as _os
+
+        _d = _os.environ.get("VERL_DELTA_VERIFY_DUMP")
+        if _d and changed:
+            _os.makedirs(_d, exist_ok=True)
+            _r = int(_os.environ.get("RANK", _os.environ.get("LOCAL_RANK", "0")))
+            with open(_os.path.join(_d, f"changed_rank{_r}.json"), "w") as fh:
+                _json.dump(sorted(changed), fh, indent=0)
+    except OSError as e:
+        logger.warning("could not write the verify changed-list: %s", e)
     missing = sorted(set(base) - set(after))
     logger.warning(
         "DELTA-VERIFY sweep: params=%d tensors=%d changed=%d missing=%d first=%s",

@@ -1335,6 +1335,14 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         ph = self._phase = _Phase()
         stager = _FusionStager()
         nonlocal_missed: list[str] = []
+        # Names that actually made it onto the wire this sync. The verify sweep
+        # reports 39-55 mismatched .weight tensors with a DIFFERENT set per rank,
+        # and the leading hypothesis is that a delta for those shards was never
+        # sent at all -- replica dedup (contributes) excluding a rank that owns
+        # data would look exactly like this. Comparing this set against the
+        # sweep's mismatch list settles it: if the mismatched params are absent
+        # here, they were dropped on the sender, not corrupted on the wire.
+        sent_names = set() if os.environ.get("VERL_DELTA_SENT_DUMP") else None
         # Sampled encoded wire pieces, when the sender-side self-check is on.
         # None (the default) makes the hook in _bucket_slot_delta a single
         # identity test per piece, so an off self-check costs nothing measurable.
@@ -1429,6 +1437,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 if e_idx is None or (e_idx.numel() == 0 and not is_group):
                     continue  # unchanged and not fused -- drop it, as before
                 changed_elems += int(e_idx.numel())
+                if sent_names is not None:
+                    sent_names.add(e_name)
                 # payload_mbytes reads the per-piece byte counts _slice_pieces
                 # already computed, rather than re-encoding to ask the width.
                 # Hardcoding 4 here made the metric report 5 B/element after the
@@ -1566,6 +1576,14 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # Dump the raw per-round x per-rank matrix when asked. 218 rounds x 16
         # ranks is a few thousand integers -- small enough to keep whole, and an
         # aggregate cannot answer "is it always the same rank".
+        _sd = os.environ.get("VERL_DELTA_SENT_DUMP")
+        if _sd and sent_names is not None:
+            try:
+                os.makedirs(os.path.dirname(_sd) or ".", exist_ok=True)
+                with open(_sd, "a") as fh:
+                    fh.write(json.dumps({"step": global_steps, "sent": sorted(sent_names)}) + "\n")
+            except OSError as e:
+                logger.warning("could not write the sent-name dump: %s", e)
         _dump = os.environ.get("VERL_DELTA_GATHER_DUMP")
         if _dump and is_r0 and _imb.get("rows"):
             try:
