@@ -262,7 +262,12 @@ class SGLangHttpServer:
         # load_format resolves inside the TP workers.
         custom_weight_loader = list(engine_kwargs.pop("custom_weight_loader", None) or [])
         ce_backend = str((self.config.get("checkpoint_engine", None) or {}).get("backend", ""))
-        if ce_backend == "delta_sharded":
+        # The ladder probe posts hash_only updates with load_format=LOADER_FQN on EVERY
+        # backend, and sglang rejects any load_format not present in
+        # server_args.custom_weight_loader ("Unknown load_format") -- which killed the
+        # first nccl ladder run at its very first probe. The feature that needs the
+        # loader must be the thing that registers it.
+        if ce_backend == "delta_sharded" or os.environ.get("VERL_DELTA_LADDER_DIR"):
             from verl.workers.rollout.sglang_rollout.delta_loader import LOADER_FQN
 
             if LOADER_FQN not in custom_weight_loader:
