@@ -346,35 +346,50 @@ def _quiet_uninit_warning():
 def _model_state_hashes(model) -> dict:
     """One hash per parameter/buffer, with a SINGLE device sync for all of them.
 
-    torch.hash_tensor is the same XOR-reduce the wire checksum uses. Hashes
-    rather than clones because the alternative is a full copy of the server's
-    shard (GBs) held across the whole sweep, and an OOM here costs a 45-minute
-    run. The tradeoff is that we learn WHICH tensor changed but not how many of
-    its elements did -- the tensor identity is the actionable half.
+    Hashes rather than clones because a full copy of the server's shard held
+    across the sweep is GBs, and an OOM costs a 45-minute run. We learn WHICH
+    tensor changed but not how many of its elements did; the identity is the
+    actionable half.
 
-    The .item() calls are batched into one stack().tolist(): per-tensor .item()
-    would be ~100k device syncs, which is the same mistake that made the verify
-    sweep unrunnable in the first place.
+    Every tensor is normalised to contiguous 1-D bytes before hashing, because
+    two separate runs died here on shape/dtype edges rather than on anything to
+    do with the delta:
+      * torch.hash_tensor is an xor-reduce with no fp8 kernel
+        ("xor_sum_cuda not implemented for Float8_e4m3fn"), and this model is
+        mostly fp8 -> bitcast to uint8;
+      * a 0-dim scalar cannot be viewed as a different element size
+        ("self.dim() cannot be 0 to view Float as Byte") -> reshape(-1) first.
+    Byte-level hashing is also what we want semantically: the question is whether
+    the BITS changed, and fp8/bf16 payloads contain NaN, where a value compare
+    would silently answer "equal".
+
+    Anything that still refuses to hash is RECORDED AND REPORTED, not skipped
+    silently and not raised: a third dead run to discover a fourth edge case is a
+    bad trade, but quietly dropping tensors would weaken the very check this is.
     """
     import itertools
 
-    names, hs = [], []
+    names, hs, unhashable = [], [], []
     for name, t in itertools.chain(model.named_parameters(), model.named_buffers()):
         if t is None or not t.numel():
             continue
-        names.append(name)
-        # Bitcast to uint8 before hashing. torch.hash_tensor is an xor-reduce and
-        # has no kernel for the fp8 dtypes -- "xor_sum_cuda not implemented for
-        # Float8_e4m3fn" -- which is most of this model. Viewing as bytes also
-        # makes the hash dtype-agnostic, which is what we want: we are asking
-        # whether the BITS changed, not whether the values compare equal (fp8 and
-        # bf16 payloads contain NaN, and nan != nan would hide a real change).
-        tt = t.detach()
-        if not tt.is_contiguous():
-            tt = tt.contiguous()
-        hs.append(torch.hash_tensor(tt.view(torch.uint8)).reshape(()))
+        try:
+            flat = t.detach().contiguous().reshape(-1).view(torch.uint8)
+            hs.append(torch.hash_tensor(flat).reshape(()))
+            names.append(name)
+        except Exception as e:  # noqa: BLE001 - the point is to survive and report
+            unhashable.append(f"{name}({type(t).__name__},{t.dtype},{tuple(t.shape)}): {e}")
+    if unhashable:
+        logger.warning(
+            "DELTA-VERIFY: %d tensor(s) could not be hashed and are NOT covered by this "
+            "sweep; first: %s",
+            len(unhashable),
+            unhashable[:5],
+        )
     if not hs:
         return {}
+    # One sync for all of them: per-tensor .item() would be ~100k device syncs,
+    # the same mistake that made this sweep unrunnable in the first place.
     vals = torch.stack(hs).tolist()
     return dict(zip(names, vals, strict=True))
 

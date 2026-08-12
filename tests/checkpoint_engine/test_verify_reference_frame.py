@@ -135,3 +135,68 @@ def test_non_contiguous_tensor_is_hashable():
             self.register_buffer("t", torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).t())
 
     assert "t" in _model_state_hashes(M())
+
+
+# --- the shape/dtype zoo -------------------------------------------------------
+# Two runs died here, on fp8 and then on a 0-dim scalar. Guessing which awkward
+# cases exist has now failed twice, so this fixture carries every combination the
+# real model can present and asserts the hash survives ALL of them.
+
+
+class ZooModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("scalar", torch.tensor(3.0))                       # 0-dim
+        self.register_buffer("scalar_int", torch.tensor(7, dtype=torch.int64))  # 0-dim int
+        self.register_buffer("fp8", torch.arange(8, dtype=torch.uint8).view(torch.float8_e4m3fn))
+        self.register_buffer("bf16", torch.arange(6, dtype=torch.bfloat16))
+        self.register_buffer("u8", torch.arange(5, dtype=torch.uint8))
+        self.register_buffer("transposed", torch.arange(12, dtype=torch.float32).reshape(3, 4).t())
+        self.register_buffer("empty", torch.zeros(0))
+        self.register_buffer("nan", torch.tensor([float("nan"), 1.0]))
+        self.w = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+
+def test_every_shape_and_dtype_hashes():
+    h = _model_state_hashes(ZooModel())
+    for k in ("scalar", "scalar_int", "fp8", "bf16", "u8", "transposed", "nan", "w"):
+        assert k in h, f"{k} was not hashed -- it would be invisible to the sweep"
+    assert "empty" not in h, "empty tensors carry no state and are skipped by design"
+
+
+def test_zero_dim_change_is_detected():
+    """The exact shape that killed run 3."""
+    m = ZooModel()
+    before = _model_state_hashes(m)
+    with torch.no_grad():
+        m.scalar.fill_(4.0)
+    assert _model_state_hashes(m)["scalar"] != before["scalar"]
+
+
+def test_nan_payload_change_is_detected():
+    """Byte comparison, not value comparison: nan != nan must not mask a change."""
+    m = ZooModel()
+    before = _model_state_hashes(m)
+    with torch.no_grad():
+        m.nan[1] = 2.0
+    assert _model_state_hashes(m)["nan"] != before["nan"]
+
+
+def test_an_unhashable_tensor_is_reported_not_fatal(caplog, monkeypatch):
+    """A fourth edge case must not cost another 45-minute run -- but it must be
+    reported, because silently dropping tensors would weaken the sweep."""
+    import verl.workers.rollout.sglang_rollout.delta_loader as dl
+
+    real = torch.hash_tensor
+
+    def boom(t):
+        if t.numel() == 5:  # the u8 buffer
+            raise RuntimeError("synthetic hashing failure")
+        return real(t)
+
+    monkeypatch.setattr(dl.torch, "hash_tensor", boom)
+    with caplog.at_level("WARNING"):
+        h = dl._model_state_hashes(ZooModel())
+    assert "u8" not in h
+    assert "bf16" in h, "one bad tensor must not abort the rest"
+    assert any("could not be hashed" in r.getMessage() for r in caplog.records)
