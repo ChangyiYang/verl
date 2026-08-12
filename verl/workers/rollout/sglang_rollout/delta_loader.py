@@ -421,10 +421,32 @@ def _verify_dense(
     """
     st = _VERIFY_STATS
     if "baseline" not in st:
-        # Finish the steady sync's semantics before snapshotting, or the baseline
+        # Settle the steady sync's semantics before snapshotting, or the baseline
         # would be a state the server never actually serves from.
+        #
+        # While we are here, answer a question the sweep itself depends on: is
+        # post_load_weights IDEMPOTENT? It does dequant/requant work ("Skip
+        # dequant fp8 wo_a" in the logs), and this sweep calls it twice, so if
+        # requant is lossy the weights drift on their own and every "mismatch"
+        # this sweep reports could be that drift rather than the delta. Calling
+        # it a second time and diffing costs one extra pass and settles it --
+        # without involving the delta, the trainer, or a training step at all.
+        h_pre = _model_state_hashes(model)
         _post_load(model)
-        st["baseline"] = _model_state_hashes(model)
+        h1 = _model_state_hashes(model)
+        _post_load(model)
+        h2 = _model_state_hashes(model)
+        moved_1 = [k for k in h_pre if h_pre.get(k) != h1.get(k)]
+        moved_2 = [k for k in h1 if h1.get(k) != h2.get(k)]
+        logger.warning(
+            "DELTA-VERIFY post_load idempotence: pre->1st changed=%d | 1st->2nd changed=%d "
+            "(nonzero on the SECOND means post_load_weights is not idempotent, so the sweep's "
+            "own premise is broken and its mismatches are drift, not delta) first_2nd=%s",
+            len(moved_1),
+            len(moved_2),
+            sorted(moved_2)[:12],
+        )
+        st["baseline"] = h2
 
     _quiet = _quiet_uninit_warning()
     _quiet.__enter__()
