@@ -133,6 +133,68 @@ class QuantSpec:
     # The checkpoint's scale dialect, from its quantization_config. DSv4 ships
     # "ue8m0" and sglang's loader requires it; None keeps the plain fp32 grid.
     scale_fmt: str | None = None
+    # weight name -> the checkpoint's own scale grid (fp32, CPU). When present,
+    # quantization is STICKY: a block keeps the checkpoint's scale as long as
+    # its amax still fits under it, and only bumps to the tightest covering
+    # power when the weights genuinely outgrew it. The checkpoint's scales
+    # carry headroom on ~2% of blocks, and that headroom is unrecoverable from
+    # the dequantized master -- recomputing from amax alone necessarily
+    # tightens those blocks and changes their bytes (B6's residual 620).
+    ckpt_scales: object | None = None  # dict[str, torch.Tensor] | None
+
+
+def sticky_ue8m0_descale(amax: torch.Tensor, ckpt_scale: torch.Tensor | None) -> torch.Tensor:
+    """ue8m0 descale that PREFERS the checkpoint's scale wherever it still covers.
+
+    A block's original scale is valid for any amax <= scale * FP8_MAX; keeping
+    it makes unchanged weights reproduce the checkpoint's bytes exactly, which
+    is what lets seed == disk AND keeps the steady verify quiet on blocks that
+    never trained. Only blocks whose weights outgrew the old scale move -- to
+    the tightest covering power, same dialect.
+    """
+    tight = ue8m0_descale(amax)
+    if ckpt_scale is None:
+        return tight
+    assert ckpt_scale.shape == amax.shape, (
+        f"ckpt scale grid {tuple(ckpt_scale.shape)} does not match the absmax grid "
+        f"{tuple(amax.shape)}: the lookup matched the wrong tensor, refusing to guess"
+    )
+    ckpt_scale = ckpt_scale.to(amax.device)
+    return torch.where(amax <= ckpt_scale * FP8_MAX, ckpt_scale, tight)
+
+
+_CKPT_SCALES_CACHE: dict = {}
+
+
+def load_ckpt_scales(ckpt_path: str) -> dict:
+    """Read every ``<stem>.scale`` tensor from the checkpoint, keyed by the
+    WEIGHT's name (``<stem>.weight``) for direct lookup at quantize time.
+
+    Scales are ~1/16384 of the weights (a few MB for DSv4's 34,213 grids), so
+    this loads once per process and stays on CPU. safetensors reads only the
+    requested tensors, not the shards.
+    """
+    got = _CKPT_SCALES_CACHE.get(ckpt_path)
+    if got is not None:
+        return got
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    idx = json.load(open(os.path.join(ckpt_path, "model.safetensors.index.json")))
+    wm = idx["weight_map"]
+    by_file: dict[str, list[str]] = {}
+    for n, f in wm.items():
+        if n.endswith(".scale"):
+            by_file.setdefault(f, []).append(n)
+    out: dict = {}
+    for f, names in by_file.items():
+        with safe_open(os.path.join(ckpt_path, f), framework="pt", device="cpu") as fh:
+            for n in names:
+                out[n[: -len(".scale")] + ".weight"] = fh.get_tensor(n).float()
+    _CKPT_SCALES_CACHE[ckpt_path] = out
+    return out
 
 
 def ue8m0_descale(amax: torch.Tensor) -> torch.Tensor:
@@ -164,7 +226,8 @@ def quantize_hf_stream(weights, spec: QuantSpec):
         t = t.to(torch.bfloat16)
         grid = local_blockwise_absmax(t, block, 0, tuple(t.shape))
         if getattr(spec, "scale_fmt", None) == "ue8m0":
-            descale = ue8m0_descale(grid)
+            ck = getattr(spec, "ckpt_scales", None)
+            descale = sticky_ue8m0_descale(grid, ck.get(name) if ck else None)
         else:
             descale = grid.clamp_(min=_ABSMAX_EPS) / FP8_MAX
         codes = quantize_shard_with_descale(t, descale, block, 0)

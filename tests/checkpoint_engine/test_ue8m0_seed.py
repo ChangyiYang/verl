@@ -78,6 +78,77 @@ def test_ue8m0_round_trip_is_bit_exact():
     ), "fp8 codes must survive the round trip"
 
 
+def test_sticky_descale_keeps_ckpt_headroom_and_bumps_overflow():
+    from verl.utils.fp8_sharded import sticky_ue8m0_descale
+
+    amax = torch.tensor([[100.0, 100.0], [1000.0, 100.0]])
+    # ckpt scale 1.0 covers amax<=448; block (1,0) outgrew it
+    ck = torch.ones(2, 2)
+    d = sticky_ue8m0_descale(amax, ck)
+    assert d[0, 0] == 1.0 and d[0, 1] == 1.0 and d[1, 1] == 1.0, "covered blocks must keep the ckpt scale"
+    assert d[1, 0] == 4.0, f"outgrown block must bump to the tightest covering power, got {d[1,0]}"
+
+
+def test_sticky_descale_shape_mismatch_fails_loud():
+    import pytest
+
+    from verl.utils.fp8_sharded import sticky_ue8m0_descale
+
+    with pytest.raises(AssertionError):
+        sticky_ue8m0_descale(torch.ones(2, 2), torch.ones(2, 3))
+
+
+def test_headroom_round_trip_is_bit_exact_with_ckpt_scales():
+    """The exact failure B6 left behind: a checkpoint whose scale carries
+    headroom (max code <= FP8_MAX/2). Recomputing from amax tightens the scale
+    and rewrites the bytes; with the ckpt's scales in the spec they must come
+    back identical."""
+    from verl.utils.fp8_sharded import quantize_shard_with_descale
+
+    torch.manual_seed(7)
+    # build a "checkpoint": quantize with a DELIBERATELY loose power-of-two scale
+    w = torch.randn(128, 128, dtype=torch.bfloat16) * 10
+    loose = torch.tensor([[1.0]])  # amax ~60 << 448 -> tight would be 0.25
+    ck_codes = quantize_shard_with_descale(w, loose, [128, 128], 0)
+    # trainer sees the dequantized master
+    master = (ck_codes.float() * loose).to(torch.bfloat16)
+
+    spec_no_ck = _spec("ue8m0")
+    out = _stream(spec_no_ck, master)
+    assert not torch.equal(out["x.weight_scale_inv"], loose), "sanity: without ckpt scales the scale tightens"
+
+    spec_ck = QuantSpec(
+        weight_block_size=(128, 128),
+        should_quantize=lambda n: n.endswith(".weight"),
+        scale_fmt="ue8m0",
+        ckpt_scales={"x.weight": loose},
+    )
+    out2 = _stream(spec_ck, master)
+    assert torch.equal(out2["x.weight_scale_inv"], loose), "scale must come back identical"
+    assert torch.equal(
+        out2["x.weight"].view(torch.uint8), ck_codes.view(torch.uint8)
+    ), "codes must come back identical"
+
+
+def test_load_ckpt_scales_keys_by_weight_name(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    from verl.utils.fp8_sharded import load_ckpt_scales
+
+    save_file(
+        {"a.weight": torch.zeros(4, 4, dtype=torch.bfloat16), "a.scale": torch.full((1, 1), 2.0)},
+        tmp_path / "model-00001-of-00001.safetensors",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a.weight": "model-00001-of-00001.safetensors",
+                                   "a.scale": "model-00001-of-00001.safetensors"}})
+    )
+    scales = load_ckpt_scales(str(tmp_path))
+    assert set(scales) == {"a.weight"} and scales["a.weight"].item() == 2.0
+
+
 def test_build_config_preserves_scale_fmt():
     cfg = build_sglang_fp8_quant_config({"quantization_config": {"weight_block_size": [128, 128], "scale_fmt": "ue8m0"}})
     assert cfg.get("scale_fmt") == "ue8m0", f"scale_fmt dropped again: {cfg}"

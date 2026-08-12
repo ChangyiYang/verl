@@ -153,6 +153,7 @@ class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
         idx = json.load(open(os.path.join(ckpt_path, "model.safetensors.index.json")))
         names = set(idx["weight_map"])
         self._quantized = {n for n in names if n.endswith(".weight") and n[: -len(".weight")] + ".scale" in names}
+        self._ckpt_path = ckpt_path
 
     def should_quantize_param(self, param_name):
         return param_name in self._quantized
@@ -160,7 +161,12 @@ class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
     async def quant_weights_by_name(self, weights, dtype=None):
         import torch
 
-        from verl.utils.fp8_sharded import local_blockwise_absmax, quantize_shard_with_descale
+        from verl.utils.fp8_sharded import (
+            load_ckpt_scales,
+            local_blockwise_absmax,
+            quantize_shard_with_descale,
+            sticky_ue8m0_descale,
+        )
         # NOTE: this import is inside an async generator, so a wrong path here
         # only explodes at the first weight of the first sync -- which is exactly
         # how the cherry-picked "verl.utils.sglang.utils" path killed the first
@@ -169,17 +175,17 @@ class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
 
         bm_bn = self.quant_config.get("weight_block_size") if isinstance(self.quant_config, dict) else None
         bm_bn = tuple(bm_bn or (128, 128))
-        FP8_MAX = 448.0
+        ckpt_scales = load_ckpt_scales(self._ckpt_path)
         async for k, v in ensure_async_iterator(weights):
             if not self.should_quantize_param(k):
                 yield (k, v)
                 continue
             x = v.to(torch.float32)
             amax = local_blockwise_absmax(x, bm_bn, row_offset=0, full_shape=tuple(x.shape))
-            # ue8m0 dialect: descale rounded UP to a power of two (exactly
-            # representable in fp32, so the wire can carry fp32 and the e8m0
-            # param cast on apply is lossless).
-            descale = torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-10) / FP8_MAX)))
+            # ue8m0 dialect (power-of-two, exact in fp32), preferring the ckpt's
+            # own scale wherever it still covers -- the ckpt carries per-block
+            # headroom that amax alone cannot reconstruct.
+            descale = sticky_ue8m0_descale(amax, ckpt_scales.get(k))
             codes = quantize_shard_with_descale(x, descale, bm_bn, row_offset=0)
             yield (k, codes)
             yield (k[: -len(".weight")] + ".scale", descale)

@@ -990,10 +990,31 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         from verl.utils.fp8_sharded import QuantSpec
 
         h = self._fp8_helper(engine)
+        scale_fmt = h.quant_config.get("scale_fmt")
+        # ue8m0 checkpoints carry per-block headroom that is unrecoverable from
+        # the dequantized master; hand the quantizers the checkpoint's own
+        # scales so unchanged blocks reproduce the checkpoint's bytes exactly.
+        # The path env is route B's existing single-source-of-truth handle.
+        ckpt_scales = None
+        if scale_fmt == "ue8m0":
+            ckpt_path = os.environ.get("VERL_FP8_CKPT_PATH") or getattr(
+                getattr(engine, "model_config", None), "local_path", None
+            )
+            if ckpt_path:
+                from verl.utils.fp8_sharded import load_ckpt_scales
+
+                ckpt_scales = load_ckpt_scales(ckpt_path)
+            else:
+                logger.warning(
+                    "ue8m0 checkpoint but no ckpt path reachable (VERL_FP8_CKPT_PATH unset, "
+                    "no model_config.local_path): quantizing without the checkpoint's scales -- "
+                    "blocks with scale headroom will not reproduce the checkpoint's bytes."
+                )
         return QuantSpec(
             weight_block_size=tuple(h.quant_config.get("weight_block_size", [128, 128])),
             should_quantize=self._quant_predicate(h),
-            scale_fmt=h.quant_config.get("scale_fmt"),
+            scale_fmt=scale_fmt,
+            ckpt_scales=ckpt_scales,
         )
 
     def _quant_predicate(self, helper):
