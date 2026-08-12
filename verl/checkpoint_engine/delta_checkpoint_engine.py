@@ -165,6 +165,32 @@ def _selfcheck_write(engine, spec_fn, quantize_fp8, step, pieces_store, out_dir,
     merely incomplete -- a dropped replica or half a fused pair passes the first
     check on its own.
     """
+    # Is the dense export bit-DETERMINISTIC? The whole offline check assumes the
+    # dense we dump here is the same artifact the delta was computed against, but
+    # we obtain it by calling get_per_tensor_param a SECOND time, which re-runs
+    # quantization. If absmax reduction order or boundary rounding varies, the two
+    # differ -- and that would produce exactly what the first real run showed:
+    # 0.309% of bytes off, concentrated on quantized MoE expert weights, a few KB
+    # per tensor. So measure it before believing the 586 failures are a delta bug.
+    # Needs no second training step, unlike the comparison it validates.
+    if os.environ.get("VERL_DELTA_SELFCHECK_DETERMINISM") == "1":
+        a, _ = engine.get_per_tensor_param(raw_master=quantize_fp8, quant_spec=spec_fn())
+        first = {n: torch.hash_tensor(t.detach().contiguous().reshape(-1).view(torch.uint8)).reshape(()) for n, t in a}
+        keys = sorted(first)
+        h1 = torch.stack([first[k] for k in keys]).tolist() if keys else []
+        b, _ = engine.get_per_tensor_param(raw_master=quantize_fp8, quant_spec=spec_fn())
+        second = {n: torch.hash_tensor(t.detach().contiguous().reshape(-1).view(torch.uint8)).reshape(()) for n, t in b}
+        h2 = torch.stack([second[k] for k in keys]).tolist() if keys else []
+        diff = [k for k, x, y in zip(keys, h1, h2, strict=True) if x != y]
+        logger.warning(
+            "DELTA-SELFCHECK determinism: %d/%d tensors differ between two consecutive "
+            "get_per_tensor_param calls (nonzero means the dense dump is NOT the artifact the "
+            "delta was diffed against, so the offline mismatches are the tool's, not the delta's); "
+            "first=%s",
+            len(diff),
+            len(keys),
+            sorted(diff)[:10],
+        )
     full, _ = engine.get_per_tensor_param(raw_master=quantize_fp8, quant_spec=spec_fn())
     dense = {}
     for name, tensor in full:  # drained in full on EVERY rank: the assembly is collective
