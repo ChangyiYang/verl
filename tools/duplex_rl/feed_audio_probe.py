@@ -138,30 +138,42 @@ class DryRunDuplex:
             self.total_ids.append(-1)                       # 占位：listen token
             return {"is_listen": True, "text": "",
                     "audio_waveform": np.zeros(0, dtype=np.float32),
-                    "end_of_turn": False, "current_time": i}
+                    "end_of_turn": False, "current_time": i + 1}
         self.total_ids.extend([1000 + i, 1001 + i, 1002 + i])
         return {"is_listen": False, "text": f"[dry-run speak @ frame {i}] ",
                 "audio_waveform": np.zeros(self.SAMPLE_RATE_OUT // 2, dtype=np.float32),
-                "end_of_turn": True, "current_time": i}
+                "end_of_turn": True, "current_time": i + 1}
 
 
 def build_model(args):
-    """加载真实的 MiniCPMODuplex。
+    """加载真实的 MiniCPMODuplex（走模型自带的 remote code）。
 
-    注意：duplex 与单工是两套实现，不能在同一实例上切换
-    （见 MiniCPM-o-Demo/core/schemas/duplex.py 的说明）。
+    官方路径是：AutoModel 加载 MiniCPMO → .as_duplex() 转成 duplex 包装器。
+    duplex 与单工是两套实现，不能在同一实例上来回切。
     """
-    import sys
-    sys.path.insert(0, args.minicpm_repo)
-    from MiniCPMO45.modeling_minicpmo import MiniCPMODuplex  # type: ignore
+    import torch
+    from transformers import AutoModel
 
-    model = MiniCPMODuplex.from_pretrained(
+    print(f"[load] {args.model} …")
+    model = AutoModel.from_pretrained(
         args.model,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+    ).eval().to(args.device)
+
+    duplex = model.as_duplex(
         device=args.device,
-        ls_mode="explicit",              # 论文的 Listen-Speak 显式控制
         generate_audio=not args.no_audio,
+        ls_mode="explicit",                     # 论文的 Listen-Speak 显式控制
+        max_new_speak_tokens_per_chunk=args.max_speak_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
     )
-    return model
+    print(f"[load] ok · listen_token_id={getattr(duplex, 'listen_token_id', None)} "
+          f"(<|listen|>) · chunk_ms={duplex._default_duplex_params['chunk_ms']}")
+    return duplex
 
 
 # ---------------------------------------------------------------------------
@@ -181,12 +193,13 @@ def run(args) -> int:
     if args.dry_run:
         print("[mode] DRY RUN —— 不加载模型，仅验证链路")
 
-    model.prepare(
-        **({} if args.dry_run else dict(
-            prefix_system_prompt=args.system_prompt,
-            prompt_wav_path=args.ref_wav,
-        ))
-    )
+    prep = {}
+    if not args.dry_run:
+        if args.system_prompt:
+            prep["prefix_system_prompt"] = args.system_prompt
+        if args.ref_wav:
+            prep["prompt_wav_path"] = args.ref_wav
+    model.prepare(**prep)
 
     records: list[FrameRecord] = []
     audio_out: list[np.ndarray] = []
@@ -199,15 +212,7 @@ def run(args) -> int:
         cost_prefill = time.time() - ts
 
         ts = time.time()
-        out = model.streaming_generate(
-            **({} if args.dry_run else dict(
-                max_new_speak_tokens_per_chunk=args.max_speak_tokens,
-                decode_mode="sampling",
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-            ))
-        )
+        out = model.streaming_generate()
         cost_generate = time.time() - ts
 
         # 取出本帧新增的 token —— total_ids 是模型侧累积的完整采样序列
@@ -286,14 +291,15 @@ def run(args) -> int:
     if n_audio:
         print(f"[written] {out_dir / 'output.wav'}")
 
-    # 时间轴自检：模型自报的 current_time 应与我们的 frame_idx 对齐
+    # 时间轴自检：模型自报的 current_time 是 1-based 的已消费 chunk 计数，
+    # 因此应恒等于 frame_idx + 1（实测确认，非 bug，只是计数约定）。
     bad = [r.frame_idx for r in records
-           if r.model_current_time is not None and r.model_current_time != r.frame_idx]
+           if r.model_current_time is not None and r.model_current_time != r.frame_idx + 1]
     if bad:
-        print(f"[WARN] current_time 与 frame_idx 不一致的帧: {bad[:10]}"
+        print(f"[WARN] current_time != frame_idx+1 的帧: {bad[:10]}"
               f"{' …' if len(bad) > 10 else ''} —— 时间轴对齐需要复核")
     else:
-        print("[ok] 时间轴自检通过：model.current_time == frame_idx")
+        print("[ok] 时间轴自检通过：model.current_time == frame_idx + 1")
 
     if rtf > 1.0 and not args.dry_run:
         print(f"[WARN] 实时率 {rtf:.2f} > 1.0，慢于实时；rollout 吞吐会成为瓶颈")
@@ -307,7 +313,6 @@ def main() -> int:
     p.add_argument("--audio", required=True, help="输入 wav（任意采样率，内部转 16k 单声道）")
     p.add_argument("--out", default="runs/probe", help="输出目录")
     p.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
-    p.add_argument("--minicpm-repo", default="", help="含 MiniCPMO45/ 的仓库路径")
     p.add_argument("--device", default="cuda")
     p.add_argument("--system-prompt", default=None)
     p.add_argument("--ref-wav", default=None, help="音色参考 wav")
@@ -320,8 +325,6 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true", help="不加载模型，仅验证链路")
     args = p.parse_args()
 
-    if not args.dry_run and not args.minicpm_repo:
-        p.error("--minicpm-repo 必填（除非 --dry-run）：需指向含 MiniCPMO45/ 的仓库")
     return run(args)
 
 

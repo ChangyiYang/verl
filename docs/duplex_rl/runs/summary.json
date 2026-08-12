@@ -1,0 +1,13 @@
+{
+  "audio": "/home/changyi.yang@liquid.ai/duplex_probe_data/user10s.wav",
+  "input_duration_s": 10.0,
+  "n_frames": 10,
+  "n_speak_frames": 2,
+  "n_listen_frames": 8,
+  "n_tokens_total": 31,
+  "output_audio_samples": 192000,
+  "output_audio_seconds": 8.0,
+  "wall_seconds": 6.736,
+  "realtime_factor": 0.674,
+  "dry_run": false
+}
