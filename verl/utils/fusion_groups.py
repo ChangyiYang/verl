@@ -53,7 +53,19 @@ _ATTN_SPELLINGS = (".self_attn.", ".attn.")
 # are distinct entries and each needs its own pair.
 _FAMILIES = (
     ("wqkv_a", ("wq_a.weight", "wkv.weight")),
-    ("wqkv_a_scale", ("wq_a.weight_scale_inv", "wkv.weight_scale_inv")),
+    # Two spellings of the fp8 scale, and BOTH are needed:
+    #   .scale            -- what the natively-fp8 DSv4 checkpoint stores and
+    #                        what the Megatron export actually streams. Measured,
+    #                        not guessed: the run named them
+    #                        ``layers.0.attn.wq_a.scale`` / ``...wkv.scale``.
+    #   .weight_scale_inv -- what ``fp8_sharded.quantize_hf_stream`` produces
+    #                        (``yield name + "_scale_inv"``) when the trainer
+    #                        re-quantizes a bf16 master, and what SGLang's own
+    #                        param is called.
+    # Getting this wrong is invisible: the weight group still pairs up and only
+    # the scale group silently stays unpaired, which reads as a partial fix.
+    ("wqkv_a_scale", ("wq_a.scale", "wkv.scale")),
+    ("wqkv_a_scale_inv", ("wq_a.weight_scale_inv", "wkv.weight_scale_inv")),
     ("compressor_wkv_gate", ("compressor.wkv.weight", "compressor.wgate.weight")),
     (
         "indexer_compressor_wkv_gate",
