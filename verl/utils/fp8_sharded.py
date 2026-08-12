@@ -130,6 +130,22 @@ class QuantSpec:
 
     weight_block_size: tuple[int, int]
     should_quantize: object  # Callable[[str], bool]
+    # The checkpoint's scale dialect, from its quantization_config. DSv4 ships
+    # "ue8m0" and sglang's loader requires it; None keeps the plain fp32 grid.
+    scale_fmt: str | None = None
+
+
+def ue8m0_descale(amax: torch.Tensor) -> torch.Tensor:
+    """Power-of-two descale, byte-identical to the DSv4 nccl converter's formula.
+
+    The exponent-only scale is what makes the trainer's dequant->requant round
+    trip bit-exact: multiplying and dividing by 2^k shifts the fp8 exponent and
+    never touches the mantissa. A plain amax/FP8_MAX scale is an arbitrary real,
+    so the round trip rewrites the codes -- that is precisely the seed-vs-disk
+    mismatch the ladder measured (B5, 2026-08-12: all 470 quantized pairs
+    differed under the plain formula while every bf16 pass-through matched).
+    """
+    return torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-10) / FP8_MAX)))
 
 
 def quantize_hf_stream(weights, spec: QuantSpec):
@@ -147,7 +163,10 @@ def quantize_hf_stream(weights, spec: QuantSpec):
             continue
         t = t.to(torch.bfloat16)
         grid = local_blockwise_absmax(t, block, 0, tuple(t.shape))
-        descale = grid.clamp_(min=_ABSMAX_EPS) / FP8_MAX
+        if getattr(spec, "scale_fmt", None) == "ue8m0":
+            descale = ue8m0_descale(grid)
+        else:
+            descale = grid.clamp_(min=_ABSMAX_EPS) / FP8_MAX
         codes = quantize_shard_with_descale(t, descale, block, 0)
         yield name, codes
         yield name + "_scale_inv", descale

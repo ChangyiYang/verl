@@ -505,10 +505,14 @@ def quant_shard_stream(engine, quant_spec):
     import torch.distributed as dist
 
     from megatron.core import parallel_state as mpu
-    from verl.utils.fp8_sharded import _ABSMAX_EPS, local_blockwise_absmax, quantize_shard_with_descale
+    from verl.utils.fp8_sharded import _ABSMAX_EPS, local_blockwise_absmax, quantize_shard_with_descale, ue8m0_descale
     from verl.utils.kernel.fp8_kernel import FP8_DTYPE, FP8_MAX, ceil_div
 
     helper_should_quantize = quant_spec.should_quantize
+    # Seed and steady MUST agree on the dialect: they write the same tensors on
+    # alternating syncs, and the delta only resends changed positions, so a
+    # formula split leaves stale scales from the other formula in place forever.
+    scale_fmt = getattr(quant_spec, "scale_fmt", None)
     block = list(quant_spec.weight_block_size)
     bm, bn = int(block[0]), int(block[1])
     index = engine._mcore_export_index()
@@ -598,7 +602,10 @@ def quant_shard_stream(engine, quant_spec):
         for sname, sshape in slots:
             t = outs.get(sname)
             if len(sshape) == 2 and helper_should_quantize(sname):
-                descale = grids[qi].clamp(min=_ABSMAX_EPS) / FP8_MAX
+                if scale_fmt == "ue8m0":
+                    descale = ue8m0_descale(grids[qi])
+                else:
+                    descale = grids[qi].clamp(min=_ABSMAX_EPS) / FP8_MAX
                 qi += 1
                 if t is not None:
                     with _xspan("quantize"):

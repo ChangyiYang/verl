@@ -106,6 +106,14 @@ def build_sglang_fp8_quant_config(hf_config: Any = None, ignored_layers: Any = N
     }
 
     hf_quant_config = _get_config_value(hf_config, "quantization_config")
+    # Carry the checkpoint's scale dialect through. Dropping it here is what
+    # made the delta engine's "no ue8m0" guard toothless for DSv4: the flag
+    # never survived to be checked, and the plain-fp32 seed formula shipped.
+    scale_fmt = None
+    if hf_quant_config is not None:
+        scale_fmt = _get_config_value(hf_quant_config, "scale_fmt")
+    if scale_fmt is not None:
+        fp8_quant_config["scale_fmt"] = scale_fmt
     merged_ignored_layers = get_sglang_fp8_ignored_layers(hf_quant_config)
     merged_ignored_layers.extend(_normalize_ignored_layers(ignored_layers))
     merged_ignored_layers = _dedupe_layers(merged_ignored_layers)

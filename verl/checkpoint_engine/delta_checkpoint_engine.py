@@ -993,6 +993,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         return QuantSpec(
             weight_block_size=tuple(h.quant_config.get("weight_block_size", [128, 128])),
             should_quantize=self._quant_predicate(h),
+            scale_fmt=h.quant_config.get("scale_fmt"),
         )
 
     def _quant_predicate(self, helper):
@@ -1050,8 +1051,14 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             assert cfg.get("quant_method") == "fp8", f"unsupported quant_method {cfg.get('quant_method')!r}"
             if cfg.get("weight_block_size") is None:
                 raise NotImplementedError("per-tensor fp8 is not supported by the delta engine (blockwise only)")
-            for bad in ("scale_fmt", "ue8m0", "deepgemm"):
-                assert bad not in cfg, f"unsupported scale format flag {bad!r} in quant config: {cfg}"
+            # ue8m0 is handled (both quantizers switch on QuantSpec.scale_fmt);
+            # anything else is still a hard stop. NOTE this guard used to reject
+            # ue8m0 while build_sglang_fp8_quant_config silently DROPPED the
+            # flag, so it never fired and the plain-fp32 seed formula shipped
+            # for DSv4 -- the exact bug the ladder pinned on 2026-08-12.
+            sf = cfg.get("scale_fmt")
+            assert sf in (None, "ue8m0"), f"unsupported scale_fmt {sf!r} in quant config: {cfg}"
+            assert "deepgemm" not in cfg, f"unsupported scale format flag 'deepgemm' in quant config: {cfg}"
             self._fp8_quant_cfg = cfg
             h = SGLangFP8QuantizerHelper(cfg)
             self._fp8_helper_inst = h
