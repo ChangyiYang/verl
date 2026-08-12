@@ -71,6 +71,23 @@ def test_hash_only_is_off_without_the_env(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("*.json"))
 
 
+def test_probe_batch_round_trips_through_the_loader(tmp_path, monkeypatch):
+    """The batch the rollout worker actually POSTS must be the one the loader
+    answers: build it with ladder_probe_batch (the sender's only source) and feed
+    it to apply_delta unmodified. Pins the sender/receiver spec contract without
+    importing sglang (the sender module needs libcuda, this test env has none)."""
+    from verl.workers.rollout.sglang_rollout.delta_loader import ladder_probe_batch
+
+    monkeypatch.setenv("VERL_DELTA_LADDER_DIR", str(tmp_path))
+    monkeypatch.setenv("VERL_DELTA_LADDER_TAG", "nccl")
+    m = TinyModel()
+    before = m.w.detach().clone()
+    apply_delta(m, ladder_probe_batch("sync3"))
+    assert torch.equal(m.w.detach(), before)
+    files = list(tmp_path.glob("ladder_nccl_sync3_*_rank*.json"))
+    assert len(files) == 1, f"stage must survive the trip into the filename: {[f.name for f in files]}"
+
+
 def test_a_normal_flush_is_unaffected(tmp_path, monkeypatch):
     """The branch must not swallow real updates -- it keys on hash_only only."""
     monkeypatch.setenv("VERL_DELTA_LADDER_DIR", str(tmp_path))

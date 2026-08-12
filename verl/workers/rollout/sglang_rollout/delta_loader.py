@@ -234,12 +234,26 @@ def _ladder_snapshot(model, stage: str) -> None:
         backend = os.environ.get("VERL_DELTA_LADDER_TAG", "unknown")
         n = _VERIFY_STATS.get("ladder_n", 0) + 1
         _VERIFY_STATS["ladder_n"] = n
-        path = os.path.join(d, f"ladder_{backend}_{stage}{n}_rank{rank}.json")
+        # Underscore before the counter: stage names carry step numbers
+        # ("sync1"), and "sync1" + counter 2 must not read as "sync12".
+        path = os.path.join(d, f"ladder_{backend}_{stage}_{n}_rank{rank}.json")
         with open(path, "w") as fh:
             json.dump(h, fh)
         logger.warning("DELTA-LADDER: wrote %d tensor hashes -> %s", len(h), path)
     except OSError as e:
         logger.warning("DELTA-LADDER: could not write %s stage: %s", stage, e)
+
+
+def ladder_probe_batch(stage: str) -> list[tuple[str, torch.Tensor]]:
+    """Build the zero-payload update that asks ``apply_delta`` to hash and return.
+
+    Lives here, next to the parser, so the sender cannot drift from the spec
+    format: the rollout worker posts exactly this batch (its own request, never
+    piggybacked on a real sync) and the ``hash_only`` branch below answers it.
+    """
+    spec = {"hash_only": True, "stage": stage}
+    payload = torch.frombuffer(bytearray(json.dumps(spec).encode()), dtype=torch.uint8).clone()
+    return [("__delta_spec__", payload)]
 
 
 def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> None:

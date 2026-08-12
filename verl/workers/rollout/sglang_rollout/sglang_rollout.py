@@ -309,12 +309,21 @@ class ServerAdapter(BaseRollout):
         """
         await self._init_server_adapter()
 
+        # Ladder stage 0: hash SGLang's state BEFORE the first sync ever touches it,
+        # i.e. exactly what the disk load produced. Every later stage is compared
+        # against this one, so it must fire on the first update_weights call of the
+        # process and never again. Inert unless VERL_DELTA_LADDER_DIR is set.
+        if not getattr(self, "_ladder_load_probed", False):
+            self._ladder_load_probed = True
+            await self._maybe_ladder_probe("load")
+
         # Delta checkpoint-engine wire (standalone replicas): the generator yields
         # per-flush sparse payloads, applied in place through the verl custom
         # weight loader. Hybrid replicas pass full (name, tensor) pairs with no
         # wire_format kwarg and take the bucketed path below.
         if wire_format == "delta_flush":
             await self._update_weights_delta(weights, global_steps=global_steps)
+            await self._maybe_ladder_probe(f"sync{global_steps if global_steps is not None else 'x'}")
             return
 
         # All ranks MUST iterate the weights generator below — DTensor.full_tensor()
@@ -379,6 +388,37 @@ class ServerAdapter(BaseRollout):
             await self._engine.flush_cache()
             if global_steps is not None:
                 await self.server_actor.set_global_steps.remote(global_steps)
+
+        # Ladder: hash what SGLang holds AFTER this full sync. This is the only
+        # coverage the nccl path gets — its sync never enters the custom loader
+        # (no load_format on sgl_update_weights), so the loader-side snapshot
+        # cannot observe it from within.
+        await self._maybe_ladder_probe(f"sync{global_steps if global_steps is not None else 'x'}")
+
+    async def _maybe_ladder_probe(self, stage: str) -> None:
+        """Post a zero-payload hash_only update so the ladder can hash SGLang's live state.
+
+        The weights to hash live inside SGLang's TP workers, and the verl custom
+        loader is the only code path handed the model object — but the loader is
+        only reached when a request carries ``load_format=LOADER_FQN``, which the
+        nccl full sync never sets. So the probe is its OWN request: a spec-only
+        update that the loader recognizes (``hash_only``) and answers by hashing
+        and returning, mutating nothing. A verification tool must not modify what
+        it verifies, which rules out setting load_format on the real sync.
+
+        Collective: every rank of the infer_tp mesh must call this (the flush
+        helper gathers across the mesh). All call sites are on the all-ranks path
+        of ``update_weights``. No-op unless VERL_DELTA_LADDER_DIR is set.
+        """
+        if not os.environ.get("VERL_DELTA_LADDER_DIR"):
+            return
+        from verl.workers.rollout.sglang_rollout.delta_loader import ladder_probe_batch
+
+        batch = [
+            (name, t.to(torch.cuda.current_device()) if torch.cuda.is_available() else t)
+            for name, t in ladder_probe_batch(stage)
+        ]
+        await self._update_weights_delta_flush(batch, flush_cache=False)
 
     async def _update_weights_delta(self, flushes, global_steps: int = None) -> None:
         """Apply the delta engine's sparse flushes in place.
