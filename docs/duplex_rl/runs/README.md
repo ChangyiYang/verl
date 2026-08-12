@@ -119,3 +119,30 @@ bf16 下 `log P(listen)` 偏差可达 0.19 ⇒ ratio ≈ e^0.19 ≈ **1.21**，�
 | `duplex_action_pos` | [B,F] | 每帧动作 token 的绝对位置 |
 | `duplex_is_listen` | [B,F] | 每帧动作（1=listen） |
 | `duplex_frame_time` | [B,F] | 每帧起点秒 —— 窗口 reward 的时间锚 |
+
+---
+
+# WindowRewardManager —— 时间窗 → token 级 reward（纯 CPU 自检全通过）
+
+`verl/workers/reward_manager/window.py`，用 verl 自带的装饰器注册为 `duplex_window`。
+
+依据：帧同步 ⇒ 时间与 token 位置固定映射 ⇒「时间窗给 reward」≡「若干动作 token 位给 reward」。
+verl 的 `token_level_scores` 本就与 responses 同形、支持逐 token 赋值
+（`naive.py` 只是把标量塞在最后一位），**故窗口化 credit assignment 不改 verl 核心**。
+
+```
+[registry] duplex_window -> verl.workers.reward_manager.window.WindowRewardManager
+  W1 单窗口精确命中   PASS      W5 padding 帧跳过   PASS
+  W2 窗口外恒为 0     PASS      W6 分解统计正确     PASS
+  W3 多窗口叠加       PASS      W7 越界防护         PASS
+  W4 only_on 过滤     PASS
+```
+对应 PLAN.md 验收 2.2「填中的 token index 集合与手算完全一致；窗口外全 0」。
+
+## 接口
+```python
+RewardWindow(t_start, t_end, value, term="trigger", only_on=None)   # only_on: 'listen'/'speak'/None
+```
+窗口来源二选一：`non_tensor_batch["reward_windows"]`（每样本一个列表），
+或 `compute_windows(item, i)` 回调。本类只做「时间→token 位→填分」，
+**不做语义判定**（TP/FP/TOO_EARLY… 由上游按 MIB 口径产出后转成窗口）。
