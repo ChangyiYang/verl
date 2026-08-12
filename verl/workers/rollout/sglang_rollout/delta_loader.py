@@ -388,6 +388,24 @@ def _model_state_hashes(model) -> dict:
         )
     if not hs:
         return {}
+    if not _VERIFY_STATS.get("coverage_logged"):
+        # Report WHAT IS COVERED, not only what changed. verify4 showed zero
+        # scale mismatches after the reference-frame change, and I read that as
+        # "the scale false-positives are gone". It may instead mean the scales
+        # are not in named_parameters()/named_buffers() at all, i.e. we simply
+        # stopped looking -- the two sweeps also use different namespaces
+        # (delta-spec names vs module paths), so set overlap cannot be assumed.
+        # A disappearing failure and an unexamined tensor look identical in the
+        # output, and only the covered-set histogram tells them apart.
+        _VERIFY_STATS["coverage_logged"] = True
+        cov: dict = {}
+        for nm in names:
+            cov[nm.rsplit(".", 1)[-1]] = cov.get(nm.rsplit(".", 1)[-1], 0) + 1
+        logger.warning(
+            "DELTA-VERIFY coverage: %d tensors hashed, by_suffix=%s",
+            len(names),
+            sorted(cov.items(), key=lambda kv: -kv[1])[:20],
+        )
     # One sync for all of them: per-tensor .item() would be ~100k device syncs,
     # the same mistake that made this sweep unrunnable in the first place.
     vals = torch.stack(hs).tolist()
