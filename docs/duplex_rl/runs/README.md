@@ -82,3 +82,40 @@ bf16 下 `log P(listen)` 偏差可达 0.19 ⇒ ratio ≈ e^0.19 ≈ **1.21**，�
 重放用的是**录下来的 embeds**，因此验证的是 **LLM 主干**的流式↔批量等价性，
 **未验证音频编码器**在「流式分块编码」与「整段编码」下是否一致。
 若训练侧打算**重新计算**音频 embeds（而非复用录下的），需另做一次等价性检查。
+
+---
+
+# DuplexRollout —— 端到端自检通过（真模型，1×MI325X）
+
+`verl/workers/rollout/duplex_rollout.py` + 注册表一行（`("duplex","sync")`）。
+`tools/duplex_rl/test_duplex_rollout.py` 不经 Ray/FSDP worker，直接构造 DataProto 调用：
+
+```
+[registry] duplex/sync -> verl.workers.rollout.duplex_rollout.DuplexRollout
+[shapes]   embeds(1,150,4096) mask(1,150) action_pos(1,10) frames=10
+  T1 形状一致              PASS
+  T2 动作位可定位          PASS
+  T3 动作与 is_listen 一致  PASS
+  T3b 采样与 argmax 不同    1/10 帧（随机策略的正常表现）
+  T4 response_mask 合理    PASS (生成位 22/150)
+  T5 时间轴单调等距        PASS
+  T6 可从 embeds 复算 logprob PASS  (P(listen) 范围 [0.0000, 0.9998])
+```
+
+## 一处被测试抓出来的真实缺陷
+初版 T3 失败 2/10。排查后发现是**测试写错了**：它拿 `argmax(logits)` 去核对动作，
+但动作是**采样**出来的——在决策边界上（P(listen)≈0.59）两者本来就会不同。
+但这暴露了 rollout 的一个真实缺口：**没有输出 token id 序列**，
+导致无法直接核对"某位置到底落了哪个 token"。
+⇒ 已给 DuplexRollout 补上 `duplex_token_ids [B,T]`（条件位填 -1），
+   verl 侧也本来就需要 token 序列。T3b 现在把"采样≠argmax"作为观测量单独报出。
+
+## 输出契约
+| 字段 | 形状 | 含义 |
+|---|---|---|
+| `duplex_embeds` | [B,T,H] | 完整输入嵌入序列，训练侧据此单次批量前向重算 logprob |
+| `duplex_token_ids` | [B,T] | 每位置 token id；音频等条件位为 -1 |
+| `response_mask` | [B,T] | 1=模型生成位（可训练），0=条件输入 |
+| `duplex_action_pos` | [B,F] | 每帧动作 token 的绝对位置 |
+| `duplex_is_listen` | [B,F] | 每帧动作（1=listen） |
+| `duplex_frame_time` | [B,F] | 每帧起点秒 —— 窗口 reward 的时间锚 |
