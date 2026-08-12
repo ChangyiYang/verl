@@ -230,10 +230,22 @@ def _ladder_snapshot(model, stage: str) -> None:
 
         os.makedirs(d, exist_ok=True)
         h = _model_state_hashes(model)
-        rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+        # Rank from the shard's own GPU, not from env: sglang's TP workers run
+        # with one pid and identical env (the first ladder run had all eight
+        # write ..._rank0.json, each clobbering the last), but each worker's
+        # model owns a distinct device, and on the single-node TP layouts we run,
+        # device index == TP rank.
+        try:
+            dev = next(model.parameters()).device.index
+            rank = os.environ.get("RANK", "0") if dev is None else str(dev)
+        except StopIteration:
+            rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
         backend = os.environ.get("VERL_DELTA_LADDER_TAG", "unknown")
-        n = _VERIFY_STATS.get("ladder_n", 0) + 1
-        _VERIFY_STATS["ladder_n"] = n
+        # Counter keyed per (stage, rank): a global counter is shared state, and
+        # with TP workers in one process it races and drifts across ranks.
+        key = f"ladder_{stage}_r{rank}"
+        n = _VERIFY_STATS.get(key, 0) + 1
+        _VERIFY_STATS[key] = n
         # Underscore before the counter: stage names carry step numbers
         # ("sync1"), and "sync1" + counter 2 must not read as "sync12".
         path = os.path.join(d, f"ladder_{backend}_{stage}_{n}_rank{rank}.json")

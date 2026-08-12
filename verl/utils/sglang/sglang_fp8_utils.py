@@ -153,7 +153,11 @@ class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
         import torch
 
         from verl.utils.fp8_sharded import local_blockwise_absmax, quantize_shard_with_descale
-        from verl.utils.sglang.utils import ensure_async_iterator
+        # NOTE: this import is inside an async generator, so a wrong path here
+        # only explodes at the first weight of the first sync -- which is exactly
+        # how the cherry-picked "verl.utils.sglang.utils" path killed the first
+        # converter-enabled run. Keep it pointing at the real module.
+        from verl.workers.rollout.utils import ensure_async_iterator
 
         bm_bn = self.quant_config.get("weight_block_size") if isinstance(self.quant_config, dict) else None
         bm_bn = tuple(bm_bn or (128, 128))
