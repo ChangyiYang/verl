@@ -37,6 +37,7 @@ mask contributes zeros.
 
 from __future__ import annotations
 
+import os
 import logging
 from dataclasses import dataclass
 
@@ -213,6 +214,67 @@ def ue8m0_descale(amax: torch.Tensor) -> torch.Tensor:
     return torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-10) / FP8_MAX)))
 
 
+_QDUMP_STATE: dict = {"detail": 0, "viol_tensors": 0, "viol_blocks": 0, "checked": 0}
+
+
+def _qdump_maybe(name: str, t: torch.Tensor, grid: torch.Tensor, ck_scale: torch.Tensor) -> None:
+    """Self-selecting perturbation dump (env VERL_DELTA_QDUMP_DIR).
+
+    An EXACT dequant of the checkpoint mathematically satisfies
+    amax <= ckpt_scale * FP8_MAX on every block (codes cannot exceed FP8_MAX),
+    so any violating block is direct evidence that the value reaching this
+    quantizer is NOT the checkpoint's dequant -- something between the load and
+    here moved it. The first few violating tensors dump enough raw material
+    (violating block coordinates, their amax, the block's elements) to compare
+    element-by-element against the offline exact dequant and bisect WHICH
+    operator moved the value.
+    """
+    d = os.environ.get("VERL_DELTA_QDUMP_DIR")
+    if not d:
+        return
+    try:
+        st = _QDUMP_STATE
+        st["checked"] += 1
+        ckd = ck_scale.to(grid.device)
+        viol = grid > ckd * FP8_MAX
+        nviol = int(viol.sum())
+        if nviol == 0:
+            return
+        st["viol_tensors"] += 1
+        st["viol_blocks"] += nviol
+        logger.warning("QDUMP: %s has %d block(s) with amax above ckpt coverage", name, nviol)
+        if st["detail"] >= 4:
+            return
+        st["detail"] += 1
+        import base64
+        import json as _json
+        import socket
+
+        os.makedirs(d, exist_ok=True)
+        coords = viol.nonzero()[:8].tolist()
+        blocks = {}
+        bm, bn = 128, 128  # spec block; detail dumps only ever ride DSv4 runs
+        for bi, bj in coords[:2]:
+            blk = t[bi * bm : (bi + 1) * bm, bj * bn : (bj + 1) * bn].contiguous()
+            blocks[f"{bi},{bj}"] = {
+                "amax": float(grid[bi, bj]),
+                "ck_scale": float(ckd[bi, bj]),
+                "elems_b64": base64.b64encode(
+                    blk.reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+                ).decode(),
+                "dtype": str(t.dtype),
+            }
+        host = socket.gethostname().split(".")[0]
+        fn = os.path.join(d, f"qdump_{host}_p{os.getpid()}_{st['detail']}.json")
+        with open(fn, "w") as fh:
+            _json.dump(
+                {"name": name, "shape": list(t.shape), "n_violating_blocks": nviol, "blocks": blocks}, fh
+            )
+        logger.warning("QDUMP: detail -> %s", fn)
+    except Exception as e:  # noqa: BLE001 - diagnostics must never kill the seed
+        logger.warning("QDUMP failed: %s", e)
+
+
 def quantize_hf_stream(weights, spec: QuantSpec):
     """Wrap a full HF ``(name, tensor)`` export with blockwise fp8 quantization:
     for every 2D weight the spec selects, yield ``(name, codes)`` +
@@ -242,6 +304,8 @@ def quantize_hf_stream(weights, spec: QuantSpec):
             ck = getattr(spec, "ckpt_scales", None)
             ck_scale = ck.get(name) if ck else None
             hits, misses = hits + (ck_scale is not None), misses + (ck_scale is None)
+            if ck_scale is not None:
+                _qdump_maybe(name, t, grid, ck_scale)
             descale = sticky_ue8m0_descale(grid, ck_scale)
         else:
             descale = grid.clamp_(min=_ABSMAX_EPS) / FP8_MAX
@@ -254,3 +318,11 @@ def quantize_hf_stream(weights, spec: QuantSpec):
     # sticky fix did nothing" (B7's first read).
     if hits or misses:
         logger.warning("quantize_hf_stream(scale_fmt=ue8m0): ckpt-scale hits=%d misses=%d", hits, misses)
+    if os.environ.get("VERL_DELTA_QDUMP_DIR") and _QDUMP_STATE["checked"]:
+        logger.warning(
+            "QDUMP summary: %d/%d tensors have amax above ckpt coverage (%d blocks total) -- "
+            "exact dequant cannot produce ANY; each one is a fingerprint of the perturbing operator",
+            _QDUMP_STATE["viol_tensors"],
+            _QDUMP_STATE["checked"],
+            _QDUMP_STATE["viol_blocks"],
+        )

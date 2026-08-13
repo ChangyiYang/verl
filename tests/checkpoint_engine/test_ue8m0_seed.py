@@ -165,3 +165,28 @@ def test_build_config_preserves_scale_fmt():
     assert cfg.get("scale_fmt") == "ue8m0", f"scale_fmt dropped again: {cfg}"
     cfg2 = build_sglang_fp8_quant_config({"quantization_config": {"weight_block_size": [128, 128]}})
     assert "scale_fmt" not in cfg2
+
+
+def test_qdump_selects_violating_tensors(tmp_path, monkeypatch):
+    """A block whose amax exceeds ckpt_scale*448 is impossible under exact
+    dequant; the dump must fire on it and stay silent on covered tensors."""
+    import glob
+    import json
+
+    monkeypatch.setenv("VERL_DELTA_QDUMP_DIR", str(tmp_path))
+    from verl.utils import fp8_sharded as fs
+
+    fs._QDUMP_STATE.update({"detail": 0, "viol_tensors": 0, "viol_blocks": 0, "checked": 0})
+    ck = torch.full((1, 1), 2.0 ** -3)  # covers amax <= 56
+    covered = torch.full((128, 128), 10.0, dtype=torch.bfloat16)
+    violating = covered.clone()
+    violating[0, 0] = 100.0  # amax 100 > 56
+    spec = QuantSpec(weight_block_size=(128, 128), should_quantize=lambda n: True,
+                     scale_fmt="ue8m0", ckpt_scales={"a.weight": ck, "b.weight": ck})
+    list(quantize_hf_stream(iter([("a.weight", covered), ("b.weight", violating)]), spec))
+    assert fs._QDUMP_STATE["viol_tensors"] == 1 and fs._QDUMP_STATE["checked"] == 2
+    files = glob.glob(str(tmp_path / "qdump_*.json"))
+    assert len(files) == 1
+    rec = json.load(open(files[0]))
+    assert rec["name"] == "b.weight" and rec["n_violating_blocks"] == 1
+    assert "0,0" in rec["blocks"] and rec["blocks"]["0,0"]["amax"] == 100.0
