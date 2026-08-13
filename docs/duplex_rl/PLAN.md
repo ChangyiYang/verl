@@ -49,9 +49,9 @@ verl/workers/reward_manager/window.py        # 新增 · ~150 行
         # 输出：形状 = responses 的 token_level_scores 张量
         # 负责把秒 → frame_index → token_index 区间，按项填值
 
-verl/utils/duplex/frame_align.py             # 新增 · ~80 行
-    sec_to_frame / frame_to_sec / frame_to_token_span / token_to_frame
-    asr_words_to_frames(word_timestamps) -> frame spans   # 对齐 MIB error window
+~~verl/utils/duplex/frame_align.py~~          # ❌ 实际不需要（2026-08-12 实测后删除）
+    帧↔秒↔token 的换算已内联：rollout 直接输出 duplex_frame_time / duplex_action_pos，
+    reward manager 直接按秒比较，无需单独的换算模块。
 
 verl/workers/rollout/base.py                 # 改 1 行：_ROLLOUT_REGISTRY 加条目
 ```
@@ -174,6 +174,24 @@ verl/workers/rollout/base.py                 # 改 1 行：_ROLLOUT_REGISTRY 加
 | 3 | 8–16 卡 | 完整动作空间 | 跨 benchmark 泛化 + 分桶不退化 |
 
 ---
+
+## 5.5 训练侧构造输入（实测得出，必须遵守）
+
+HF 模型**二选一**：`Qwen3Model.forward` 明确
+`raise ValueError("You must specify exactly one of input_ids or inputs_embeds")`。
+
+⚠️ 但**不可**把 `duplex_embeds` 原样当常量喂 —— 文本 token 位的 embeds 也是 rollout 时
+由 `embed_tokens` 查表得到的，原样喂会让 **embedding 矩阵静默失去梯度**（不报错）。
+
+正确做法是用 rollout 的两个字段**拼**出唯一的 `inputs_embeds`：
+
+```python
+emb = duplex_embeds.clone()                              # 音频位：常量
+m   = duplex_token_ids >= 0
+emb[m] = model.model.embed_tokens(duplex_token_ids[m])   # 文本位：可导
+logits = model(inputs_embeds=emb, position_ids=...)
+```
+断言（建议常开）：第 0 步重建的文本位 embeds 与录下的应逐比特相同。
 
 ## 6. 待定 / 需确认
 

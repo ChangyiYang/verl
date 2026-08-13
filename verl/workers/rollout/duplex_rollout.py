@@ -33,6 +33,28 @@
 
 5. `StreamDecoder.feed` 未加 `@torch.no_grad()`（只有 `decode` 加了）⇒ 梯度可通。
 
+⚠️ **训练侧构造输入的正确方式（容易踩的坑）**
+
+HF 模型二选一：`Qwen3Model.forward` 里明确
+`raise ValueError("You must specify exactly one of input_ids or inputs_embeds")`，
+**不能同时传 input_ids 和 inputs_embeds**。
+
+但**不能把 `duplex_embeds` 原样当常量喂进去** —— 序列里文本 token 位的 embeds
+也是 rollout 时由 `embed_token()`（即 `model.embed_tokens` 查表）算好录下来的，
+原样喂 ⇒ **embedding 矩阵拿不到梯度，且是静默冻结、不会报错**。
+
+正确做法是用本类产出的两个字段**拼**出唯一的 `inputs_embeds`：
+
+    emb = duplex_embeds.clone()                   # 音频位：常量（免去重跑音频编码器）
+    m   = duplex_token_ids >= 0                   # 文本位有 id，条件位为 -1
+    emb[m] = model.model.embed_tokens(duplex_token_ids[m])   # 文本位：可导
+    logits = model(inputs_embeds=emb, position_ids=...)
+
+⇒ 这就是本类**必须同时输出 token_ids 与 embeds** 的原因：不是都传给模型，
+   而是用来**拼**模型的输入。
+建议常开一条断言：第 0 步重建出的文本位 embeds 应与录下的逐比特相同；
+若不同，说明 rollout 与训练的权重/精度已经不一致。
+
 注意：rollout 期间记录的 logprob **仅供诊断**，不作为 `old_log_probs`。
 verl 会用 actor 的训练前向重算（`ray_trainer.py` 的 `compute_log_prob`），
 这样 ratio 在第 0 步严格为 1，与 rollout 精度无关（bf16 下二者可差 0.19 nats）。
