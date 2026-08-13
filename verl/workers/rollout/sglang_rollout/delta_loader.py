@@ -246,9 +246,17 @@ def _ladder_snapshot(model, stage: str) -> None:
         key = f"ladder_{stage}_r{rank}"
         n = _VERIFY_STATS.get(key, 0) + 1
         _VERIFY_STATS[key] = n
+        # Server identity in the name: B7 exposed FIVE sglang servers in one
+        # deployment (hybrid replicas beside the standalone one), all probing,
+        # all writing the same filenames -- last writer wins and the two
+        # generations even held DIFFERENT seed formulas. One file per server,
+        # or the ladder reads whichever replica happened to write last.
+        import socket
+
+        host = socket.gethostname().split(".")[0]
         # Underscore before the counter: stage names carry step numbers
         # ("sync1"), and "sync1" + counter 2 must not read as "sync12".
-        path = os.path.join(d, f"ladder_{backend}_{stage}_{n}_rank{rank}.json")
+        path = os.path.join(d, f"ladder_{backend}_{stage}_{n}_{host}_p{os.getpid()}_rank{rank}.json")
         with open(path, "w") as fh:
             json.dump(h, fh)
         logger.warning("DELTA-LADDER: wrote %d tensor hashes -> %s", len(h), path)

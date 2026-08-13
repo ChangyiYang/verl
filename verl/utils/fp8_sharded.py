@@ -37,11 +37,14 @@ mask contributes zeros.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
 
 from verl.utils.kernel.fp8_kernel import FP8_DTYPE, FP8_MAX, ceil_div
+
+logger = logging.getLogger(__name__)
 
 # matches the triton kernel's numerical-stability floor for block absmax
 _ABSMAX_EPS = 1e-10
@@ -219,6 +222,7 @@ def quantize_hf_stream(weights, spec: QuantSpec):
     implementation-sensitive across kernels.
     """
     block = list(spec.weight_block_size)
+    hits = misses = 0
     for name, t in weights:
         if t.dim() != 2 or not spec.should_quantize(name):
             yield name, t
@@ -227,9 +231,17 @@ def quantize_hf_stream(weights, spec: QuantSpec):
         grid = local_blockwise_absmax(t, block, 0, tuple(t.shape))
         if getattr(spec, "scale_fmt", None) == "ue8m0":
             ck = getattr(spec, "ckpt_scales", None)
-            descale = sticky_ue8m0_descale(grid, ck.get(name) if ck else None)
+            ck_scale = ck.get(name) if ck else None
+            hits, misses = hits + (ck_scale is not None), misses + (ck_scale is None)
+            descale = sticky_ue8m0_descale(grid, ck_scale)
         else:
             descale = grid.clamp_(min=_ABSMAX_EPS) / FP8_MAX
         codes = quantize_shard_with_descale(t, descale, block, 0)
         yield name, codes
         yield name + "_scale_inv", descale
+    # WARNING not info: the info-level FULL-SEED timing was swallowed for a
+    # whole night once. Misses are the silent failure mode -- ck.get() falling
+    # through leaves the tight formula in charge and looks exactly like "the
+    # sticky fix did nothing" (B7's first read).
+    if hits or misses:
+        logger.warning("quantize_hf_stream(scale_fmt=ue8m0): ckpt-scale hits=%d misses=%d", hits, misses)

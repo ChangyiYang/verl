@@ -1004,6 +1004,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 from verl.utils.fp8_sharded import load_ckpt_scales
 
                 ckpt_scales = load_ckpt_scales(ckpt_path)
+                logger.warning(
+                    "fp8 spec: scale_fmt=ue8m0, ckpt_scales=%d entries from %s", len(ckpt_scales), ckpt_path
+                )
             else:
                 logger.warning(
                     "ue8m0 checkpoint but no ckpt path reachable (VERL_FP8_CKPT_PATH unset, "

@@ -46,18 +46,24 @@ def diff_one(a: dict, b: dict, label: str) -> bool:
 
 
 def pair_by_rank(d: Path, prefix: str) -> dict[str, Path]:
-    """rank -> file for ladder_<prefix>_<counter>_rank<r>.json; counter must be unique per rank."""
+    """key -> file for ladder_<prefix>_<counter>[_<host>_p<pid>]_rank<r>.json.
+
+    The server identity (host+pid) is part of the key: one deployment runs
+    SEVERAL sglang servers (hybrid replicas beside the standalone one), and
+    comparing across different servers silently compares different machines'
+    states. Old identity-less files key by rank alone."""
     out: dict[str, Path] = {}
-    pat = re.compile(rf"^ladder_{re.escape(prefix)}_\d+_rank(\w+)\.json$")
+    pat = re.compile(rf"^ladder_{re.escape(prefix)}_\d+(?:_(.+_p\d+))?_rank(\w+)\.json$")
     for f in sorted(d.iterdir()):
         m = pat.match(f.name)
         if not m:
             continue
-        if m.group(1) in out:
-            print(f"ambiguous: two files for rank {m.group(1)} with prefix {prefix} "
-                  f"({out[m.group(1)].name}, {f.name}) — pass a more specific prefix", file=sys.stderr)
+        key = f"{m.group(1)}/rank{m.group(2)}" if m.group(1) else f"rank{m.group(2)}"
+        if key in out:
+            print(f"ambiguous: two files for {key} with prefix {prefix} "
+                  f"({out[key].name}, {f.name}) — pass a more specific prefix", file=sys.stderr)
             sys.exit(2)
-        out[m.group(1)] = f
+        out[key] = f
     return out
 
 
