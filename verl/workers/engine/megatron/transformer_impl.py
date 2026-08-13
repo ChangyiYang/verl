@@ -976,11 +976,14 @@ class MegatronEngine(BaseEngine):
         rec = self._delta_export_by_name[name]
         return mcore_hf_delta_entry(rec, place, lidx, lval, self._delta_slot_cache)
 
-    def get_per_tensor_param_delta_shard(self, quant_spec=None, **kwargs):
+    def get_per_tensor_param_delta_shard(self, quant_spec=None, full_seed: bool = False, **kwargs):
         """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
         per mcore parameter (see the FSDP engine's method of the same name for the
         contract; MegatronEngine extends BaseEngine directly, so the thin wrapper
-        is repeated here). Requires a prior :meth:`prime_delta_snapshots` call.
+        is repeated here). Requires a prior :meth:`prime_delta_snapshots` call --
+        unless ``full_seed=True``, which emits EVERY position (the seed as a
+        steady sync where everything changed) and primes the snapshots inline,
+        so no separate prime pass is needed afterwards.
 
         With ``quant_spec`` the payloads are produced directly in the rollout's
         quantization domain (codes + scale grids diffed against the engine-held
@@ -994,7 +997,7 @@ class MegatronEngine(BaseEngine):
         # disjoint namespaces, identical prime/diff/refresh semantics.
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
         entry = quant_delta_entry(self) if quant_spec is not None else self._hf_delta_entry
-        return hf_delta_export(gen, self._delta_shard_snap, entry), None
+        return hf_delta_export(gen, self._delta_shard_snap, entry, full=full_seed), None
 
     def prime_delta_snapshots(self, quant_spec=None) -> None:
         """Capture the state the NEXT delta-shard call will diff against. With

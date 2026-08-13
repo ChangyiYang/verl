@@ -1319,12 +1319,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # export+ship the residual is outside this function entirely. Guessing
         # between the two would have sent the next optimisation at the wrong half.
         t_total0 = time.perf_counter()
-        if not self._shard_seeded:
-            # the BACKEND produces the seed in the rollout's exact format (with a
-            # quant spec: codes + scale_inv off the raw master; without: bf16),
-            # ships it verbatim, then snapshots the SAME domain as the diff base
-            # -- weights do not move during the sync, so the snapshots equal
-            # exactly what the rollout just received.
+        seeding = not self._shard_seeded
+        if seeding and (not self.quantize_fp8 or os.environ.get("VERL_DELTA_SEED_LEGACY") == "1"):
+            # LEGACY seed: stream the bridge's full export over the values-only
+            # wire, then prime. Kept for the bf16 (no quant spec) wire and as an
+            # env-selectable fallback; the fp8 default below replaces it because
+            # the bridge's stream re-quantizes DSv4 exports at TWO levels (the
+            # auto fp8 task family and the v4 per-task requant hook), and
+            # disarming both still leaves the seed and the steady path with
+            # different producers.
             spec = self._fp8_spec(engine) if self.quantize_fp8 else None
             full, _ = engine.get_per_tensor_param(raw_master=spec is not None, quant_spec=spec)
             metrics = self._send_full_seed(full, global_steps, bytes_wire=spec is not None)
@@ -1333,11 +1336,21 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # the BACKEND owns delta production for every dtype: with a quant spec
         # it yields quant-domain entries (codes + scale grids diffed against
         # engine-held snapshots), without one the bf16 shard deltas.
+        #
+        # SEED-AS-FULL-STEADY (seeding=True): the first sync runs THIS same
+        # path with full_seed -- every position emitted, snapshots primed
+        # inline. Same mapping transforms, same quantizer (sticky ue8m0), same
+        # wire and same receiver code as every later delta; the bridge's stream
+        # export (and both of its hidden re-quantizers) never runs. The wire
+        # carries positions it would not strictly need (~1B/elem gap-encoded),
+        # a one-time cost paid for having ONE producer instead of two.
         _t = time.perf_counter()
         _spec = self._fp8_spec(engine) if self.quantize_fp8 else None
         t_spec = time.perf_counter() - _t
         _t = time.perf_counter()
-        weights, _ = engine.get_per_tensor_param_delta_shard(quant_spec=_spec)
+        weights, _ = engine.get_per_tensor_param_delta_shard(quant_spec=_spec, full_seed=seeding)
+        if seeding:
+            self._shard_seeded = True
         t_delta_open = time.perf_counter() - _t
         # t_delta_open is 14% of the sync and is essentially one call:
         # load_megatron_model_to_gpu, bringing params back from the CPU offload

@@ -187,7 +187,7 @@ def _hf_entry_identity(name, spec, place, lidx, lval):
     return [(name, tuple(spec.full_shape))], str(lval.dtype).replace("torch.", ""), counts, gidx, lval
 
 
-def hf_delta_export(gen, snaps: dict, entry_fn):
+def hf_delta_export(gen, snaps: dict, entry_fn, full: bool = False):
     """STEADY export: wrap a raw ``(name, local_shard, spec)`` exporter into final
     HF-coordinate delta entries ``(slots, dtype_str, counts, hf_idx, hf_val,
     gather_group)`` -- diff against the pinned snapshot, refresh it, then hand the
@@ -195,7 +195,14 @@ def hf_delta_export(gen, snaps: dict, entry_fn):
     per-param entry builder (FSDP: identity only; veomni adds the EP converter).
     The delta engine consumes these entries verbatim (batch -> gather -> wire); no
     spec, no placement and no conversion cross the boundary. Requires a prior seed
-    pass."""
+    pass -- unless ``full=True``.
+
+    ``full=True`` is the SEED: every position is treated as changed (lidx =
+    arange), no prior snapshot is required, and the snapshot is primed in the
+    same pass -- so the seed is literally a steady sync in which everything
+    moved, produced by the SAME mapping transforms, the SAME quantizer and the
+    SAME wire as every later delta. The bridge's stream export (and both of its
+    hidden re-quantizers) never runs."""
     from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
 
     from .spec import derive_dtensor_placement
@@ -203,9 +210,14 @@ def hf_delta_export(gen, snaps: dict, entry_fn):
     for name, local, spec in gen:
         local = local.detach().contiguous().view(-1)
         snap = snaps.get(name)
-        assert snap is not None and snap.numel() == local.numel(), (
-            f"{name}: no seed snapshot for this shard; run the seed export first"
-        )
+        if full:
+            if snap is None or snap.numel() != local.numel():
+                snap = torch.empty_like(local, device="cpu")
+                snaps[name] = snap
+        else:
+            assert snap is not None and snap.numel() == local.numel(), (
+                f"{name}: no seed snapshot for this shard; run the seed export first"
+            )
         if spec.place is not None:
             # explicit exporter override: the backend declared the whole triple
             # (hybrid geometries are not derivable from DTensor facts alone).
@@ -213,8 +225,12 @@ def hf_delta_export(gen, snaps: dict, entry_fn):
         else:
             place, contributes, pg = derive_dtensor_placement(spec)
         if contributes:
-            base = snap.to(local.device, non_blocking=True)
-            lidx, lval = shard_delta_indices(local, base, 0)
+            if full:
+                lidx = torch.arange(local.numel(), dtype=torch.int64, device=local.device)
+                lval = local
+            else:
+                base = snap.to(local.device, non_blocking=True)
+                lidx, lval = shard_delta_indices(local, base, 0)
         else:
             # replicated param owned by another rank; empty delta keeps lockstep.
             lidx = torch.empty(0, dtype=torch.int64, device=local.device)
