@@ -1167,7 +1167,27 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             encoding=self.encoding, params=params, positions_cpu=positions_u8, values_gpu=values_gpu, checksum=cks
         )
 
-    def _send_full_seed_sharded(self, engine, spec, global_steps: int | None = None) -> dict[str, float] | None:
+    def _seed_verify_sweep(self, engine, spec, global_steps: int | None = None) -> None:
+        """Verify sweep straight after the seed, inside the seed's receive
+        session (the seed held is_last for us). Collective on every rank: the
+        full export assembles per tensor. Same producer as the steady path's
+        sweep, so the two sweeps judge seed and steady on identical terms."""
+        if spec is not None:
+            full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=spec)
+            self._send_full_seed(
+                _verify_sample(full),
+                global_steps,
+                verify=True,
+                bytes_wire=True,
+                fp32_predicate=getattr(spec, "fp32_predicate", None),
+            )
+        else:
+            full, _ = engine.get_per_tensor_param()
+            self._send_full_seed(_verify_sample(full), global_steps, verify=True)
+
+    def _send_full_seed_sharded(
+        self, engine, spec, global_steps: int | None = None, hold_last: bool = False
+    ) -> dict[str, float] | None:
         """Seed from the STEADY shard stream over the values-only wire.
 
         One producer for the first and every later sync: the shard stream's
@@ -1211,7 +1231,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     yield slot_name, piece.view(dtype).reshape(shape)
 
         return self._send_full_seed(
-            pairs(), global_steps, bytes_wire=True, fp32_predicate=getattr(spec, "fp32_predicate", None)
+            pairs(),
+            global_steps,
+            bytes_wire=True,
+            fp32_predicate=getattr(spec, "fp32_predicate", None),
+            hold_last=hold_last,
         )
 
     def _send_full_seed(
@@ -1221,6 +1245,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         verify: bool = False,
         bytes_wire: bool = False,
         fp32_predicate=None,
+        hold_last: bool = False,
     ) -> dict[str, float] | None:
         """First sync: stream the backend's FULL HF export over the values-only wire.
 
@@ -1326,11 +1351,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         stager.assert_drained()
         logger.info("seed fusion staging: groups=%d", stager.n_groups)
         bkt.seal()
-                # sweep (same contract as the steady path: only the sync's final flush
-        # carries is_last).
+        # hold_last: a verify sweep follows INSIDE this same receive session,
+        # so its finale -- not ours -- carries is_last (the steady+sweep
+        # contract: only the sync's final flush terminates the stream).
         if bkt.pending is not None:
-            bkt.emit(is_last=True)
-        else:
+            bkt.emit(is_last=not hold_last)
+        elif not hold_last:
             self._publish_terminal(True)
         # warning level on purpose: worker default log level swallows info, and the
         # one-off seed cost is the number people ask for when sizing a run.
@@ -1397,9 +1423,19 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # bitwise-parity test pins seed and steady quantizers to identical
         # codes+scales on identical input; this switch only picks the transport.
         seed_via_shard = os.environ.get("VERL_DELTA_SEED_SHARD") == "1"
+        # VERL_DELTA_VERIFY_AFTER_SEED=1: run the verify sweep IMMEDIATELY after
+        # the seed, before any training step or steady delta. Order-invariance
+        # regression (changyi, 2026-08-13): "先 steady 再 seed 不该有区别" --
+        # the sweep's verdict must not depend on whether a steady sync happened
+        # in between. Seed-then-sweep changed=0 is the seed's own correctness
+        # certificate, on the same criterion the steady path already uses.
+        verify_after_seed = os.environ.get("VERL_DELTA_VERIFY_AFTER_SEED") == "1"
         if seeding and self.quantize_fp8 and seed_via_shard:
             spec = self._fp8_spec(engine)
-            return self._send_full_seed_sharded(engine, spec, global_steps)
+            metrics = self._send_full_seed_sharded(engine, spec, global_steps, hold_last=verify_after_seed)
+            if verify_after_seed:
+                self._seed_verify_sweep(engine, spec, global_steps)
+            return metrics
         if seeding:
             # LEGACY seed: stream the bridge's full export over the values-only
             # wire, then prime. Kept for the bf16 (no quant spec) wire and as an
@@ -1411,9 +1447,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             spec = self._fp8_spec(engine) if self.quantize_fp8 else None
             full, _ = engine.get_per_tensor_param(raw_master=spec is not None, quant_spec=spec)
             metrics = self._send_full_seed(
-                full, global_steps, bytes_wire=spec is not None, fp32_predicate=getattr(spec, "fp32_predicate", None)
+                full,
+                global_steps,
+                bytes_wire=spec is not None,
+                fp32_predicate=getattr(spec, "fp32_predicate", None),
+                hold_last=verify_after_seed,
             )
             engine.prime_delta_snapshots(quant_spec=spec)
+            if verify_after_seed:
+                self._seed_verify_sweep(engine, spec, global_steps)
             return metrics
         # the BACKEND owns delta production for every dtype: with a quant spec
         # it yields quant-domain entries (codes + scale grids diffed against
