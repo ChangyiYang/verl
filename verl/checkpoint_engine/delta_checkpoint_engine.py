@@ -1320,7 +1320,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # between the two would have sent the next optimisation at the wrong half.
         t_total0 = time.perf_counter()
         seeding = not self._shard_seeded
-        if seeding and (not self.quantize_fp8 or os.environ.get("VERL_DELTA_SEED_LEGACY") == "1"):
+        # seed-as-full-steady is OPT-IN (VERL_DELTA_SEED_SHARD=1) until dense
+        # entries land: the sparse wire stages ~9 B/element on the GPU (int64
+        # positions beside fp8 values) and the padded gather adds a same-sized
+        # pad copy, which OOMed B14 at the 100%-coverage work point with 773 MiB
+        # free. Quantization is single-authored EITHER way -- the offline
+        # bitwise-parity test pins seed and steady quantizers to identical
+        # codes+scales on identical input; this switch only picks the transport.
+        seed_via_shard = os.environ.get("VERL_DELTA_SEED_SHARD") == "1"
+        if seeding and (not self.quantize_fp8 or not seed_via_shard):
             # LEGACY seed: stream the bridge's full export over the values-only
             # wire, then prime. Kept for the bf16 (no quant spec) wire and as an
             # env-selectable fallback; the fp8 default below replaces it because
