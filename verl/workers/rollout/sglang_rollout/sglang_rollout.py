@@ -315,7 +315,7 @@ class ServerAdapter(BaseRollout):
         # process and never again. Inert unless VERL_DELTA_LADDER_DIR is set.
         if not getattr(self, "_ladder_load_probed", False):
             self._ladder_load_probed = True
-            await self._maybe_ladder_probe("load")
+            await self._maybe_ladder_probe("load", wire="none:disk-load")
 
         # Delta checkpoint-engine wire (standalone replicas): the generator yields
         # per-flush sparse payloads, applied in place through the verl custom
@@ -323,7 +323,7 @@ class ServerAdapter(BaseRollout):
         # wire_format kwarg and take the bucketed path below.
         if wire_format == "delta_flush":
             await self._update_weights_delta(weights, global_steps=global_steps)
-            await self._maybe_ladder_probe(f"sync{global_steps if global_steps is not None else 'x'}")
+            await self._maybe_ladder_probe(f"sync{global_steps if global_steps is not None else 'x'}", wire="delta_flush")
             return
 
         # All ranks MUST iterate the weights generator below — DTensor.full_tensor()
@@ -393,9 +393,11 @@ class ServerAdapter(BaseRollout):
         # coverage the nccl path gets — its sync never enters the custom loader
         # (no load_format on sgl_update_weights), so the loader-side snapshot
         # cannot observe it from within.
-        await self._maybe_ladder_probe(f"sync{global_steps if global_steps is not None else 'x'}")
+        await self._maybe_ladder_probe(
+            f"sync{global_steps if global_steps is not None else 'x'}", wire=f"named_tensors:{wire_format}"
+        )
 
-    async def _maybe_ladder_probe(self, stage: str) -> None:
+    async def _maybe_ladder_probe(self, stage: str, wire: str | None = None) -> None:
         """Post a zero-payload hash_only update so the ladder can hash SGLang's live state.
 
         The weights to hash live inside SGLang's TP workers, and the verl custom
@@ -414,9 +416,14 @@ class ServerAdapter(BaseRollout):
             return
         from verl.workers.rollout.sglang_rollout.delta_loader import ladder_probe_batch
 
+        prov = {
+            "wire": wire,
+            "cls": type(self).__name__,
+            "mode": str(getattr(self.config, "mode", None)),
+        }
         batch = [
             (name, t.to(torch.cuda.current_device()) if torch.cuda.is_available() else t)
-            for name, t in ladder_probe_batch(stage)
+            for name, t in ladder_probe_batch(stage, provenance=prov)
         ]
         await self._update_weights_delta_flush(batch, flush_cache=False)
 

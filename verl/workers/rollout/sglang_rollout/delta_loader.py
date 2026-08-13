@@ -204,7 +204,7 @@ def _check_quant_handshake(model: torch.nn.Module, spec: dict) -> None:
     model._delta_quant_handshake_done = True
 
 
-def _ladder_snapshot(model, stage: str) -> None:
+def _ladder_snapshot(model, stage: str, provenance: dict | None = None) -> None:
     """Hash the whole model and persist it, for the cross-run verification ladder.
 
     The ladder anchors on the checkpoint and then compares one path at a time:
@@ -252,7 +252,7 @@ def _ladder_snapshot(model, stage: str) -> None:
                 "shape": list(t.shape),
                 "b64": base64.b64encode(flat.view(torch.uint8).cpu().numpy().tobytes()).decode(),
             }
-        h = {"hashes": h, "raw_scales": raw}
+        h = {"hashes": h, "raw_scales": raw, "provenance": provenance}
         # Rank from the shard's own GPU, not from env: sglang's TP workers run
         # with one pid and identical env (the first ladder run had all eight
         # write ..._rank0.json, each clobbering the last), but each worker's
@@ -287,7 +287,7 @@ def _ladder_snapshot(model, stage: str) -> None:
         logger.warning("DELTA-LADDER: could not write %s stage: %s", stage, e)
 
 
-def ladder_probe_batch(stage: str) -> list[tuple[str, torch.Tensor]]:
+def ladder_probe_batch(stage: str, provenance: dict | None = None) -> list[tuple[str, torch.Tensor]]:
     """Build the zero-payload update that asks ``apply_delta`` to hash and return.
 
     Lives here, next to the parser, so the sender cannot drift from the spec
@@ -295,6 +295,11 @@ def ladder_probe_batch(stage: str) -> list[tuple[str, torch.Tensor]]:
     piggybacked on a real sync) and the ``hash_only`` branch below answers it.
     """
     spec = {"hash_only": True, "stage": stage}
+    if provenance:
+        # which sync path triggered this probe (wire format, caller mode):
+        # B17 left five servers holding plain-formula scales that NO known
+        # sender produces -- the provenance names each server's feed.
+        spec["provenance"] = provenance
     payload = torch.frombuffer(bytearray(json.dumps(spec).encode()), dtype=torch.uint8).clone()
     return [("__delta_spec__", payload)]
 
@@ -319,7 +324,7 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
         #
         # Returns BEFORE the checksum check on purpose: there are no positions and
         # no values to checksum, and demanding one would mean fabricating a payload.
-        _ladder_snapshot(model, str(spec.get("stage", "x")))
+        _ladder_snapshot(model, str(spec.get("stage", "x")), provenance=spec.get("provenance"))
         return
     values = tensors["__values__"]
     positions = tensors.get("__positions__")
