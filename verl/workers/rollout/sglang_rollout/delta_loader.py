@@ -381,6 +381,36 @@ def _apply_dense(
             return values[p["val_start"] : p["val_end"]].clone().view(dtype).view(p["shape"])
         return values[p["val_start"] : p["val_end"]].to(dtype).view(p["shape"])
 
+    # Wire tap AT THE DOOR: dump layer-0 scale units exactly as they arrived,
+    # BEFORE any weight_loader touches them. B10 left an impossible triangle --
+    # sender says it shipped the ckpt's power-of-two scales (sticky hits full),
+    # receiver code is a plain copy, yet the stored grids are amax/448-shaped
+    # reals. Whichever side of this dump disagrees is the lying vertex.
+    tap = os.environ.get("VERL_DELTA_WIRETAP_DIR")
+    if tap:
+        try:
+            import base64
+            import socket
+
+            os.makedirs(tap, exist_ok=True)
+            rec = {}
+            for p in params:
+                if "layers.0." in p["name"] and "scale" in p["name"]:
+                    t = _materialize(p).contiguous()
+                    rec[p["name"]] = {
+                        "dtype": p["dtype"],
+                        "shape": list(p["shape"]),
+                        "b64": base64.b64encode(t.reshape(-1).view(torch.uint8).cpu().numpy().tobytes()).decode(),
+                    }
+            if rec:
+                host = socket.gethostname().split(".")[0]
+                fn = os.path.join(tap, f"wire_{host}_p{os.getpid()}_{_VERIFY_STATS.get('params', 0)}.json")
+                with open(fn, "w") as fh:
+                    json.dump(rec, fh)
+                logger.warning("DELTA-WIRETAP: dumped %d layer-0 scale units -> %s", len(rec), fn)
+        except Exception as e:  # noqa: BLE001 - the tap must never kill the apply
+            logger.warning("DELTA-WIRETAP failed: %s", e)
+
     _load_in_chunks(model, params, _materialize)
 
 
