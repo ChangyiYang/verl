@@ -35,7 +35,8 @@ def make_data(action_pos, is_listen, frame_time, T=20, B=1):
     ft = torch.tensor(frame_time, dtype=torch.float32).reshape(B, -1)
     batch = TensorDict({
         "attention_mask": torch.ones(B, T, dtype=torch.int32),
-        "duplex_action_pos": ap,
+        "responses": torch.zeros(B, T, dtype=torch.long),
+        "duplex_action_response_pos": ap,
         "duplex_is_listen": il,
         "duplex_frame_time": ft,
     }, batch_size=B)

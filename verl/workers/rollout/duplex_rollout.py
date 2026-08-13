@@ -114,9 +114,14 @@ class DuplexRollout(BaseRollout):
     产出的 DataProto 除 verl 标准字段外，另带 duplex 专用字段（见 `generate_sequences`）。
     """
 
-    def __init__(self, module, config, tokenizer=None, **kwargs):
+    def __init__(self, module=None, config=None, tokenizer=None, **kwargs):
         super().__init__(config=config, model_config=kwargs.pop("model_config", None),
                          device_mesh=kwargs.pop("device_mesh", None))
+        if module is None:
+            raise RuntimeError(
+                "DuplexRollout requires a MiniCPMODuplex module. The verl worker factory "
+                "must explicitly wire the actor/rollout model lifecycle before distributed training."
+            )
         self.module = module              # MiniCPMODuplex（由 MiniCPMO.as_duplex() 得到）
         self.config = config
         self.tokenizer = tokenizer or getattr(module, "tokenizer", None)
@@ -126,14 +131,17 @@ class DuplexRollout(BaseRollout):
         self.chunk_seconds = float(getattr(config, "chunk_seconds", 1.0))
 
     # ------------------------------------------------------------------
-    # BaseRollout 抽象方法：本 rollout 与训练同进程 colocated，
-    # 不涉及独立推理引擎，故权重生命周期无需额外处理。
+    # BaseRollout lifecycle. resume/release are no-ops for the current PyTorch
+    # object, but weight synchronization must never silently succeed: the
+    # distributed verl worker does not yet inject a shared actor module.
     # ------------------------------------------------------------------
     async def resume(self, tags: list[str]):
         return None
 
     async def update_weights(self, weights, **kwargs):
-        return None
+        raise RuntimeError(
+            "DuplexRollout weight synchronization is not wired yet; refusing to continue with stale rollout weights"
+        )
 
     async def release(self):
         return None
@@ -177,6 +185,13 @@ class DuplexRollout(BaseRollout):
 
         dec.feed, dec.decode = traced_feed, traced_decode
         try:
+            # MiniCPMODuplex.prepare() resets the streaming processor and LLM
+            # decoder, but the current official implementation does not clear
+            # the audio encoder KV cache. Without this reset, sample b+1 in a
+            # serial batch is conditioned on sample b's audio.
+            model = getattr(duplex, "model", None)
+            if model is not None and hasattr(model, "audio_past_key_values"):
+                model.audio_past_key_values = None
             prep = {"prefix_system_prompt": system_prompt} if system_prompt else {}
             duplex.prepare(**prep)
             prompt_len = cursor["len"]      # 系统提示等条件输入的长度
@@ -247,6 +262,7 @@ class DuplexRollout(BaseRollout):
           duplex_embeds        [B, T, H]  完整输入嵌入序列（训练侧据此重算 logprob）
           duplex_token_ids     [B, T]     每位置的 token id；条件位（音频等）为 -1
           duplex_action_pos    [B, F]     每帧动作 token 的绝对位置（-1 为 padding）
+          duplex_action_response_pos [B,F] 动作在 verl response/reward 张量中的位置
           duplex_is_listen     [B, F]     每帧动作（1=listen, 0=speak）
           duplex_frame_time    [B, F]     每帧起点的 wall-clock 秒 —— 供窗口 reward 用
         """
@@ -263,7 +279,7 @@ class DuplexRollout(BaseRollout):
 
         embeds = torch.zeros(B, T, H, device=dev, dtype=dtype)
         attention_mask = torch.zeros(B, T, dtype=torch.int32, device=dev)
-        response_mask = torch.zeros(B, T, dtype=torch.int32, device=dev)
+        sequence_action_mask = torch.zeros(B, T, dtype=torch.int32, device=dev)
         position_ids = torch.zeros(B, T, dtype=torch.long, device=dev)
         seq_tokens = torch.full((B, T), PAD_ID, dtype=torch.long, device=dev)
         action_pos = torch.full((B, F), -1, dtype=torch.long, device=dev)
@@ -274,7 +290,8 @@ class DuplexRollout(BaseRollout):
             L = int(t.embeds.size(0))
             embeds[b, :L] = t.embeds
             attention_mask[b, :L] = 1
-            response_mask[b, :L] = t.response_mask.to(dev)
+            if t.action_positions.numel():
+                sequence_action_mask[b, t.action_positions.to(dev)] = 1
             position_ids[b, :L] = torch.arange(L, device=dev)
             seq_tokens[b, :L] = t.seq_token_ids.to(dev)
             n = len(t.frames)
@@ -285,14 +302,27 @@ class DuplexRollout(BaseRollout):
             frame_time[b, :n] = torch.tensor([f.t_start for f in t.frames],
                                              dtype=torch.float32, device=dev)
 
+        # Duplex has no natural prompt/response boundary, but the PPO stack
+        # requires the standard fields. Treat position 0 as a one-token causal
+        # seed and positions 1..T-1 as the response. Conditioning positions use
+        # a harmless placeholder id; the actor takes their embeddings from
+        # duplex_embeds instead of looking this id up.
+        safe_input_ids = seq_tokens.masked_fill(seq_tokens < 0, 0)
+        action_response_pos = action_pos - 1
+        action_response_pos.masked_fill_(action_pos <= 0, -1)
+
         batch = TensorDict(
             {
+                "prompts": safe_input_ids[:, :1],
+                "responses": safe_input_ids[:, 1:],
+                "input_ids": safe_input_ids,
                 "attention_mask": attention_mask,
-                "response_mask": response_mask,
+                "response_mask": sequence_action_mask[:, 1:],
                 "position_ids": position_ids,
                 "duplex_embeds": embeds,
                 "duplex_token_ids": seq_tokens,
                 "duplex_action_pos": action_pos,
+                "duplex_action_response_pos": action_response_pos,
                 "duplex_is_listen": is_listen,
                 "duplex_frame_time": frame_time,
             },

@@ -7,7 +7,7 @@
   T1 形状一致      —— embeds / mask / position_ids / 动作字段 batch 维一致
   T2 动作可定位    —— duplex_action_pos 指向的 token 必须是 <|listen|> 或 <|speak|>
   T3 动作与标志一致 —— duplex_is_listen 必须与该位置的 token id 吻合
-  T4 掩码合理      —— response_mask 仅在模型生成位置为 1，且 ⊆ attention_mask
+  T4 掩码合理      —— response_mask 仅在 LS action 位置为 1，且 ⊆ attention_mask
   T5 时间轴        —— duplex_frame_time 必须是 0,1,2,… × chunk_seconds
   T6 训练可复算    —— 用 duplex_embeds 做单次批量前向，在动作位复算 logprob，
                      并与 rollout 当时的决策一致（argmax 对齐）
@@ -62,7 +62,12 @@ def main() -> int:
         args.model, trust_remote_code=True,
         torch_dtype=getattr(torch, args.dtype), attn_implementation="sdpa",
     ).eval().to(args.device)
-    duplex = model.as_duplex(device=args.device, generate_audio=False, ls_mode="explicit")
+    original_init_tts = model.init_tts
+    model.init_tts = lambda **kwargs: None
+    try:
+        duplex = model.as_duplex(device=args.device, generate_audio=False, ls_mode="explicit")
+    finally:
+        model.init_tts = original_init_tts
 
     class Cfg:
         chunk_seconds = 1.0
@@ -81,6 +86,7 @@ def main() -> int:
     b = out.batch
     emb, amask, rmask = b["duplex_embeds"], b["attention_mask"], b["response_mask"]
     apos, islisten, ftime = b["duplex_action_pos"], b["duplex_is_listen"], b["duplex_frame_time"]
+    arpos = b["duplex_action_response_pos"]
     listen_id, speak_id = out.meta_info["listen_token_id"], out.meta_info["speak_token_id"]
     print(f"[shapes] embeds{tuple(emb.shape)} mask{tuple(amask.shape)} "
           f"action_pos{tuple(apos.shape)} frames={int((apos[0] >= 0).sum())}")
@@ -89,7 +95,12 @@ def main() -> int:
 
     # T1 形状
     B, T, _ = emb.shape
-    ok = amask.shape == (B, T) and rmask.shape == (B, T) and b["position_ids"].shape == (B, T)
+    ok = (
+        amask.shape == (B, T)
+        and rmask.shape == (B, T - 1)
+        and b["responses"].shape == (B, T - 1)
+        and b["position_ids"].shape == (B, T)
+    )
     print(f"  T1 形状一致            : {'PASS' if ok else 'FAIL'}")
     fails += [] if ok else ["T1"]
 
@@ -124,7 +135,13 @@ def main() -> int:
     print(f"  T3b 采样与 argmax 不同  : {n_diff}/{len(got_ids)} 帧（随机策略的正常表现）")
 
     # T4 掩码
-    ok = bool(((rmask[0] == 1) <= (amask[0] == 1)).all()) and int(rmask[0].sum()) > 0
+    valid_rpos = arpos[0][arpos[0] >= 0]
+    ok = (
+        bool(((rmask[0] == 1) <= (amask[0, 1:] == 1)).all())
+        and int(rmask[0].sum()) == len(valid_rpos)
+        and bool((rmask[0, valid_rpos] == 1).all())
+        and bool(torch.equal(valid_rpos, valid - 1))
+    )
     print(f"  T4 response_mask 合理  : {'PASS' if ok else 'FAIL'} "
           f"(生成位 {int(rmask[0].sum())}/{int(amask[0].sum())})")
     fails += [] if ok else ["T4"]

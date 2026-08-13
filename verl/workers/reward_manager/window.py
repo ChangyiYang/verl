@@ -64,7 +64,7 @@ class WindowRewardManager:
     """把每条样本的 RewardWindow 列表展开成与 responses 同形的 token 级张量。
 
     依赖 `DuplexRollout` 产出的三个字段：
-        duplex_action_pos  [B,F]  每帧动作 token 的绝对位置（-1 为 padding）
+        duplex_action_response_pos [B,F] 动作在 responses/reward 中的位置
         duplex_is_listen   [B,F]  该帧动作是否为 listen
         duplex_frame_time  [B,F]  该帧起点的 wall-clock 秒
 
@@ -95,23 +95,18 @@ class WindowRewardManager:
 
     # ------------------------------------------------------------------
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
-        for k in ("duplex_action_pos", "duplex_is_listen", "duplex_frame_time"):
+        for k in ("duplex_action_response_pos", "duplex_is_listen", "duplex_frame_time"):
             if k not in data.batch:
                 raise KeyError(
                     f"WindowRewardManager 需要 DuplexRollout 产出的 `{k}`；"
                     f"当前 batch 只有 {sorted(data.batch.keys())}"
                 )
 
-        action_pos = data.batch["duplex_action_pos"]      # [B,F]
+        action_pos = data.batch["duplex_action_response_pos"]  # [B,F]
         is_listen = data.batch["duplex_is_listen"]        # [B,F]
         frame_time = data.batch["duplex_frame_time"]      # [B,F]
 
-        # reward 张量与 responses 同形；duplex 下没有独立 responses 时退回按序列长度
-        if "responses" in data.batch:
-            reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
-        else:
-            ref = data.batch["attention_mask"]
-            reward_tensor = torch.zeros(ref.shape, dtype=torch.float32, device=ref.device)
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
 
         B, T = reward_tensor.shape
         extra: dict[str, list] = defaultdict(list)

@@ -20,6 +20,34 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, unpad_input
 
 
+def rebuild_duplex_inputs_embeds(
+    recorded_embeds: torch.Tensor, token_ids: torch.Tensor, embedding: torch.nn.Module
+) -> torch.Tensor:
+    """Combine fixed conditioning embeds with current, differentiable token embeds."""
+    mixed = recorded_embeds.detach().clone()
+    token_mask = token_ids >= 0
+    if bool(token_mask.any()):
+        current = embedding(token_ids[token_mask].long())
+        mixed[token_mask] = current.to(dtype=mixed.dtype)
+    return mixed
+
+
+def _unpad_input_portable(values: torch.Tensor, attention_mask: torch.Tensor):
+    """Use flash-attn's helper when present, otherwise a pure PyTorch equivalent."""
+    try:
+        return unpad_input(values, attention_mask)
+    except ModuleNotFoundError as error:
+        if error.name is None or not error.name.startswith("flash_attn"):
+            raise
+        mask = attention_mask.bool()
+        indices = mask.flatten().nonzero().flatten()
+        flat = values.flatten(0, 1).index_select(0, indices)
+        lengths = mask.sum(dim=1, dtype=torch.int32)
+        cu_seqlens = torch.nn.functional.pad(lengths.cumsum(0), (1, 0))
+        max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
+        return flat, indices, cu_seqlens, max_seqlen
+
+
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     """
     Convert TensorDict from left-right padding to no-padding format.
@@ -50,7 +78,7 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     tu.assign_non_tensor_data(data, "max_seq_len", max_seq_len)
     tu.assign_non_tensor_data(data, "max_response_len", max_response_len)
 
-    input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+    input_ids_rmpad, indices, cu_seqlens, *_ = _unpad_input_portable(input_ids.unsqueeze(-1), attention_mask)
     tu.assign_non_tensor_data(data, "indices", indices)
 
     input_ids_nested = torch.nested.nested_tensor_from_jagged(input_ids_rmpad.squeeze(-1), offsets=cu_seqlens)
@@ -69,6 +97,21 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     data["input_ids"] = input_ids_nested
     data["position_ids"] = position_ids_nested
     data["loss_mask"] = data["response_mask"]
+
+    # Duplex trajectories carry the already-encoded conditioning stream next
+    # to token ids. Keep both tensors on exactly the same jagged layout as
+    # input_ids. The actor rebuilds differentiable embeddings at token
+    # positions and reuses duplex_embeds only for conditioning positions.
+    if "duplex_embeds" in data:
+        duplex_embeds = data["duplex_embeds"]
+        duplex_token_ids = data["duplex_token_ids"]
+        embeds_list, token_ids_list = [], []
+        for i in range(attention_mask.shape[0]):
+            curr_mask = attention_mask[i].bool()
+            embeds_list.append(duplex_embeds[i, curr_mask])
+            token_ids_list.append(duplex_token_ids[i, curr_mask])
+        data["duplex_embeds"] = torch.nested.as_nested_tensor(embeds_list, layout=torch.jagged)
+        data["duplex_token_ids"] = torch.nested.as_nested_tensor(token_ids_list, layout=torch.jagged)
 
     routed_experts = data.get("routed_experts", None)
     if routed_experts is not None and not routed_experts.is_nested:

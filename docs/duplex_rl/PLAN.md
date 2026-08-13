@@ -120,7 +120,7 @@ verl/workers/rollout/base.py                 # 改 1 行：_ROLLOUT_REGISTRY 加
 **(b) 训练能跑（系统级）**
 | # | 检查项 | 阈值 |
 |---|---|---|
-| 2.4 | 端到端 1 个 GRPO step | 完成、loss 有限、无 NaN、梯度非零 |
+| 2.4 | 端到端 1 个 GRPO step | ✅ 1×MI325X G=2 gate 通过：ratio=1、loss/grad finite、参数变化且策略方向正确 |
 | 2.5 | checkpoint 存取 | 存后重载，前向输出与存前**逐比特一致** |
 | 2.6 | 连续 50 step 稳定性 | 不 OOM、不 hang（日志 20s 内必须有增长）、entropy 不塌到 0 |
 

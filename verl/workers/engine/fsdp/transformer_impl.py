@@ -71,7 +71,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
-from verl.workers.utils.padding import build_attention_mask_from_nested
+from verl.workers.utils.padding import build_attention_mask_from_nested, rebuild_duplex_inputs_embeds
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
@@ -1085,6 +1085,23 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
+    def _build_duplex_inputs_embeds(self, recorded_embeds: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+        """Rebuild the mixed audio/text stream without freezing token embeddings.
+
+        ``recorded_embeds`` is authoritative at conditioning positions
+        (``token_ids == -1``). At token positions we deliberately redo the
+        embedding lookup with the current actor weights so gradients reach the
+        embedding table/LoRA path and the training policy cannot silently use
+        stale rollout embeddings.
+        """
+        wrapped = getattr(self.module, "module", self.module)
+        get_input_embeddings = getattr(wrapped, "get_input_embeddings", None)
+        if get_input_embeddings is None:
+            raise TypeError("Duplex actor model must implement get_input_embeddings()")
+        embedding = get_input_embeddings()
+
+        return rebuild_duplex_inputs_embeds(recorded_embeds, token_ids, embedding)
+
     def prepare_model_inputs(self, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -1100,6 +1117,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
+        is_duplex = "duplex_embeds" in micro_batch
+        if is_duplex and use_fused_kernels:
+            raise NotImplementedError("Duplex inputs_embeds does not support fused kernels yet")
+        if is_duplex and self.use_ulysses_sp:
+            raise NotImplementedError("Duplex inputs_embeds does not support Ulysses sequence parallelism yet")
         pass_packed_cu_seqlens = getattr(self, "pass_packed_cu_seqlens", False)
 
         if not isinstance(temperature, torch.Tensor):
@@ -1130,7 +1152,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
             # for compute the log_prob
-            input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+            if is_duplex:
+                duplex_token_ids = micro_batch["duplex_token_ids"].values().unsqueeze(0)
+                # Labels are the actual sampled LS/text ids, not placeholder
+                # input_ids at audio-conditioning positions. Invalid labels are
+                # harmlessly mapped to zero; response_mask excludes them.
+                input_ids_rmpad_rolled = torch.roll(duplex_token_ids, shifts=-1, dims=1)
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.masked_fill(input_ids_rmpad_rolled < 0, 0)
+            else:
+                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
 
             # pad and slice the inputs if sp > 1
             sp_pad_size = 0
@@ -1176,6 +1206,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "attention_mask": None,
                 "position_ids": position_ids_rmpad,
             }
+            if is_duplex:
+                recorded = micro_batch["duplex_embeds"].values()
+                token_ids = micro_batch["duplex_token_ids"].values()
+                model_inputs.pop("input_ids")
+                model_inputs["inputs_embeds"] = self._build_duplex_inputs_embeds(recorded, token_ids).unsqueeze(0)
             if packed_cu_seqlens is not None and pass_packed_cu_seqlens:
                 model_cu_seqlens = packed_cu_seqlens
                 if self.use_ulysses_sp and sp_pad_size:
@@ -1198,7 +1233,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 seq_len_effective = input_ids.offsets().diff()
                 max_seq_len = int(seq_len_effective.max().item())
 
-                input_ids_rmpad_rolled = torch.roll(input_ids.values(), shifts=-1, dims=0)
+                if is_duplex:
+                    duplex_ids = micro_batch["duplex_token_ids"]
+                    duplex_ids_padded = torch.nested.to_padded_tensor(
+                        duplex_ids, padding=-1, output_size=(batch_size, max_seq_len)
+                    )
+                    input_ids_rmpad_rolled = torch.roll(duplex_ids.values(), shifts=-1, dims=0)
+                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.masked_fill(input_ids_rmpad_rolled < 0, 0)
+                else:
+                    duplex_ids_padded = None
+                    input_ids_rmpad_rolled = torch.roll(input_ids.values(), shifts=-1, dims=0)
                 output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
                 # we store the per sample temperature
                 output_args["temperature"] = temperature
@@ -1225,6 +1269,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     "attention_mask": attention_mask,
                     "position_ids": position_ids,
                 }
+                if is_duplex:
+                    hidden_size = micro_batch["duplex_embeds"].values().shape[-1]
+                    recorded = torch.nested.to_padded_tensor(
+                        micro_batch["duplex_embeds"],
+                        padding=0.0,
+                        output_size=(batch_size, max_seq_len, hidden_size),
+                    )
+                    model_inputs.pop("input_ids")
+                    model_inputs["inputs_embeds"] = self._build_duplex_inputs_embeds(recorded, duplex_ids_padded)
 
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")

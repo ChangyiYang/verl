@@ -115,8 +115,10 @@ bf16 下 `log P(listen)` 偏差可达 0.19 ⇒ ratio ≈ e^0.19 ≈ **1.21**，�
 |---|---|---|
 | `duplex_embeds` | [B,T,H] | 完整输入嵌入序列，训练侧据此单次批量前向重算 logprob |
 | `duplex_token_ids` | [B,T] | 每位置 token id；音频等条件位为 -1 |
-| `response_mask` | [B,T] | 1=模型生成位（可训练），0=条件输入 |
+| `prompts` / `responses` | [B,1] / [B,T−1] | verl 标准 causal 坐标；duplex 把首位置当 seed |
+| `response_mask` | [B,T−1] | 仅 LS action 位为 1；内容/条件/padding 均为 0 |
 | `duplex_action_pos` | [B,F] | 每帧动作 token 的绝对位置 |
+| `duplex_action_response_pos` | [B,F] | action 在 response/reward 中的位置，恒为绝对位置 −1 |
 | `duplex_is_listen` | [B,F] | 每帧动作（1=listen） |
 | `duplex_frame_time` | [B,F] | 每帧起点秒 —— 窗口 reward 的时间锚 |
 
@@ -146,3 +148,60 @@ RewardWindow(t_start, t_end, value, term="trigger", only_on=None)   # only_on: '
 窗口来源二选一：`non_tensor_batch["reward_windows"]`（每样本一个列表），
 或 `compute_windows(item, i)` 回调。本类只做「时间→token 位→填分」，
 **不做语义判定**（TP/FP/TOO_EARLY… 由上游按 MIB 口径产出后转成窗口）。
+
+---
+
+# Actor `inputs_embeds` + 终极 G=2 E2E（2026-08-13）
+
+## 真实 GPU backward gate
+
+Job `1846175`，1×MI325X；真实 16kHz PCM 经官方 streaming audio encoder 和
+`DuplexRollout`，再走 verl **实际** `FSDPEngineWithLMHead.prepare_model_inputs()`：
+
+```text
+sequence=37 actions=2 loss=0.362780
+embedding_grad_l1=55.750000 finite=True
+PASS: one batched duplex forward/backward completed; no checkpoint written
+```
+
+训练输入的关键实现：条件位复用 rollout 录下的 audio embeds；token 位用当前 actor 的
+`get_input_embeddings()` 重查，保证 embedding 参数可导。动作 token 位 `m` 的 label
+由 `m−1` 的 causal logits 预测，因此 reward/logprob 使用 response 坐标 `m−1`。
+
+同时为 ROCm 补了 `flash_attn.bert_padding` 不存在时的纯 PyTorch unpad fallback。
+
+## 终极 G=2 counterfactual GRPO gate
+
+Job `1846276`，1×MI325X。两条 trajectory 使用同一真实 PCM 和完全相同的首帧 causal prefix，
+仅在第一个 LS action 分叉为 LISTEN / SPEAK。`WindowRewardManager` 给 `[-1,+1]`，
+经 group normalization 后做一次 LoRA PPO/GRPO update：
+
+```text
+rewards=[-1.0, 1.0] advantages=[-1.0, 1.0]
+step0_ratios=[1.0, 1.0] loss=-0.000000 grad_norm=6.091956
+delta_logp_speak=+1.902779 delta_logp_listen=-0.003471
+checks={ratio=1, finite_loss, params_changed, speak_up, listen_down}: ALL TRUE
+PASS: PCM -> duplex rollout -> window reward -> GRPO update -> correct policy direction
+No checkpoint written
+```
+
+第一次 E2E 还抓到官方 wrapper 的真实缺陷：`prepare()` 没清空 audio encoder KV cache，
+导致串行 batch 的后一条样本继承前一条音频上下文。`DuplexRollout` 现已在每条 trajectory
+开始前显式清空 `model.audio_past_key_values`；反事实 prefix 一致性检查随后通过。
+
+## 仍未完成：distributed worker ownership / weight sync
+
+以上 gate 验证了算法和张量链路，但**没有**证明现有 `ActorRolloutRefWorker` 能直接启动 duplex：
+worker factory 当前构造 rollout 时只传 config/model_config/device_mesh，没有传
+`MiniCPMODuplex module`；而 actor engine 的 FSDP/LoRA module 与 streaming wrapper 的模型所有权
+尚未统一。因此原先“同进程所以无需 sync”的说法不成立——colocation 不等于共享同一个 Python model object。
+
+`DuplexRollout` 现在对此 fail closed：缺 module 时立即报错，`update_weights()` 也拒绝静默 no-op，
+避免训练继续使用 stale rollout weights。下一步必须二选一并做两步一致性 gate：
+
+1. **推荐：shared-module lifecycle** —— worker 建 actor 时同时创建指向同一参数对象的 duplex wrapper；
+   update 后 rollout 自动看见新权重，不做 tensor copy。
+2. 独立 PyTorch rollout copy —— 实现从 FSDP actor 到 MiniCPM decoder 的显式 named-tensor sync。
+
+验收：optimizer step 后随机抽 ≥10 个参数，actor/rollout 逐比特一致；同一固定 prefix 的
+LS logits 在 sync 前后随参数改变且 actor/rollout 一致。完成前不能宣称完整 verl distributed E2E 已打通。
