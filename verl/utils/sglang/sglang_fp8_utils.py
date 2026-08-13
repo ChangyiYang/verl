@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import re
 from collections.abc import Iterable
 from typing import Any
 
 from verl.utils.fp8_utils import FP8QuantizerHelper
+
+logger = logging.getLogger(__name__)
 
 
 def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -176,8 +179,23 @@ class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
         bm_bn = self.quant_config.get("weight_block_size") if isinstance(self.quant_config, dict) else None
         bm_bn = tuple(bm_bn or (128, 128))
         ckpt_scales = load_ckpt_scales(self._ckpt_path)
+        n_fp8_passthrough = 0
         async for k, v in ensure_async_iterator(weights):
             if not self.should_quantize_param(k):
+                yield (k, v)
+                continue
+            if v.element_size() == 1:
+                # The stream is ALREADY quantized upstream (the bridge's
+                # auto-fp8 export ships codes + scale companions). Quantizing
+                # fp8 codes garbles them (their float view is not the master),
+                # and the freshly emitted scale joins the original in the same
+                # push -- SGLang's fused wqkv_a loader dies on
+                # "duplicate shard kv" (R2, 2026-08-13 20:12, all 10 hybrid
+                # servers at once). Pass codes through untouched; their scale
+                # companions are not in the quantize manifest and pass through
+                # on their own. Fidelity of a pre-quantized stream is the
+                # upstream producer's business, not this converter's.
+                n_fp8_passthrough += 1
                 yield (k, v)
                 continue
             x = v.to(torch.float32)
@@ -198,6 +216,13 @@ class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
             self._n_q = _n_q
             if _n_q % 32 == 0:
                 torch.cuda.empty_cache()
+        if n_fp8_passthrough:
+            logger.warning(
+                "DSv4 named_tensors converter: %d params arrived already fp8-quantized and passed "
+                "through untouched -- their scales keep the UPSTREAM dialect (not sticky/ue8m0). "
+                "Fix the exporter if checkpoint-exact scales are required on this path.",
+                n_fp8_passthrough,
+            )
 
 
 def named_tensors_quant_mode(quantization, hf_config) -> str | None:

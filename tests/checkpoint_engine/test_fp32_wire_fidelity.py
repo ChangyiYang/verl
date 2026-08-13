@@ -202,3 +202,95 @@ def test_named_tensors_quant_mode_raw_escape_hatch(monkeypatch):
     assert named_tensors_quant_mode(None, _HFCfg("deepseek_v4", DSV4_QC)) is None
     # the explicit flag still wins over the escape hatch (it was an explicit ask)
     assert named_tensors_quant_mode("fp8", _HFCfg("deepseek_v4", DSV4_QC)) == "dsv4"
+
+
+def test_dsv4_converter_passes_pre_quantized_streams_through(tmp_path):
+    """R2's crash (2026-08-13 20:12): the hybrid full sync already carries the
+    bridge's fp8 codes + scale companions; quantizing the codes garbles them
+    and the second scale kills SGLang's fused loader with 'duplicate shard kv'.
+    Pre-quantized input must pass through byte-identical, with no extra scale."""
+    import asyncio
+    import json
+
+    from verl.utils.sglang.sglang_fp8_utils import DeepseekV4FP8QuantizerHelper
+
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    _write_safetensors(
+        ckpt / "model-00001-of-00001.safetensors",
+        {
+            "model.layers.0.self_attn.wkv.weight": (torch.randn(256, 256) * 0.01).to(torch.float8_e4m3fn),
+            "model.layers.0.self_attn.wkv.scale": torch.ones(2, 2, dtype=torch.float32),
+        },
+    )
+    (ckpt / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.self_attn.wkv.weight": "model-00001-of-00001.safetensors",
+                    "model.layers.0.self_attn.wkv.scale": "model-00001-of-00001.safetensors",
+                }
+            }
+        )
+    )
+    helper = DeepseekV4FP8QuantizerHelper({"weight_block_size": [128, 128]}, str(ckpt))
+
+    codes = (torch.randn(256, 256) * 0.01).to(torch.float8_e4m3fn)
+    scale = torch.full((2, 2), 2.0**-7, dtype=torch.float32)
+    stream = [
+        ("model.layers.0.self_attn.wkv.weight", codes),
+        ("model.layers.0.self_attn.wkv.scale", scale),
+    ]
+
+    async def collect():
+        return [(k, v) async for k, v in helper.quant_weights_by_name(iter(stream))]
+
+    out = asyncio.run(collect())
+    names = [k for k, _ in out]
+    assert names == [n for n, _ in stream], f"stream shape changed: {names}"
+    assert torch.equal(out[0][1].view(torch.uint8), codes.view(torch.uint8)), "codes must pass through untouched"
+    assert torch.equal(out[1][1], scale), "the upstream scale must pass through untouched"
+
+
+def test_dsv4_converter_still_quantizes_bf16_input(tmp_path):
+    """The passthrough must not disable the converter for genuine bf16 pushes."""
+    import asyncio
+    import json
+
+    from verl.utils.sglang.sglang_fp8_utils import DeepseekV4FP8QuantizerHelper
+
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    _write_safetensors(
+        ckpt / "model-00001-of-00001.safetensors",
+        {
+            "model.layers.0.self_attn.wkv.weight": (torch.randn(256, 256) * 0.01).to(torch.float8_e4m3fn),
+            "model.layers.0.self_attn.wkv.scale": torch.exp2(
+                torch.randint(-10, -5, (2, 2)).float()
+            ),
+        },
+    )
+    (ckpt / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.self_attn.wkv.weight": "model-00001-of-00001.safetensors",
+                    "model.layers.0.self_attn.wkv.scale": "model-00001-of-00001.safetensors",
+                }
+            }
+        )
+    )
+    helper = DeepseekV4FP8QuantizerHelper({"weight_block_size": [128, 128]}, str(ckpt))
+
+    async def collect():
+        stream = [("model.layers.0.self_attn.wkv.weight", torch.randn(256, 256, dtype=torch.bfloat16) * 0.01)]
+        return [(k, v) async for k, v in helper.quant_weights_by_name(iter(stream))]
+
+    out = asyncio.run(collect())
+    assert [k for k, _ in out] == [
+        "model.layers.0.self_attn.wkv.weight",
+        "model.layers.0.self_attn.wkv.scale",
+    ]
+    assert out[0][1].element_size() == 1, "bf16 input must come out as fp8 codes"
+    log = torch.log2(out[1][1])
+    assert torch.equal(log, log.round()), "emitted scales must stay ue8m0 (power of two)"
