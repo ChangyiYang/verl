@@ -198,3 +198,35 @@ class DeepseekV4FP8QuantizerHelper(SGLangFP8QuantizerHelper):
             self._n_q = _n_q
             if _n_q % 32 == 0:
                 torch.cuda.empty_cache()
+
+
+def named_tensors_quant_mode(quantization, hf_config) -> str | None:
+    """Which verl-side quantizer the named_tensors full-sync path must use.
+
+    Returns ``"dsv4"``, ``"generic"``, or None (send raw).
+
+    The DSv4 answer deliberately does NOT depend on the rollout's
+    ``quantization`` flag: that flag doubles as an init-time switch that
+    rewrites ``hf_config.quantization_config``, so delta runs keep it unset --
+    and with it unset the hybrid ServerAdapter used to push raw bf16, which
+    SGLang then requantized with its own plain ``amax/448`` formula. That is
+    the fingerprint the R1 sync0 probes caught on every hybrid server (17% of
+    scales power-of-two by coincidence) while the delta-fed standalone held
+    100% power-of-two. An fp8-SERIALIZED checkpoint is itself the instruction
+    to ship codes+scales: quantize verl-side (ue8m0 + sticky, the converter
+    the ladder validated bit-exact) whenever the checkpoint is fp8, flag or
+    no flag. ``VERL_NAMED_TENSORS_RAW=1`` restores the raw-bf16 legacy for
+    debugging.
+    """
+    import os
+
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type == "deepseek_v4" and os.environ.get("VERL_NAMED_TENSORS_RAW") != "1":
+        qc = getattr(hf_config, "quantization_config", None)
+        if qc is not None:
+            get = qc.get if isinstance(qc, dict) else lambda k, d=None: getattr(qc, k, d)
+            if get("quant_method") == "fp8":
+                return "dsv4"
+    if quantization == "fp8":
+        return "dsv4" if model_type == "deepseek_v4" else "generic"
+    return None

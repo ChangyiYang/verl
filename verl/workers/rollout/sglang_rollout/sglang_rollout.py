@@ -352,29 +352,37 @@ class ServerAdapter(BaseRollout):
                 await self._engine.load_lora_adapter_from_tensor(req)
         else:
             update_weights_bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
-            if self.config.get("quantization", None) == "fp8":
-                if getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v4":
-                    # DSv4 ships a serialized fp8(ue8m0) ckpt with native naming;
-                    # quantize by the ckpt's own manifest instead of name rules.
-                    from verl.utils.sglang.sglang_fp8_utils import DeepseekV4FP8QuantizerHelper
+            # The quantizer choice comes from the CHECKPOINT, not only from the
+            # rollout's quantization flag: raw bf16 pushed at an fp8-serialized
+            # DSv4 server gets requantized by SGLang's own plain amax/448
+            # formula, silently splitting the fleet from the delta-fed replicas
+            # (R1 sync0 provenance: every hybrid server held plain scales, the
+            # standalone held the checkpoint's). See named_tensors_quant_mode.
+            from verl.utils.sglang.sglang_fp8_utils import named_tensors_quant_mode
 
-                    logger.info("Convert bf16 weights to DSv4-native fp8(ue8m0) before loading")
-                    fp8_quantizer_helper = DeepseekV4FP8QuantizerHelper(
-                        self.model_config.hf_config.quantization_config,
-                        self.model_config.local_path,
-                    )
-                    weights = fp8_quantizer_helper.quant_weights_by_name(weights)
-                else:
-                    from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper
+            quant_mode = named_tensors_quant_mode(
+                self.config.get("quantization", None), self.model_config.hf_config
+            )
+            if quant_mode == "dsv4":
+                # DSv4 ships a serialized fp8(ue8m0) ckpt with native naming;
+                # quantize by the ckpt's own manifest instead of name rules.
+                from verl.utils.sglang.sglang_fp8_utils import DeepseekV4FP8QuantizerHelper
 
-                    logger.info("Convert bf16 weights to fp8 format before loading")
-                    fp8_quantizer_helper = SGLangFP8QuantizerHelper(self.model_config.hf_config.quantization_config)
-                    weights = fp8_quantizer_helper.quant_weights_by_name(
-                        weights,
-                        dtype=self.model_config.hf_config.dtype,
-                    )
-            else:
-                weights = weights
+                logger.info("Convert bf16 weights to DSv4-native fp8(ue8m0) before loading")
+                fp8_quantizer_helper = DeepseekV4FP8QuantizerHelper(
+                    self.model_config.hf_config.quantization_config,
+                    self.model_config.local_path,
+                )
+                weights = fp8_quantizer_helper.quant_weights_by_name(weights)
+            elif quant_mode == "generic":
+                from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper
+
+                logger.info("Convert bf16 weights to fp8 format before loading")
+                fp8_quantizer_helper = SGLangFP8QuantizerHelper(self.model_config.hf_config.quantization_config)
+                weights = fp8_quantizer_helper.quant_weights_by_name(
+                    weights,
+                    dtype=self.model_config.hf_config.dtype,
+                )
 
             async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
                 await sgl_update_weights(

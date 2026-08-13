@@ -159,3 +159,46 @@ def test_dsv4_fp32_families_are_exactly_the_406_plus_mtp():
     # and the quantized/bf16 bulk stays out
     assert pred("model.layers.7.self_attn.wkv.weight") is False
     assert pred("model.layers.7.self_attn.wkv.weight.scale") is False
+
+
+class _HFCfg:
+    def __init__(self, model_type=None, quantization_config=None):
+        self.model_type = model_type
+        if quantization_config is not None:
+            self.quantization_config = quantization_config
+
+
+DSV4_QC = {"quant_method": "fp8", "scale_fmt": "ue8m0", "weight_block_size": [128, 128]}
+
+
+def test_named_tensors_quant_mode_fp8_ckpt_needs_no_flag(monkeypatch):
+    """The R1 finding: with the quantization flag unset, hybrid servers were fed
+    raw bf16 and SGLang requantized with the plain formula. An fp8-serialized
+    DSv4 checkpoint alone must select the verl-side converter."""
+    from verl.utils.sglang.sglang_fp8_utils import named_tensors_quant_mode
+
+    monkeypatch.delenv("VERL_NAMED_TENSORS_RAW", raising=False)
+    assert named_tensors_quant_mode(None, _HFCfg("deepseek_v4", DSV4_QC)) == "dsv4"
+    assert named_tensors_quant_mode("fp8", _HFCfg("deepseek_v4", DSV4_QC)) == "dsv4"
+
+
+def test_named_tensors_quant_mode_legacy_paths_unchanged(monkeypatch):
+    from verl.utils.sglang.sglang_fp8_utils import named_tensors_quant_mode
+
+    monkeypatch.delenv("VERL_NAMED_TENSORS_RAW", raising=False)
+    # flag-driven generic path for non-DSv4 models
+    assert named_tensors_quant_mode("fp8", _HFCfg("llama", None)) == "generic"
+    # no flag, no fp8 ckpt -> raw, exactly as before
+    assert named_tensors_quant_mode(None, _HFCfg("llama", None)) is None
+    assert named_tensors_quant_mode(None, _HFCfg("deepseek_v4", None)) is None
+    # DSv4 with a NON-fp8 quant config does not auto-select
+    assert named_tensors_quant_mode(None, _HFCfg("deepseek_v4", {"quant_method": "awq"})) is None
+
+
+def test_named_tensors_quant_mode_raw_escape_hatch(monkeypatch):
+    from verl.utils.sglang.sglang_fp8_utils import named_tensors_quant_mode
+
+    monkeypatch.setenv("VERL_NAMED_TENSORS_RAW", "1")
+    assert named_tensors_quant_mode(None, _HFCfg("deepseek_v4", DSV4_QC)) is None
+    # the explicit flag still wins over the escape hatch (it was an explicit ask)
+    assert named_tensors_quant_mode("fp8", _HFCfg("deepseek_v4", DSV4_QC)) == "dsv4"
