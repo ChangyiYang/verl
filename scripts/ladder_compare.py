@@ -22,7 +22,9 @@ from pathlib import Path
 
 
 def load(path: Path) -> dict:
-    return json.loads(path.read_text())
+    d = json.loads(path.read_text())
+    # newer snapshots nest hashes beside raw scale dumps
+    return d["hashes"] if isinstance(d, dict) and "hashes" in d else d
 
 
 def diff_one(a: dict, b: dict, label: str) -> bool:

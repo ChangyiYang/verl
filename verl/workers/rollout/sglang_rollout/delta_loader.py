@@ -230,6 +230,29 @@ def _ladder_snapshot(model, stage: str) -> None:
 
         os.makedirs(d, exist_ok=True)
         h = _model_state_hashes(model)
+        # Raw bytes for the small scale grids alongside the hashes. B8 proved a
+        # hash can only say WHICH tensor differs, not WHY: sticky quantization
+        # fully engaged (hits=33346 misses=0) yet every quantized pair still
+        # hashed differently from the disk-load state -- indistinguishable
+        # between wrong VALUES and a different storage LAYOUT (sglang's disk
+        # load runs transform_sf_into_required_layout; the wire path may not).
+        # Values settle it: compare these bytes across ckpt / load / seed.
+        import base64
+        import itertools as _it
+
+        raw = {}
+        for name, t in _it.chain(model.named_parameters(), model.named_buffers()):
+            if t is None or not (0 < t.numel() * t.element_size() <= 4096):
+                continue
+            if "scale" not in name.rsplit(".", 1)[-1]:
+                continue
+            flat = t.detach().contiguous().reshape(-1)
+            raw[name] = {
+                "dtype": str(t.dtype),
+                "shape": list(t.shape),
+                "b64": base64.b64encode(flat.view(torch.uint8).cpu().numpy().tobytes()).decode(),
+            }
+        h = {"hashes": h, "raw_scales": raw}
         # Rank from the shard's own GPU, not from env: sglang's TP workers run
         # with one pid and identical env (the first ladder run had all eight
         # write ..._rank0.json, each clobbering the last), but each worker's

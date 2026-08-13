@@ -24,6 +24,7 @@ class TinyModel(torch.nn.Module):
         super().__init__()
         self.w = torch.nn.Parameter(torch.arange(8, dtype=torch.float32), requires_grad=False)
         self.register_buffer("codes", torch.arange(4, dtype=torch.uint8).view(torch.float8_e4m3fn))
+        self.register_buffer("weight_scale_inv", torch.full((2, 2), 0.5))
 
 
 def _spec_tensor(spec: dict) -> torch.Tensor:
@@ -50,8 +51,17 @@ def test_hash_only_writes_a_snapshot(tmp_path, monkeypatch):
     apply_delta(TinyModel(), _hash_only_update(stage="1"))
     files = list(tmp_path.glob("ladder_nccl_1*_rank*.json"))
     assert len(files) == 1, f"expected one snapshot, got {[f.name for f in files]}"
-    h = json.loads(files[0].read_text())
+    d = json.loads(files[0].read_text())
+    h = d["hashes"]
     assert "w" in h and "codes" in h, "must hash parameters AND buffers"
+    assert isinstance(d.get("raw_scales"), dict), "small scale grids must be dumped raw beside the hashes"
+    import base64
+
+    import numpy as np
+
+    rs = d["raw_scales"]["weight_scale_inv"]
+    vals = np.frombuffer(base64.b64decode(rs["b64"]), dtype=np.float32)
+    assert vals.tolist() == [0.5] * 4, "raw dump must carry the exact bytes"
 
 
 def test_hash_only_needs_no_checksum(tmp_path, monkeypatch):
