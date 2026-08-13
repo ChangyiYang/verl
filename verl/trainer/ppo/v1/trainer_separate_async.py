@@ -227,6 +227,21 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         self.current_mode = HybridEngineMode.TRAINER
 
     def add_replicas_to_balancer(self):
+        # VERL_HYBRID_REPLICAS_SERVE=0: hybrid replicas never enter the load
+        # balancer, so generation runs on the standalone stack alone. This is
+        # what _hybrid_sync_masked's docstring believed always happened -- in
+        # reality _setup leaves current_mode=ROLLOUT and registers the hybrid
+        # replicas, they serve from the first batch, and the first
+        # switch_to_trainer() then ABORTS their in-flight requests: the agent
+        # loop waits forever on the aborted responses and the run deadlocks
+        # (R1, 2026-08-13 19:15, 29 tasks orphaned, every GPU at 0%). B-series
+        # runs never hit this because noop generation kept the servers empty.
+        # Guarding registration (both call sites: _setup and switch_to_rollout)
+        # makes the switch a no-op on live traffic; the hybrid weight sync and
+        # its probes are untouched. remove_servers pops absent ids safely.
+        if os.environ.get("VERL_HYBRID_REPLICAS_SERVE") == "0":
+            logger.info("VERL_HYBRID_REPLICAS_SERVE=0: hybrid replicas stay out of the load balancer")
+            return
         global_load_balancer = self.standalone_server_manager.global_load_balancer
         servers = dict(
             zip(self.llm_server_manager.server_addresses, self.llm_server_manager.server_handles, strict=True)
