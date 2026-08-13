@@ -1158,6 +1158,51 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             encoding=self.encoding, params=params, positions_cpu=positions_u8, values_gpu=values_gpu, checksum=cks
         )
 
+    def _send_full_seed_sharded(self, engine, spec, global_steps: int | None = None) -> dict[str, float] | None:
+        """Seed from the STEADY shard stream over the values-only wire.
+
+        One producer for the first and every later sync: the shard stream's
+        comm-stubbed mapping transforms and sticky-ue8m0 quantizer make the
+        tensors, a dense per-record gather (values only, sequential P2P)
+        assembles them on rank 0, and the pairs feed the SAME values-only
+        bucketing as the legacy seed -- so the receiver sees a wire format it
+        has always known. Snapshots are primed inline from the very flats that
+        shipped, so the next steady diff base equals the shipped state by
+        construction and the separate prime pass disappears.
+        """
+        from verl.checkpoint_engine.delta_sync.sparse_gather import dense_gather_group
+        from verl.utils.device import is_cuda_available
+
+        gen, _ = engine.get_per_tensor_param_shard(quant_spec=spec)
+        engine._delta_shard_snap = getattr(engine, "_delta_shard_snap", {})
+        snaps = engine._delta_shard_snap
+
+        def pairs():
+            meta = None
+            for name, flat, sspec in gen:
+                flat = flat.detach().contiguous().view(-1)
+                # prime the steady diff base inline (same layout/pinning as
+                # prime_delta_snapshots)
+                snap = snaps.get(name)
+                if snap is None or snap.numel() != flat.numel():
+                    snap = torch.empty_like(flat, device="cpu", pin_memory=is_cuda_available)
+                    snaps[name] = snap
+                snap.copy_(flat, non_blocking=True)
+                if meta is None:
+                    meta = engine._quant_group_meta
+                slots, sizes, dtype_str = meta[name]
+                # replicas do not contribute: zero their size vector so the
+                # gather's exactly-one-owner assert sees the true ownership map
+                sizes_eff = sizes if sspec.contributes else [0] * len(sizes)
+                pieces = dense_gather_group(flat, sizes_eff, sspec.gather_group)
+                if pieces is None:
+                    continue
+                dtype = getattr(torch, dtype_str)
+                for (slot_name, shape), piece in zip(slots, pieces, strict=True):
+                    yield slot_name, piece.view(dtype).reshape(shape)
+
+        return self._send_full_seed(pairs(), global_steps, bytes_wire=True)
+
     def _send_full_seed(
         self,
         weights: Generator[tuple[str, torch.Tensor], None, None],
@@ -1320,15 +1365,19 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # between the two would have sent the next optimisation at the wrong half.
         t_total0 = time.perf_counter()
         seeding = not self._shard_seeded
-        # seed-as-full-steady is OPT-IN (VERL_DELTA_SEED_SHARD=1) until dense
-        # entries land: the sparse wire stages ~9 B/element on the GPU (int64
-        # positions beside fp8 values) and the padded gather adds a same-sized
-        # pad copy, which OOMed B14 at the 100%-coverage work point with 773 MiB
-        # free. Quantization is single-authored EITHER way -- the offline
+        # seed-via-shard (OPT-IN, VERL_DELTA_SEED_SHARD=1): the seed's tensors
+        # come from the SAME shard stream as every steady delta -- same mapping
+        # transforms, same sticky quantizer -- and travel the values-only wire
+        # via a dense gather (no positions exist at any point; the sparse
+        # transport's ~9 B/element staging is what OOMed B14 at 100% coverage).
+        # Quantization is single-authored EITHER way -- the offline
         # bitwise-parity test pins seed and steady quantizers to identical
         # codes+scales on identical input; this switch only picks the transport.
         seed_via_shard = os.environ.get("VERL_DELTA_SEED_SHARD") == "1"
-        if seeding and (not self.quantize_fp8 or not seed_via_shard):
+        if seeding and self.quantize_fp8 and seed_via_shard:
+            spec = self._fp8_spec(engine)
+            return self._send_full_seed_sharded(engine, spec, global_steps)
+        if seeding:
             # LEGACY seed: stream the bridge's full export over the values-only
             # wire, then prime. Kept for the bf16 (no quant spec) wire and as an
             # env-selectable fallback; the fp8 default below replaces it because

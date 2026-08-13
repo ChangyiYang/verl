@@ -56,3 +56,12 @@ def test_steady_without_seed_still_fails_loud():
 
     with pytest.raises(AssertionError, match="seed"):
         list(hf_delta_export(iter([("p", torch.ones(4), _spec())]), {}, _entry))
+
+
+def test_dense_gather_group_single_process_slices_by_slot():
+    from verl.checkpoint_engine.delta_sync.sparse_gather import dense_gather_group
+
+    flat = torch.arange(10, dtype=torch.float32)
+    pieces = dense_gather_group(flat, [4, 0, 6], group=None)
+    assert [p.numel() for p in pieces] == [4, 0, 6]
+    assert torch.equal(pieces[0], flat[:4]) and torch.equal(pieces[2], flat[4:])
