@@ -227,6 +227,15 @@ def quantize_hf_stream(weights, spec: QuantSpec):
         if t.dim() != 2 or not spec.should_quantize(name):
             yield name, t
             continue
+        # Fail loud on already-quantized input. Quantizing fp8 codes "works"
+        # numerically (amax≈448 -> scale 1) and is exactly how the bridge's
+        # auto-fp8 export slipped a second quantizer into the seed for a week:
+        # the output looked plausible and only a wire tap told the two apart.
+        assert t.element_size() > 1, (
+            f"quantize_hf_stream got {t.dtype} for {name!r}: the input is already "
+            "quantized codes, not a bf16 master. The export upstream must produce "
+            "plain bf16 (pass explicit non-fp8 conversion_tasks to the bridge)."
+        )
         t = t.to(torch.bfloat16)
         grid = local_blockwise_absmax(t, block, 0, tuple(t.shape))
         if getattr(spec, "scale_fmt", None) == "ue8m0":

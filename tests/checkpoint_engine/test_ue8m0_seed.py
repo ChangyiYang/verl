@@ -149,6 +149,17 @@ def test_load_ckpt_scales_keys_by_weight_name(tmp_path):
     assert set(scales) == {"a.weight"} and scales["a.weight"].item() == 2.0
 
 
+def test_stream_refuses_already_quantized_input():
+    """fp8 codes in = a second quantizer upstream (the bridge's auto-fp8 export).
+    Quantizing codes 'works' (amax~448 -> scale 1) and shipped for a week;
+    only a wire tap told the two apart. Refuse instead of double-quantizing."""
+    import pytest
+
+    codes = torch.arange(64, dtype=torch.uint8).view(torch.float8_e4m3fn).reshape(8, 8)
+    with pytest.raises(AssertionError, match="already"):
+        list(quantize_hf_stream(iter([("x.weight", codes)]), _spec("ue8m0")))
+
+
 def test_build_config_preserves_scale_fmt():
     cfg = build_sglang_fp8_quant_config({"quantization_config": {"weight_block_size": [128, 128], "scale_fmt": "ue8m0"}})
     assert cfg.get("scale_fmt") == "ue8m0", f"scale_fmt dropped again: {cfg}"
