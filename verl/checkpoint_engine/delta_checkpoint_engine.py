@@ -996,10 +996,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # scales so unchanged blocks reproduce the checkpoint's bytes exactly.
         # The path env is route B's existing single-source-of-truth handle.
         ckpt_scales = None
+        ckpt_path = os.environ.get("VERL_FP8_CKPT_PATH") or getattr(
+            getattr(engine, "model_config", None), "local_path", None
+        )
         if scale_fmt == "ue8m0":
-            ckpt_path = os.environ.get("VERL_FP8_CKPT_PATH") or getattr(
-                getattr(engine, "model_config", None), "local_path", None
-            )
             if ckpt_path:
                 from verl.utils.fp8_sharded import load_ckpt_scales
 
@@ -1013,11 +1013,20 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                     "no model_config.local_path): quantizing without the checkpoint's scales -- "
                     "blocks with scale headroom will not reproduce the checkpoint's bytes."
                 )
+        # fp32 wire fidelity for the checkpoint's non-quantized fp32 families
+        # (DSv4: hc_*, ape, attn_sink, e_score_correction_bias). Header-only
+        # read, memoised per process like the fp8 predicate.
+        fp32_predicate = None
+        if ckpt_path:
+            from verl.utils.fp8_ckpt_dtypes import build_ckpt_fp32_predicate
+
+            fp32_predicate = build_ckpt_fp32_predicate(ckpt_path)
         return QuantSpec(
             weight_block_size=tuple(h.quant_config.get("weight_block_size", [128, 128])),
             should_quantize=self._quant_predicate(h),
             scale_fmt=scale_fmt,
             ckpt_scales=ckpt_scales,
+            fp32_predicate=fp32_predicate,
         )
 
     def _quant_predicate(self, helper):
@@ -1201,7 +1210,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
                 for (slot_name, shape), piece in zip(slots, pieces, strict=True):
                     yield slot_name, piece.view(dtype).reshape(shape)
 
-        return self._send_full_seed(pairs(), global_steps, bytes_wire=True)
+        return self._send_full_seed(
+            pairs(), global_steps, bytes_wire=True, fp32_predicate=getattr(spec, "fp32_predicate", None)
+        )
 
     def _send_full_seed(
         self,
@@ -1209,6 +1220,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         global_steps: int | None = None,
         verify: bool = False,
         bytes_wire: bool = False,
+        fp32_predicate=None,
     ) -> dict[str, float] | None:
         """First sync: stream the backend's FULL HF export over the values-only wire.
 
@@ -1269,7 +1281,18 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             tensor = tensor.detach()
             # fp8 codes and their fp32 scale_inv tensors ARE the rollout state:
             # never fold them into the bf16 wire dtype.
-            keep_dtype = tensor.element_size() == 1 or name.endswith("_scale_inv")
+            # fp32 sources stay fp32: DSv4 stores its sensitive special params
+            # (hyper-connection coefficients, ape tables, attention sinks) in
+            # fp32, and folding them to the bf16 wire dtype silently costs 16
+            # mantissa bits (measured: rel err p50 1.35e-3, max 3.9e-3 across
+            # all five families) -- a train/serve fidelity gap the verify sweep
+            # cannot see, because the replay folds identically. These tensors
+            # total ~68 MB fp32 against a 267 GB seed.
+            keep_dtype = (
+                tensor.element_size() == 1
+                or name.endswith("_scale_inv")
+                or (fp32_predicate is not None and fp32_predicate(name))
+            )
             if tensor.is_floating_point() and tensor.dtype != self.rollout_dtype and not keep_dtype:
                 tensor = tensor.to(self.rollout_dtype)
             if not is_r0:
@@ -1387,7 +1410,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             # different producers.
             spec = self._fp8_spec(engine) if self.quantize_fp8 else None
             full, _ = engine.get_per_tensor_param(raw_master=spec is not None, quant_spec=spec)
-            metrics = self._send_full_seed(full, global_steps, bytes_wire=spec is not None)
+            metrics = self._send_full_seed(
+                full, global_steps, bytes_wire=spec is not None, fp32_predicate=getattr(spec, "fp32_predicate", None)
+            )
             engine.prime_delta_snapshots(quant_spec=spec)
             return metrics
         # the BACKEND owns delta production for every dtype: with a quant spec
@@ -1658,8 +1683,15 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         if verify:
             # collective on every rank: the full export assembles per tensor.
             if self.quantize_fp8:
-                full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=self._fp8_spec(engine))
-                self._send_full_seed(_verify_sample(full), global_steps, verify=True, bytes_wire=True)
+                vspec = self._fp8_spec(engine)
+                full, _ = engine.get_per_tensor_param(raw_master=True, quant_spec=vspec)
+                self._send_full_seed(
+                    _verify_sample(full),
+                    global_steps,
+                    verify=True,
+                    bytes_wire=True,
+                    fp32_predicate=getattr(vspec, "fp32_predicate", None),
+                )
             else:
                 full, _ = engine.get_per_tensor_param()
                 self._send_full_seed(_verify_sample(full), global_steps, verify=True)

@@ -48,6 +48,23 @@ logger = logging.getLogger(__name__)
 _FP8_DTYPES = {"F8_E4M3", "F8_E5M2"}
 
 
+def _tail(n: str) -> str:
+    """Longest-common-tail key for matching checkpoint names to export names.
+
+    The export renames as it converts (model.layers.N.self_attn.* vs
+    layers.N.attn.*), so match on the longest common tail rather than on the
+    full string. Normalise the one rename we know about first: SGLang/HF spell
+    the block ``self_attn`` while Megatron-Bridge's DSv4 mapping writes
+    ``attn`` -- without this the tails differ in the very segment we keep.
+    Three components, not two: two would reduce both ``attn.wkv.weight`` (fp8)
+    and ``compressor.wkv.weight`` (bf16) to ``wkv.weight`` -- a collision
+    between exactly the pair whose dtypes disagree.
+    """
+    n = n.replace(".self_attn.", ".attn.")
+    parts = n.split(".")
+    return ".".join(parts[-3:]) if len(parts) >= 3 else n
+
+
 # Both entry points are memoised per model path. They walk EVERY shard of the
 # checkpoint and read its safetensors header -- 46 shards for DSv4-FP8 -- and
 # nothing upstream cached the result: _quant_predicate rebuilt the predicate on
@@ -94,21 +111,8 @@ def build_ckpt_fp8_predicate(model_path: str):
         logger.info("fp8 dtype map: %s has no fp8 tensors; falling back", model_path)
         return None
 
-    # The export renames as it converts (model.layers.N.self_attn.* vs
-    # layers.N.attn.*), so match on the longest common tail rather than on the
-    # full string. Two tensors never share a tail this long in practice, and a
-    # collision would have to be between an fp8 and a non-fp8 tensor to matter.
-    def _tail(n: str) -> str:
-        # Normalise the one rename we know about first: SGLang/HF spell the block
-        # ``self_attn`` while Megatron-Bridge's DSv4 mapping writes ``attn``.
-        # Without this the tails differ in the very segment we keep.
-        n = n.replace(".self_attn.", ".attn.")
-        parts = n.split(".")
-        # Three components, not two: two would reduce both ``attn.wkv.weight``
-        # (fp8) and ``compressor.wkv.weight`` (bf16) to ``wkv.weight`` -- a
-        # collision between exactly the pair whose dtypes disagree.
-        return ".".join(parts[-3:]) if len(parts) >= 3 else n
-
+    # Two tensors never share a 3-component tail in practice, and a collision
+    # would have to be between an fp8 and a non-fp8 tensor to matter.
     fp8_tails = {_tail(n) for n in fp8_names}
     all_tails = {_tail(n) for n in dtypes}
     logger.info(
@@ -130,5 +134,53 @@ def build_ckpt_fp8_predicate(model_path: str):
             return False
         # Unknown name (scales the export adds, fused params, ...) -> not fp8.
         return False
+
+    return predicate
+
+
+@functools.lru_cache(maxsize=4)
+def build_ckpt_fp32_predicate(model_path: str):
+    """A ``name -> bool`` predicate for params the checkpoint stores in FP32,
+    or None if the checkpoint cannot answer.
+
+    DSv4 keeps a handful of sensitive families in fp32 on disk and in the
+    serving engine (hyper-connection coefficients, ape compressor position
+    embeddings, attention sinks, router e_score_correction_bias -- ~68 MB
+    total). The wire used to fold every non-fp8 float to the rollout dtype,
+    silently costing these params 16 mantissa bits per sync (measured rel err
+    p50 1.35e-3, max 3.9e-3), invisibly to the verify sweep because the replay
+    folds identically. The sender must know which params to keep fp32, and the
+    routing has to be identical on every rank -- including ranks that do not
+    own the param and see no tensor -- so the decision comes from the
+    checkpoint's own headers, exactly like the fp8 predicate above.
+
+    Quantization scale grids (``<stem>.scale`` / ``*_scale_inv``) are also F32
+    in the headers but are NOT this predicate's business: they ride the wire's
+    dedicated scale group and are excluded here.
+    """
+    dtypes = read_checkpoint_dtypes(model_path)
+    if not dtypes:
+        logger.warning("fp32 dtype map: no safetensors headers under %s; falling back", model_path)
+        return None
+
+    def _is_scale(n: str) -> bool:
+        return n.endswith(".scale") or n.endswith("_scale_inv")
+
+    fp32_names = {n for n, d in dtypes.items() if d == "F32" and not _is_scale(n)}
+    if not fp32_names:
+        logger.info("fp32 dtype map: %s stores no non-scale fp32 tensors", model_path)
+        return None
+    fp32_tails = {_tail(n) for n in fp32_names}
+    logger.info(
+        "fp32 dtype map: %d fp32 non-scale tensors (%d distinct tails) out of %d",
+        len(fp32_names),
+        len(fp32_tails),
+        len(dtypes),
+    )
+
+    def predicate(param_name: str) -> bool:
+        if _is_scale(param_name):
+            return False
+        return param_name in fp32_names or _tail(param_name) in fp32_tails
 
     return predicate

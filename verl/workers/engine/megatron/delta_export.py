@@ -520,6 +520,7 @@ def quant_shard_stream(engine, quant_spec):
     # scales in place forever.
     scale_fmt = getattr(quant_spec, "scale_fmt", None)
     ckpt_scales = getattr(quant_spec, "ckpt_scales", None)
+    fp32_pred = getattr(quant_spec, "fp32_predicate", None)
     block = list(quant_spec.weight_block_size)
     bm, bn = int(block[0]), int(block[1])
     index = engine._mcore_export_index()
@@ -604,6 +605,7 @@ def quant_shard_stream(engine, quant_spec):
             "c": {"slots": [], "pieces": [], "dtype": FP8_DTYPE, "contributes": owns_replica},
             "s": {"slots": [], "pieces": [], "dtype": torch.float32, "contributes": group_rank == 0},
             "b": {"slots": [], "pieces": [], "dtype": torch.bfloat16, "contributes": owns_replica},
+            "f": {"slots": [], "pieces": [], "dtype": torch.float32, "contributes": owns_replica},
         }
         qi = 0
         for sname, sshape in slots:
@@ -623,6 +625,21 @@ def quant_shard_stream(engine, quant_spec):
                 groups["c"]["pieces"].append(codes.reshape(-1))
                 groups["s"]["slots"].append((sname + "_scale_inv", tuple(descale.shape)))
                 groups["s"]["pieces"].append(descale.reshape(-1))
+            elif fp32_pred is not None and fp32_pred(sname):
+                # fp32 passthrough group: same fidelity rule as the seed wire --
+                # DSv4's special params are fp32 on disk and in the serving
+                # engine; folding them to bf16 costs 16 mantissa bits every
+                # time they change. Routed by the CHECKPOINT-derived predicate,
+                # never by the local tensor's presence or dtype: group slot
+                # layouts must be identical on every rank, and non-owner ranks
+                # see t is None here.
+                flat = (
+                    t.to(torch.float32).reshape(-1)
+                    if t is not None
+                    else torch.empty(0, dtype=torch.float32, device=dev)
+                )
+                groups["f"]["slots"].append((sname, tuple(sshape)))
+                groups["f"]["pieces"].append(flat)
             else:
                 flat = (
                     t.to(torch.bfloat16).reshape(-1)

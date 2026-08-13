@@ -145,6 +145,12 @@ class QuantSpec:
     # the dequantized master -- recomputing from amax alone necessarily
     # tightens those blocks and changes their bytes (B6's residual 620).
     ckpt_scales: object | None = None  # dict[str, torch.Tensor] | None
+    # name -> bool: params the CHECKPOINT stores in fp32 (DSv4's special
+    # families). The wire keeps these fp32 instead of folding to the rollout
+    # dtype; the predicate is checkpoint-derived so every rank -- including
+    # ranks that do not own the param and see no tensor -- routes the slot
+    # into the same wire group. None keeps the legacy fold-to-rollout-dtype.
+    fp32_predicate: object | None = None  # Callable[[str], bool] | None
 
 
 def sticky_ue8m0_descale(amax: torch.Tensor, ckpt_scale: torch.Tensor | None) -> torch.Tensor:

@@ -905,14 +905,30 @@ class MegatronEngine(BaseEngine):
                 # weight_dtype cannot be passed to export_hf_weights here: with
                 # caller-supplied tasks the stream rejects the combination, and
                 # without tasks the auto-fp8 branch fires first.
-                # bf16 stamping is byte-neutral for the few fp32 outputs (HC
-                # alphas): the seed folds non-fp8 floats to rollout_dtype
-                # (bf16) on the wire anyway. (None rows filtered for the same
-                # reason as the QAT branch above.)
+                # The stamp is bf16 EXCEPT for the checkpoint's fp32 families
+                # (spec.fp32_predicate; DSv4's hc_*/ape/attn_sink/router bias):
+                # stamping those bf16 is where the seed used to lose their last
+                # 16 mantissa bits -- the hook-disarming stamp itself did the
+                # folding, before the wire ever saw the tensor. Stamping them
+                # float32 disarms the hook identically (any set weight_dtype
+                # skips it) and keeps the master's exact bytes. A fused task
+                # with mixed outputs stamps float32 for all of them; harmless,
+                # since bf16->fp32 is exact and the wire folds non-predicate
+                # names back to bf16. (None rows filtered for the same reason
+                # as the QAT branch above.)
                 import dataclasses
 
+                fp32_pred = getattr(quant_spec, "fp32_predicate", None)
+
+                def _stamp_dtype(task):
+                    if fp32_pred is None:
+                        return torch.bfloat16
+                    hf = task.mapping.hf_param  # resolved concrete name(s)
+                    names = [hf] if isinstance(hf, str) else list(hf.values())
+                    return torch.float32 if any(fp32_pred(n) for n in names) else torch.bfloat16
+
                 tasks = [
-                    dataclasses.replace(t, weight_dtype=torch.bfloat16)
+                    dataclasses.replace(t, weight_dtype=_stamp_dtype(t))
                     for t in self.bridge.get_conversion_tasks(self.module)
                     if t is not None
                 ]
