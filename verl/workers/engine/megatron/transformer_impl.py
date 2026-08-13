@@ -890,18 +890,32 @@ class MegatronEngine(BaseEngine):
             from verl.utils.fp8_sharded import quantize_hf_stream
 
             if not self.vanilla_bridge:
-                # The bridge auto-routes fp8-serialized checkpoints to its OWN
-                # quantizing export (export_weight_dtype=="fp8" ->
-                # build_export_fp8_tasks): the stream then carries fp8 codes +
-                # plain amax/448 ".scale" companions, and the wrap below
-                # re-"quantizes" those codes -- B11's wire tap caught both
-                # (all-ones weight_scale_inv beside the bridge's plain .scale).
-                # Handing the bridge explicit PLAIN tasks skips that branch, so
-                # it exports the bf16 master and quantization stays
-                # single-authored here: sticky ue8m0, bitwise-identical to the
-                # steady shard quantizer by construction. (None rows filtered
-                # for the same reason as the QAT branch above.)
-                tasks = [t for t in self.bridge.get_conversion_tasks(self.module) if t is not None]
+                # For fp8-serialized checkpoints the bridge quantizes on export
+                # at TWO levels, and both must be disarmed or the wrap below
+                # receives fp8 codes instead of the bf16 master:
+                #   1. export_hf_weights auto-builds build_export_fp8_tasks
+                #      (quantizing task family) -- bypassed by handing it
+                #      explicit plain tasks;
+                #   2. the DSv4 bridge's maybe_modify_converted_hf_weight hook
+                #      re-quantizes EVERY task's output to match the fp8 shard
+                #      index (plain amax/448 scales -- the ".scale" family
+                #      B11's wire tap caught) -- skipped only when
+                #      task.weight_dtype is set, so stamp it on each task
+                #      (frozen dataclass, hence replace()).
+                # weight_dtype cannot be passed to export_hf_weights here: with
+                # caller-supplied tasks the stream rejects the combination, and
+                # without tasks the auto-fp8 branch fires first.
+                # bf16 stamping is byte-neutral for the few fp32 outputs (HC
+                # alphas): the seed folds non-fp8 floats to rollout_dtype
+                # (bf16) on the wire anyway. (None rows filtered for the same
+                # reason as the QAT branch above.)
+                import dataclasses
+
+                tasks = [
+                    dataclasses.replace(t, weight_dtype=torch.bfloat16)
+                    for t in self.bridge.get_conversion_tasks(self.module)
+                    if t is not None
+                ]
                 per_tensor_param = self.bridge.export_hf_weights(self.module, conversion_tasks=tasks)
             per_tensor_param = quantize_hf_stream(per_tensor_param, quant_spec)
 
