@@ -533,7 +533,19 @@ def quant_shard_stream(engine, quant_spec):
             dev = torch.device(torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         else:
             with _xspan("convert"):
-                outs = rec.probe.megatron_to_hf(rec.param.data.to(torch.bfloat16), rec.module)
+                # fp32 params keep their dtype through the probe transform: the
+                # blanket bf16 cast here was the FOURTH fold site for DSv4's
+                # fp32 special families -- the f-group downstream faithfully
+                # shipped values that had already lost their last 16 mantissa
+                # bits at this line (R3 sweep: changed=381, every one an fp32
+                # special, while seed-side values were exact). Quantized and
+                # bf16 params are re-cast at their own group sites, so keeping
+                # fp32 here only changes what the f-group sees. Transforms
+                # rearrange elements and are dtype-agnostic.
+                src = rec.param.data
+                if src.dtype != torch.float32:
+                    src = src.to(torch.bfloat16)
+                outs = rec.probe.megatron_to_hf(src, rec.module)
             dev = rec.param.device
         pg = rec.spec.gather_group
         group_rank = dist.get_rank(pg) if pg is not None else dist.get_rank()
