@@ -233,3 +233,8 @@ step 1 后的 policy v1，没有 stale trajectory。两步的 reward 范围均�
 advantage 有限且非零，gradient norm 为 `5.9375` / `6.0`，峰值 GPU allocated
 约 `95.34 GiB`。Slurm 状态 `COMPLETED (0:0)`，用时 2m53s；`trainer.save_freq=-1`，
 未写 checkpoint。完整日志：`trainer-e2e-1868875.log`。
+
+后续清理了未使用的 experimental `DuplexWindowRewardManager`：token-level window score
+由 agent loop 直接计算并写入 `rm_scores`，不启动 reward worker。Job `1874107`
+以 `reward.num_workers=0` 重跑同一两步 gate，`COMPLETED (0:0)`，v0 → v1 → v2、
+770-tensor full sync、两步普通 `q_proj.weight` 变化和 actor/rollout logit audit 全部再次通过。

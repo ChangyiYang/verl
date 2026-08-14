@@ -6,9 +6,8 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from verl import DataProto
-from verl.experimental.reward_loop.reward_manager.duplex_window import DuplexWindowRewardManager
 from verl.utils.duplex_prompt import extract_duplex_audio_and_system_prompt
+from verl.utils.duplex_reward import score_duplex_windows
 from verl.workers.rollout.duplex_rollout import DuplexRollout, pack_duplex_payloads
 
 
@@ -145,28 +144,16 @@ def test_duplex_weight_update_rejects_shape_mismatch():
 
 
 def test_async_duplex_window_reward_stays_on_action_positions():
-    batch = TensorDict(
-        {
-            "responses": torch.zeros(1, 4, dtype=torch.long),
-            "duplex_action_response_pos": torch.tensor([[0, 2]]),
-            "duplex_is_listen": torch.tensor([[1, 0]], dtype=torch.int32),
-            "duplex_frame_time": torch.tensor([[0.0, 1.0]]),
-        },
-        batch_size=1,
+    reward, hit_count = score_duplex_windows(
+        responses=torch.zeros(4, dtype=torch.long),
+        action_response_pos=torch.tensor([0, 2]),
+        is_listen=torch.tensor([1, 0], dtype=torch.int32),
+        frame_time=torch.tensor([0.0, 1.0]),
+        windows=[
+            {"t_start": 0.0, "t_end": 0.0, "value": -1.0, "only_on": "listen"},
+            {"t_start": 1.0, "t_end": 1.0, "value": 1.0, "only_on": "speak"},
+        ],
     )
-    data = DataProto(
-        batch=batch,
-        non_tensor_batch={
-            "reward_windows": np.asarray(
-                [[{"t_start": 0.0, "t_end": 0.0, "value": -1.0, "only_on": "listen"},
-                  {"t_start": 1.0, "t_end": 1.0, "value": 1.0, "only_on": "speak"}]],
-                dtype=object,
-            )
-        },
-    )
-    manager = object.__new__(DuplexWindowRewardManager)
 
-    output = asyncio.run(manager.run_single(data))
-    rewards = DuplexWindowRewardManager.assemble_rm_scores(data, [output["reward_score"]])
-
-    assert rewards.tolist() == [[-1.0, 0.0, 1.0, 0.0]]
+    assert reward.tolist() == [-1.0, 0.0, 1.0, 0.0]
+    assert hit_count == 2

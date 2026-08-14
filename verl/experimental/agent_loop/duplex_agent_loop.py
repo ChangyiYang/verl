@@ -16,8 +16,8 @@ import numpy as np
 import torch
 
 from verl import DataProto
-from verl.experimental.reward_loop.reward_manager.duplex_window import score_duplex_windows
 from verl.utils.duplex_prompt import extract_duplex_audio_and_system_prompt
+from verl.utils.duplex_reward import score_duplex_windows
 from verl.utils.ray_utils import auto_await
 from verl.workers.rollout.duplex_rollout import pack_duplex_payloads
 
