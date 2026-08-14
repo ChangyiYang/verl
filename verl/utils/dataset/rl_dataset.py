@@ -320,7 +320,11 @@ class RLHFDataset(Dataset):
         for message in messages:
             if not images and not videos and not audios:
                 continue
-            assert self.processor is not None, "processor is needed to process multimodal data"
+            # Audio-only agent loops can carry the raw waveform/path directly
+            # and do not need a Hugging Face processor. Images and videos still
+            # require one for their model-specific preprocessing contract.
+            if (images or videos) and self.processor is None:
+                raise AssertionError("processor is needed to process image/video data")
 
             content = message["content"]
             if not isinstance(content, str):

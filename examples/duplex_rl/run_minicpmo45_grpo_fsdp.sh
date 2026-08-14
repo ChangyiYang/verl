@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -x
+
+MODEL_PATH=${MODEL_PATH:-openbmb/MiniCPM-o-4_5}
+TRAIN_FILE=${TRAIN_FILE:?Set TRAIN_FILE to the parquet built by tools/duplex_rl/build_trainer_fixture.py}
+TEST_FILE=${TEST_FILE:-${TRAIN_FILE}}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-2}
+PROJECT_NAME=${PROJECT_NAME:-duplex_rl}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-minicpmo45_full_grpo_gate}
+PYTHON_BIN=${PYTHON_BIN:-python3}
+
+"${PYTHON_BIN}" -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    algorithm.norm_adv_by_std_in_grpo=True \
+    algorithm.use_kl_in_reward=False \
+    data.train_files="${TRAIN_FILE}" \
+    data.val_files="${TEST_FILE}" \
+    data.train_batch_size=1 \
+    data.max_prompt_length=64 \
+    data.max_response_length=2048 \
+    data.filter_overlong_prompts=False \
+    data.truncation=error \
+    data.shuffle=False \
+    data.dataloader_num_workers=0 \
+    data.return_multi_modal_inputs=False \
+    data.trust_remote_code=True \
+    actor_rollout_ref.hybrid_engine=True \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.trust_remote_code=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=False \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.lora_rank=0 \
+    +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
+    +actor_rollout_ref.model.override_config.init_vision=False \
+    +actor_rollout_ref.model.override_config.init_audio=True \
+    +actor_rollout_ref.model.override_config.init_tts=False \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.weight_decay=0 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_epochs=1 \
+    actor_rollout_ref.actor.use_dynamic_bsz=False \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.use_torch_compile=False \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    actor_rollout_ref.actor.fsdp_config.dtype=bfloat16 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.use_orig_params=True \
+    actor_rollout_ref.actor.fsdp_config.use_torch_compile=False \
+    actor_rollout_ref.rollout.name=duplex \
+    actor_rollout_ref.rollout.mode=async \
+    actor_rollout_ref.rollout.dtype=bfloat16 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.data_parallel_size=1 \
+    actor_rollout_ref.rollout.max_num_seqs=1 \
+    actor_rollout_ref.rollout.max_model_len=2048 \
+    actor_rollout_ref.rollout.n=2 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.free_cache_engine=True \
+    actor_rollout_ref.rollout.calculate_log_probs=False \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=naive \
+    actor_rollout_ref.rollout.agent.num_workers=1 \
+    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl.experimental.agent_loop.duplex_agent_loop.DuplexAgentLoopManager \
+    +actor_rollout_ref.rollout.duplex.chunk_seconds=1.0 \
+    +actor_rollout_ref.rollout.duplex.init_vision=False \
+    +actor_rollout_ref.rollout.duplex.init_tts=False \
+    +actor_rollout_ref.rollout.duplex.counterfactual_first_actions=True \
+    reward.reward_model.enable=False \
+    reward.num_workers=1 \
+    reward.reward_manager.source=register \
+    reward.reward_manager.name=duplex_window \
+    trainer.use_v1=False \
+    trainer.balance_batch=False \
+    trainer.logger='["console"]' \
+    trainer.project_name="${PROJECT_NAME}" \
+    trainer.experiment_name="${EXPERIMENT_NAME}" \
+    trainer.n_gpus_per_node=1 \
+    trainer.nnodes=1 \
+    trainer.total_epochs=1 \
+    trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
+    trainer.val_before_train=False \
+    trainer.test_freq=-1 \
+    trainer.save_freq=-1 \
+    trainer.resume_mode=disable \
+    "$@"

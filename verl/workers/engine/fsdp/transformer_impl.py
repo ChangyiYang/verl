@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import types
 import warnings
 from contextlib import contextmanager, nullcontext
 from inspect import signature
@@ -256,6 +257,45 @@ class FSDPEngine(BaseEngine):
                     config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
                 )
+
+                # MiniCPMO's remote-code forward expects a multimodal ``data``
+                # dict, while duplex RL deliberately replays already-recorded
+                # mixed embeddings. Adapt the *root* module forward so the call
+                # still enters through FSDP hooks and then delegates to the
+                # underlying causal LLM.
+                if getattr(module.config, "model_type", None) == "minicpmo":
+                    original_forward = module.forward
+
+                    def _verl_minicpmo_forward(
+                        this,
+                        data=None,
+                        input_ids=None,
+                        inputs_embeds=None,
+                        attention_mask=None,
+                        position_ids=None,
+                        use_cache=None,
+                        **kwargs,
+                    ):
+                        if inputs_embeds is not None:
+                            if input_ids is not None:
+                                raise ValueError("Duplex MiniCPMO forward accepts exactly one of input_ids/inputs_embeds")
+                            return this.llm(
+                                input_ids=None,
+                                inputs_embeds=inputs_embeds,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                use_cache=use_cache,
+                                **kwargs,
+                            )
+                        if data is None:
+                            data = {
+                                "input_ids": input_ids,
+                                "position_ids": position_ids,
+                                "attention_mask": attention_mask,
+                            }
+                        return original_forward(data, use_cache=use_cache, **kwargs)
+
+                    module.forward = types.MethodType(_verl_minicpmo_forward, module)
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.
                 # talker / code2wav for Qwen3-Omni Thinker-only training).

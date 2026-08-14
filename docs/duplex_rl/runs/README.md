@@ -189,7 +189,7 @@ No checkpoint written
 导致串行 batch 的后一条样本继承前一条音频上下文。`DuplexRollout` 现已在每条 trajectory
 开始前显式清空 `model.audio_past_key_values`；反事实 prefix 一致性检查随后通过。
 
-## 仍未完成：distributed worker ownership / weight sync
+## 历史缺口：distributed worker ownership / weight sync（已解决）
 
 以上 gate 验证了算法和张量链路，但**没有**证明现有 `ActorRolloutRefWorker` 能直接启动 duplex：
 worker factory 当前构造 rollout 时只传 config/model_config/device_mesh，没有传
@@ -205,3 +205,31 @@ worker factory 当前构造 rollout 时只传 config/model_config/device_mesh，
 
 验收：optimizer step 后随机抽 ≥10 个参数，actor/rollout 逐比特一致；同一固定 prefix 的
 LS logits 在 sync 前后随参数改变且 actor/rollout 一致。完成前不能宣称完整 verl distributed E2E 已打通。
+
+---
+
+# RayPPOTrainer 两步真实 E2E（2026-08-14）
+
+Job `1868875`，1×MI325X，运行实际 `RayPPOTrainer.fit()`。`ActorRolloutRefWorker`
+中 FSDP actor 与官方 HF MiniCPM-o rollout model 共置，通过现有 Ray load balancer /
+worker handle 跑 async agent loop，不经 HTTP。输入为 28.16 s、16 kHz mono 真实 PCM，
+G=2 轨迹分别强制首个动作为 LISTEN / SPEAK，`WindowReward` 给出 `[-1,+1]`。
+
+```text
+[duplex] full_weight_sync version=0 tensors=770 changed_transformer=initial_sync
+[duplex] trainer_step=1 rollout_policy_version=0 batch=2
+[duplex] full_weight_sync version=1 tensors=770 changed_transformer=llm.model.layers.0.self_attn.q_proj.weight
+[duplex] sync_logit_audit version=1 prefix=27 max_abs_diff=0.0625
+[duplex] trainer_step=2 rollout_policy_version=1 batch=2
+[duplex] full_weight_sync version=2 tensors=770 changed_transformer=llm.model.layers.0.self_attn.q_proj.weight
+[duplex] sync_logit_audit version=2 prefix=27 max_abs_diff=0.0625
+Training Progress: 100% 2/2
+```
+
+两步均完成 full-parameter optimizer update，且普通 transformer `q_proj.weight`确实改变。
+每次同步严格覆盖 770 个 tensor，校验 key/shape/dtype/value；固定 prefix 上
+actor/rollout LS logits 最大差值为 `0.0625`（bf16 量化精度）。step 2 明确使用
+step 1 后的 policy v1，没有 stale trajectory。两步的 reward 范围均为 `[-1,+1]`，
+advantage 有限且非零，gradient norm 为 `5.9375` / `6.0`，峰值 GPU allocated
+约 `95.34 GiB`。Slurm 状态 `COMPLETED (0:0)`，用时 2m53s；`trainer.save_freq=-1`，
+未写 checkpoint。完整日志：`trainer-e2e-1868875.log`。

@@ -787,6 +787,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         await self.rollout.update_weights(
             per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
         )
+        if self.config.rollout.name == "duplex":
+            self.rollout.audit_against_actor(self.actor.engine.module)
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
@@ -802,6 +804,37 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.base_sync_done = True
         set_expandable_segments(True)
+
+    # ------------------------------------------------------------------
+    # Direct-Ray async surface for the official-HF duplex backend. Unlike
+    # vLLM/SGLang it does not launch another server process: DuplexReplica
+    # registers this hybrid worker handle with the existing load balancer.
+    # ------------------------------------------------------------------
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def generate(self, *args, **kwargs):
+        if not self._is_rollout or self.rollout is None:
+            raise RuntimeError("generate() requires a rollout role")
+        generate = getattr(self.rollout, "generate", None)
+        if generate is None:
+            raise NotImplementedError(f"{type(self.rollout).__name__} has no direct async generate method")
+        return await generate(*args, **kwargs)
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def duplex_sleep(self):
+        if self.rollout is not None:
+            await self.rollout.release()
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def duplex_wake_up(self):
+        if self.rollout is not None:
+            await self.rollout.resume(tags=["weights", "kv_cache"])
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def duplex_clear_kv_cache(self):
+        if self.rollout is not None:
+            clear = getattr(self.rollout, "clear_kv_cache", None)
+            if clear is not None:
+                clear()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

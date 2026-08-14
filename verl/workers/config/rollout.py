@@ -13,7 +13,7 @@
 # limitations under the License.
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from omegaconf import MISSING, DictConfig, OmegaConf
 
@@ -166,6 +166,11 @@ class RolloutConfig(BaseConfig):
     do_sample: bool = True
     n: int = 1
     repetition_penalty: float = 1.0
+
+    # Backend-specific options for the official-HF MiniCPM-o duplex runtime.
+    # Kept as a mapping so the remote-code runtime can evolve independently of
+    # the generic rollout schema.
+    duplex: dict[str, Any] = field(default_factory=dict)
 
     # Whether to enable full determinism for reproducibility.
     full_determinism: bool = False

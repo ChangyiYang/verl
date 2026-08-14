@@ -374,10 +374,17 @@ def _load_trtllm():
     return TRTLLMReplica
 
 
+def _load_duplex():
+    from verl.workers.rollout.duplex_replica import DuplexReplica
+
+    return DuplexReplica
+
+
 # Register built-in types
 RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
+RolloutReplicaRegistry.register("duplex", _load_duplex)
 
 
 def get_rollout_replica_class(rollout: str, disaggregation_enabled: bool = False) -> type[RolloutReplica]:

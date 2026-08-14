@@ -62,16 +62,22 @@ verl 会用 actor 的训练前向重算（`ray_trainer.py` 的 `compute_log_prob
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
 from tensordict import TensorDict
 
 from verl import DataProto
+from verl.utils.device import get_device_id, get_device_name
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.replica import TokenOutput
 
-__all__ = ["DuplexRollout", "DuplexFrame", "DuplexTrajectory"]
+__all__ = ["DuplexRollout", "DuplexFrame", "DuplexTrajectory", "pack_duplex_payloads"]
+
+logger = logging.getLogger(__name__)
 
 # 输入音频采样率，见 modeling_minicpmo.py 的 SAMPLE_RATE
 INPUT_SR = 16000
@@ -104,6 +110,68 @@ class DuplexTrajectory:
     action_positions: torch.Tensor  # [n_frames] 每帧动作 token 的绝对位置
 
 
+def pack_duplex_payloads(payloads: list[dict[str, Any]]) -> TensorDict:
+    """Pad serialized trajectories into the actor/reward DataProto schema."""
+    if not payloads:
+        raise ValueError("Cannot pack an empty duplex rollout batch")
+    batch_size = len(payloads)
+    max_length = max(int(payload["embeds"].shape[0]) for payload in payloads)
+    hidden_size = int(payloads[0]["embeds"].shape[-1])
+    max_frames = max(len(payload["frames"]) for payload in payloads)
+    dtype = payloads[0]["embeds"].dtype
+
+    embeds = torch.zeros(batch_size, max_length, hidden_size, dtype=dtype)
+    attention_mask = torch.zeros(batch_size, max_length, dtype=torch.int32)
+    position_ids = torch.zeros(batch_size, max_length, dtype=torch.long)
+    sequence_action_mask = torch.zeros(batch_size, max_length, dtype=torch.int32)
+    token_ids = torch.full((batch_size, max_length), PAD_ID, dtype=torch.long)
+    action_pos = torch.full((batch_size, max_frames), -1, dtype=torch.long)
+    is_listen = torch.zeros(batch_size, max_frames, dtype=torch.int32)
+    frame_time = torch.zeros(batch_size, max_frames, dtype=torch.float32)
+
+    for batch_index, payload in enumerate(payloads):
+        sample_embeds = payload["embeds"]
+        sample_token_ids = payload["seq_token_ids"]
+        sample_action_positions = payload["action_positions"]
+        length = int(sample_embeds.shape[0])
+        embeds[batch_index, :length] = sample_embeds
+        attention_mask[batch_index, :length] = 1
+        position_ids[batch_index, :length] = torch.arange(length)
+        token_ids[batch_index, :length] = sample_token_ids
+        if sample_action_positions.numel():
+            action_pos[batch_index, : sample_action_positions.numel()] = sample_action_positions
+            sequence_action_mask[batch_index, sample_action_positions] = 1
+        frames = payload["frames"]
+        if frames:
+            is_listen[batch_index, : len(frames)] = torch.tensor(
+                [int(frame["is_listen"]) for frame in frames], dtype=torch.int32
+            )
+            frame_time[batch_index, : len(frames)] = torch.tensor(
+                [float(frame["t_start"]) for frame in frames], dtype=torch.float32
+            )
+
+    safe_input_ids = token_ids.masked_fill(token_ids < 0, 0)
+    action_response_pos = action_pos - 1
+    action_response_pos.masked_fill_(action_pos <= 0, -1)
+    return TensorDict(
+        {
+            "prompts": safe_input_ids[:, :1],
+            "responses": safe_input_ids[:, 1:],
+            "input_ids": safe_input_ids,
+            "attention_mask": attention_mask,
+            "response_mask": sequence_action_mask[:, 1:],
+            "position_ids": position_ids,
+            "duplex_embeds": embeds,
+            "duplex_token_ids": token_ids,
+            "duplex_action_pos": action_pos,
+            "duplex_action_response_pos": action_response_pos,
+            "duplex_is_listen": is_listen,
+            "duplex_frame_time": frame_time,
+        },
+        batch_size=batch_size,
+    )
+
+
 class DuplexRollout(BaseRollout):
     """把预录用户音频逐帧喂进全双工模型，采样模型的 listen/speak 行为。
 
@@ -115,36 +183,314 @@ class DuplexRollout(BaseRollout):
     """
 
     def __init__(self, module=None, config=None, tokenizer=None, **kwargs):
-        super().__init__(config=config, model_config=kwargs.pop("model_config", None),
-                         device_mesh=kwargs.pop("device_mesh", None))
+        model_config = kwargs.pop("model_config", None)
+        device_mesh = kwargs.pop("device_mesh", None)
+        super().__init__(config=config, model_config=model_config, device_mesh=device_mesh)
         if module is None:
-            raise RuntimeError(
-                "DuplexRollout requires a MiniCPMODuplex module. The verl worker factory "
-                "must explicitly wire the actor/rollout model lifecycle before distributed training."
-            )
+            module = self._load_duplex_module(model_config)
         self.module = module              # MiniCPMODuplex（由 MiniCPMO.as_duplex() 得到）
         self.config = config
         self.tokenizer = tokenizer or getattr(module, "tokenizer", None)
 
         self.listen_id = int(module.listen_token_id)
         self.speak_id = int(self.tokenizer.convert_tokens_to_ids("<|speak|>"))
-        self.chunk_seconds = float(getattr(config, "chunk_seconds", 1.0))
+        duplex_config = getattr(config, "duplex", {}) or {}
+        self.chunk_seconds = float(duplex_config.get("chunk_seconds", getattr(config, "chunk_seconds", 1.0)))
+        self.global_steps = 0
+        self._update_in_progress = False
+        self._weights_valid = True
+        self._released = False
+        self._last_audit_payload: dict[str, Any] | None = None
+
+    def _load_duplex_module(self, model_config):
+        """Load an independent official-HF model for rollout workers."""
+        if model_config is None:
+            raise RuntimeError("Distributed DuplexRollout construction requires model_config")
+
+        from copy import deepcopy
+
+        from transformers import AutoModel
+
+        hf_config = deepcopy(model_config.hf_config)
+        # The RL policy uses the audio encoder and thinker. Vision and TTS do
+        # not contribute to LS/text policy logits and needlessly duplicate
+        # their weights in the colocated rollout copy.
+        hf_config.init_vision = bool(self.config.duplex.get("init_vision", False))
+        hf_config.init_tts = bool(self.config.duplex.get("init_tts", False))
+        dtype_name = str(getattr(self.config, "dtype", "bfloat16"))
+        dtype = getattr(torch, dtype_name)
+        device = torch.device(get_device_name(), get_device_id())
+
+        model = AutoModel.from_pretrained(
+            model_config.local_path,
+            config=hf_config,
+            trust_remote_code=model_config.trust_remote_code,
+            torch_dtype=dtype,
+        ).eval().to(device)
+
+        # MiniCPMODuplex.from_existing_model currently initializes TTS even
+        # when generate_audio=False. Suppress that optional branch without
+        # modifying the remote-code package.
+        original_init_tts = model.init_tts
+        model.init_tts = lambda **_kwargs: None
+        try:
+            return model.as_duplex(
+                device=str(device),
+                generate_audio=False,
+                ls_mode="explicit",
+                **dict(self.config.duplex.get("runtime_kwargs", {})),
+            )
+        finally:
+            model.init_tts = original_init_tts
 
     # ------------------------------------------------------------------
-    # BaseRollout lifecycle. resume/release are no-ops for the current PyTorch
-    # object, but weight synchronization must never silently succeed: the
-    # distributed verl worker does not yet inject a shared actor module.
+    # BaseRollout lifecycle.
     # ------------------------------------------------------------------
     async def resume(self, tags: list[str]):
-        return None
+        self._released = False
 
-    async def update_weights(self, weights, **kwargs):
-        raise RuntimeError(
-            "DuplexRollout weight synchronization is not wired yet; refusing to continue with stale rollout weights"
-        )
+    @staticmethod
+    def _normalize_weight_name(name: str) -> str:
+        prefixes = ("module.", "_fsdp_wrapped_module.")
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if name.startswith(prefix):
+                    name = name[len(prefix) :]
+                    changed = True
+        return name
+
+    @torch.no_grad()
+    async def update_weights(self, weights, global_steps: int | None = None, wire_format="named_tensors", **kwargs):
+        """Copy a complete HF-keyed state stream into the rollout model.
+
+        Failure is intentionally non-transactional at the tensor-storage
+        level, but it is transactional at the policy level: generation remains
+        disabled until a later complete synchronization succeeds.
+        """
+        if wire_format != "named_tensors":
+            raise ValueError(f"Duplex rollout requires named_tensors, got {wire_format!r}")
+        if self._update_in_progress:
+            raise RuntimeError("A duplex weight update is already in progress")
+
+        self._update_in_progress = True
+        self._weights_valid = False
+        target = self.module.model.state_dict(keep_vars=True)
+        has_transformer_weights = any(".layers." in name and name.endswith(".weight") for name in target)
+        seen: set[str] = set()
+        changed_transformer_weight = None
+        try:
+            for source_name, source in weights:
+                name = self._normalize_weight_name(source_name)
+                if name in seen:
+                    raise RuntimeError(f"Duplicate duplex rollout weight: {name}")
+                if name not in target:
+                    raise RuntimeError(f"Unexpected duplex rollout weight: {source_name} -> {name}")
+                destination = target[name]
+                if tuple(destination.shape) != tuple(source.shape):
+                    raise RuntimeError(
+                        f"Shape mismatch for {name}: rollout={tuple(destination.shape)}, actor={tuple(source.shape)}"
+                    )
+                if destination.dtype != source.dtype:
+                    raise RuntimeError(
+                        f"Dtype mismatch for {name}: rollout={destination.dtype}, actor={source.dtype}"
+                    )
+                if (
+                    changed_transformer_weight is None
+                    and global_steps is not None
+                    and int(global_steps) > 0
+                    and ".layers." in name
+                    and name.endswith(".weight")
+                    and not torch.equal(destination, source)
+                ):
+                    changed_transformer_weight = name
+                with torch.no_grad():
+                    destination.copy_(source, non_blocking=True)
+                if not torch.equal(destination, source):
+                    raise RuntimeError(f"Post-copy duplex rollout weight mismatch: {name}")
+                seen.add(name)
+
+            missing = sorted(set(target) - seen)
+            if missing:
+                preview = ", ".join(missing[:8])
+                raise RuntimeError(f"Missing {len(missing)} duplex rollout weights; first: {preview}")
+            if (
+                global_steps is not None
+                and int(global_steps) > 0
+                and has_transformer_weights
+                and changed_transformer_weight is None
+            ):
+                raise RuntimeError("Actor update changed no ordinary transformer weight before duplex synchronization")
+
+            self.clear_kv_cache()
+            if global_steps is not None:
+                self.global_steps = int(global_steps)
+            self._weights_valid = True
+            print(
+                f"[duplex] full_weight_sync version={self.global_steps} tensors={len(seen)} "
+                f"changed_transformer={changed_transformer_weight or 'initial_sync'}"
+            )
+        finally:
+            self._update_in_progress = False
 
     async def release(self):
-        return None
+        self.clear_kv_cache()
+        self._released = True
+
+    def clear_kv_cache(self):
+        model = getattr(self.module, "model", None)
+        if model is not None:
+            if hasattr(model, "reset_session"):
+                model.reset_session(reset_token2wav_cache=True)
+            if hasattr(model, "audio_past_key_values"):
+                model.audio_past_key_values = None
+        decoder = getattr(self.module, "decoder", None)
+        if decoder is not None and hasattr(decoder, "reset"):
+            decoder.reset()
+        processor = getattr(self.module, "processor", None)
+        if processor is not None and hasattr(processor, "reset_streaming"):
+            processor.reset_streaming()
+
+    @staticmethod
+    def _input_embeddings(model):
+        unwrapped = getattr(model, "_fsdp_wrapped_module", model)
+        llm = getattr(unwrapped, "llm", None)
+        if llm is not None:
+            return llm.get_input_embeddings()
+        return unwrapped.get_input_embeddings()
+
+    @torch.no_grad()
+    def audit_against_actor(self, actor_module) -> dict[str, float] | None:
+        """Compare fixed-prefix LS logits after an actor-to-rollout sync."""
+        payload = self._last_audit_payload
+        if payload is None:
+            return None
+        action_positions = payload["action_positions"]
+        if not action_positions.numel():
+            raise RuntimeError("Cannot audit duplex sync without an LS action position")
+        prefix_length = int(action_positions[0])
+        if prefix_length <= 0:
+            raise RuntimeError(f"Invalid duplex audit prefix length: {prefix_length}")
+
+        device = next(actor_module.parameters()).device
+        recorded = payload["embeds"][:prefix_length].to(device=device)
+        token_ids = payload["seq_token_ids"][:prefix_length].to(device=device)
+        token_mask = token_ids >= 0
+        attention_mask = torch.ones(1, prefix_length, dtype=torch.long, device=device)
+        position_ids = torch.arange(prefix_length, device=device).unsqueeze(0)
+
+        def _ls_logits(model, call):
+            embeds = recorded.clone()
+            if token_mask.any():
+                embeds[token_mask] = self._input_embeddings(model)(token_ids[token_mask])
+            output = call(
+                inputs_embeds=embeds.unsqueeze(0),
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+            return output.logits[0, -1, [self.listen_id, self.speak_id]].float().cpu()
+
+        was_training = actor_module.training
+        actor_module.eval()
+        try:
+            actor_logits = _ls_logits(actor_module, actor_module)
+        finally:
+            actor_module.train(was_training)
+        rollout_model = self.module.model
+        rollout_logits = _ls_logits(rollout_model, rollout_model.llm)
+        max_abs_diff = float((actor_logits - rollout_logits).abs().max())
+        # The FSDP mixed-precision wrapper and the plain HF module may round
+        # one bf16 ULP differently even with bit-identical weights. At the
+        # observed LS logit scale one ULP is 0.03125, so allow two ULPs.
+        if max_abs_diff > 0.0625:
+            raise RuntimeError(
+                f"Post-sync actor/rollout LS logits diverged: max_abs_diff={max_abs_diff}, "
+                f"actor={actor_logits.tolist()}, rollout={rollout_logits.tolist()}"
+            )
+        result = {"max_abs_diff": max_abs_diff, "prefix_length": float(prefix_length)}
+        print(
+            f"[duplex] sync_logit_audit version={self.global_steps} "
+            f"prefix={prefix_length} max_abs_diff={max_abs_diff:.6g}"
+        )
+        return result
+
+    @staticmethod
+    def trajectory_to_payload(trajectory: DuplexTrajectory) -> dict[str, Any]:
+        return {
+            "embeds": trajectory.embeds.detach().cpu(),
+            "seq_token_ids": trajectory.seq_token_ids.detach().cpu(),
+            "response_mask": trajectory.response_mask.detach().cpu(),
+            "action_positions": trajectory.action_positions.detach().cpu(),
+            "frames": [
+                {
+                    "frame_idx": frame.frame_idx,
+                    "t_start": frame.t_start,
+                    "t_end": frame.t_end,
+                    "is_listen": frame.is_listen,
+                    "action_token_id": frame.action_token_id,
+                    "action_seq_pos": frame.action_seq_pos,
+                    "token_ids": frame.token_ids,
+                    "text": frame.text,
+                    "end_of_turn": frame.end_of_turn,
+                }
+                for frame in trajectory.frames
+            ],
+        }
+
+    @torch.no_grad()
+    async def generate(
+        self,
+        request_id: str,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data=None,
+        video_data=None,
+        audio_data=None,
+        mm_processor_kwargs=None,
+        system_prompt: str | None = None,
+        **kwargs,
+    ) -> TokenOutput:
+        """Run one real-audio streaming trajectory for the async server path."""
+        del request_id, prompt_ids, sampling_params
+        if self._update_in_progress or not self._weights_valid:
+            raise RuntimeError("Duplex rollout weights are updating or invalid")
+        if self._released:
+            await self.resume(tags=["weights", "kv_cache"])
+        if audio_data is None or len(audio_data) != 1:
+            raise ValueError("Duplex generate expects exactly one mono waveform in audio_data")
+        if image_data is not None or video_data is not None:
+            raise ValueError("Duplex generate does not accept image or video inputs")
+        if mm_processor_kwargs:
+            raise ValueError("Duplex generate does not accept multimodal processor kwargs")
+        force_first_action = kwargs.pop("force_first_action", None)
+        if kwargs:
+            raise TypeError(f"Unexpected duplex generate kwargs: {sorted(kwargs)}")
+        if force_first_action == "listen":
+            force_first_action_id = self.listen_id
+        elif force_first_action == "speak":
+            force_first_action_id = self.speak_id
+        elif force_first_action is None:
+            force_first_action_id = None
+        else:
+            raise ValueError(f"Unknown force_first_action={force_first_action!r}")
+        with torch.no_grad():
+            trajectory = self._rollout_one(
+                np.asarray(audio_data[0], dtype=np.float32),
+                system_prompt,
+                force_first_action_id=force_first_action_id,
+            )
+        payload = self.trajectory_to_payload(trajectory)
+        self._last_audit_payload = payload
+        return TokenOutput(
+            token_ids=trajectory.token_ids,
+            stop_reason="completed",
+            extra_fields={
+                "duplex_trajectory": payload,
+                "global_steps": self.global_steps,
+            },
+        )
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -159,7 +505,12 @@ class DuplexRollout(BaseRollout):
             out.append(c)
         return out
 
-    def _rollout_one(self, wav: np.ndarray, system_prompt: str | None = None) -> DuplexTrajectory:
+    def _rollout_one(
+        self,
+        wav: np.ndarray,
+        system_prompt: str | None = None,
+        force_first_action_id: int | None = None,
+    ) -> DuplexTrajectory:
         """对一条音频跑完整的逐帧循环，并把嵌入序列一并录下。"""
         duplex = self.module
         dec = duplex.decoder
@@ -177,9 +528,15 @@ class DuplexRollout(BaseRollout):
             cursor["len"] += int(embeds.size(0))
             return orig_feed(embeds, return_logits=return_logits)
 
+        forced = {"pending": force_first_action_id is not None}
+
         def traced_decode(logits, *a, **kw):
             decision_marks.append(cursor["len"])
-            tok = orig_decode(logits, *a, **kw)
+            if forced["pending"]:
+                forced["pending"] = False
+                tok = torch.tensor([force_first_action_id], device=logits.device, dtype=torch.long)
+            else:
+                tok = orig_decode(logits, *a, **kw)
             decision_tokens.append(int(tok.item()) if hasattr(tok, "item") else int(tok))
             return tok
 

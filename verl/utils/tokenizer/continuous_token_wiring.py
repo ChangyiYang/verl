@@ -17,8 +17,15 @@ from __future__ import annotations
 
 import logging
 import re
-from enum import StrEnum
 from typing import Any
+
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 is supported by pyproject.toml.
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 
 from .continuous_token import (
     ContinuousTokenBuilder,

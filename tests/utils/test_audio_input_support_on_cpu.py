@@ -30,7 +30,7 @@ def test_build_messages_replaces_audio_placeholder() -> None:
     dataset.image_key = "images"
     dataset.video_key = "videos"
     dataset.audio_key = "audios"
-    dataset.processor = object()
+    dataset.processor = None
 
     example = {
         "prompt": [
