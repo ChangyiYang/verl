@@ -17,31 +17,9 @@ import torch
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.duplex_window import score_duplex_windows
+from verl.utils.duplex_prompt import extract_duplex_audio_and_system_prompt
 from verl.utils.ray_utils import auto_await
 from verl.workers.rollout.duplex_rollout import pack_duplex_payloads
-
-
-def _message_audio_and_system_prompt(messages: list[dict[str, Any]]) -> tuple[Any, str | None]:
-    audio = None
-    system_parts: list[str] = []
-    for message in messages:
-        content = message.get("content")
-        if message.get("role") == "system":
-            if isinstance(content, str):
-                system_parts.append(content)
-            elif isinstance(content, list):
-                system_parts.extend(item.get("text", "") for item in content if isinstance(item, dict))
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if not isinstance(item, dict) or item.get("type") != "audio":
-                continue
-            candidate = item.get("audio", item.get("audio_url"))
-            if candidate is not None:
-                if audio is not None:
-                    raise ValueError("Duplex rollout currently accepts exactly one audio item per prompt")
-                audio = candidate
-    return audio, "\n".join(part for part in system_parts if part) or None
 
 
 def _load_mono_16khz(audio: Any) -> np.ndarray:
@@ -89,7 +67,7 @@ class DuplexAgentLoopManager:
         return cls(*args, **kwargs)
 
     async def _generate_one(self, messages, priority: int, batch_index: int):
-        audio, system_prompt = _message_audio_and_system_prompt(messages)
+        audio, system_prompt = extract_duplex_audio_and_system_prompt(messages)
         if audio is None:
             raise ValueError("Duplex prompt contains no audio item")
         waveform = _load_mono_16khz(audio)

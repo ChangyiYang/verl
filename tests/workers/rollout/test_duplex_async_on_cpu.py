@@ -8,6 +8,7 @@ from tensordict import TensorDict
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.duplex_window import DuplexWindowRewardManager
+from verl.utils.duplex_prompt import extract_duplex_audio_and_system_prompt
 from verl.workers.rollout.duplex_rollout import DuplexRollout, pack_duplex_payloads
 
 
@@ -55,6 +56,45 @@ def _payload(length, hidden, actions):
             {"is_listen": index % 2 == 0, "t_start": float(index)} for index in range(len(actions))
         ],
     }
+
+
+def test_duplex_prompt_extracts_one_system_message_and_audio():
+    audio = np.zeros(160, dtype=np.float32)
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "First instruction."},
+                {"type": "text", "text": "Second instruction."},
+            ],
+        },
+        {"role": "user", "content": [{"type": "audio", "audio": audio}]},
+    ]
+
+    extracted_audio, system_prompt = extract_duplex_audio_and_system_prompt(messages)
+
+    assert extracted_audio is audio
+    assert system_prompt == "First instruction.\nSecond instruction."
+
+    extracted_audio, system_prompt = extract_duplex_audio_and_system_prompt(
+        [
+            {"role": "system", "content": "Single instruction."},
+            {"role": "user", "content": [{"type": "audio", "audio": audio}]},
+        ]
+    )
+    assert extracted_audio is audio
+    assert system_prompt == "Single instruction."
+
+
+def test_duplex_prompt_rejects_multiple_system_messages():
+    messages = [
+        {"role": "system", "content": "First instruction."},
+        {"role": "system", "content": "Second instruction."},
+        {"role": "user", "content": [{"type": "audio", "audio": np.zeros(160)}]},
+    ]
+
+    with pytest.raises(ValueError, match="at most one system message"):
+        extract_duplex_audio_and_system_prompt(messages)
 
 
 def test_pack_duplex_payloads_uses_response_coordinates():
