@@ -105,6 +105,15 @@ class DuplexAgentLoopManager:
         outputs, durations = zip(*results, strict=True)
         payloads = [output.extra_fields["duplex_trajectory"] for output in outputs]
         versions = np.asarray([int(output.extra_fields["global_steps"]) for output in outputs], dtype=np.int64)
+        replica_ranks = np.asarray([int(output.extra_fields["replica_rank"]) for output in outputs], dtype=np.int64)
+        expected_replicas = int(self.rollout_config.duplex.get("expected_replicas", 1))
+        unique_replicas = sorted(set(replica_ranks.tolist()))
+        if len(unique_replicas) < expected_replicas:
+            raise RuntimeError(
+                f"Duplex rollout used {len(unique_replicas)} replicas, expected at least {expected_replicas}: "
+                f"{replica_ranks.tolist()}"
+            )
+        print(f"[duplex] rollout_replicas={replica_ranks.tolist()} unique={unique_replicas}")
         if int(versions.min()) != int(versions.max()):
             raise RuntimeError(f"Duplex rollout batch mixed policy versions: {versions.tolist()}")
         trainer_step = prompts.meta_info.get("global_steps")
@@ -144,6 +153,7 @@ class DuplexAgentLoopManager:
             "global_steps": versions,
             "min_global_steps": versions.copy(),
             "max_global_steps": versions.copy(),
+            "duplex_replica_rank": replica_ranks,
             "duplex_reward_hits": np.asarray(reward_hits, dtype=np.int64),
         }
         timing = {

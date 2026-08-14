@@ -238,3 +238,44 @@ advantage 有限且非零，gradient norm 为 `5.9375` / `6.0`，峰值 GPU allo
 由 agent loop 直接计算并写入 `rm_scores`，不启动 reward worker。Job `1874107`
 以 `reward.num_workers=0` 重跑同一两步 gate，`COMPLETED (0:0)`，v0 → v1 → v2、
 770-tensor full sync、两步普通 `q_proj.weight` 变化和 actor/rollout logit audit 全部再次通过。
+
+---
+
+# 2× rollout replica 两步真实 E2E（2026-08-14）
+
+Job `1878096`，2×MI325X。一个 `RayPPOTrainer` controller 管理两个独立的
+one-GPU `DuplexReplica`；每个 replica 都有自己的 FSDP actor shard 和官方 HF rollout
+model。G=2 的每一轮请求必须实际命中 rank 0 与 rank 1，否则 agent loop 立即失败。
+
+```text
+[duplex] replica_ready rank=0 address=duplex://replica-0
+[duplex] replica_ready rank=1 address=duplex://replica-1
+[duplex] replica=0 full_weight_sync version=0 tensors=770 changed_transformer=initial_sync
+[duplex] replica=1 full_weight_sync version=0 tensors=770 changed_transformer=initial_sync
+[duplex] rollout_replicas=[0, 1] unique=[0, 1]
+[duplex] trainer_step=1 rollout_policy_version=0 batch=2
+[duplex] replica=0 full_weight_sync version=1 tensors=770 changed_transformer=llm.model.layers.0.self_attn.q_proj.weight
+[duplex] replica=1 full_weight_sync version=1 tensors=770 changed_transformer=llm.model.layers.0.self_attn.q_proj.weight
+[duplex] replica=0 sync_logit_audit version=1 prefix=27 max_abs_diff=0.09375
+[duplex] replica=1 sync_logit_audit version=1 prefix=27 max_abs_diff=0.09375
+[duplex] rollout_replicas=[0, 1] unique=[0, 1]
+[duplex] trainer_step=2 rollout_policy_version=1 batch=2
+[duplex] replica=0 full_weight_sync version=2 tensors=770 changed_transformer=llm.model.layers.0.self_attn.q_proj.weight
+[duplex] replica=1 full_weight_sync version=2 tensors=770 changed_transformer=llm.model.layers.0.self_attn.q_proj.weight
+[duplex] replica=0 sync_logit_audit version=2 prefix=27 max_abs_diff=0.0625
+[duplex] replica=1 sync_logit_audit version=2 prefix=27 max_abs_diff=0.0625
+Training Progress: 100% 2/2
+```
+
+两步均产生有限非零 gradient norm（`6.34375` / `10.3125`），两个 replica 均完成
+v0 → v1 → v2 的 770-tensor 同步，且普通 `q_proj.weight` 每步都改变。Slurm 状态
+`COMPLETED (0:0)`，用时 3m11s；`trainer.save_freq=-1`，未写 checkpoint。
+
+本轮还收紧了两个生产契约：
+
+- verl request 的 `temperature` / `top_k` / `top_p` 经过严格校验后显式传给
+  `MiniCPMODuplex.streaming_generate()`；`temperature=0` 映射为 greedy，`top_k=-1`
+  映射为 MiniCPMO 的 disabled 值 `0`，未知参数不再静默忽略。
+- 昂贵的 post-sync actor/rollout logit audit 由环境变量
+  `VERL_DUPLEX_WEIGHT_SYNC_AUDIT` 控制，当前默认 `1`；生产可设为 `0`。低成本的
+  weight key/shape/dtype/coverage 完整性校验始终保留。

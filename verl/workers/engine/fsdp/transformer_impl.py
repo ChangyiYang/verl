@@ -271,14 +271,34 @@ class FSDPEngine(BaseEngine):
                         data=None,
                         input_ids=None,
                         inputs_embeds=None,
+                        duplex_recorded_embeds=None,
+                        duplex_token_ids=None,
                         attention_mask=None,
                         position_ids=None,
                         use_cache=None,
                         **kwargs,
                     ):
+                        if duplex_recorded_embeds is not None:
+                            if inputs_embeds is not None or input_ids is not None:
+                                raise ValueError(
+                                    "Duplex MiniCPMO forward accepts recorded embeds/token ids instead of "
+                                    "input_ids/inputs_embeds"
+                                )
+                            if duplex_token_ids is None:
+                                raise ValueError("duplex_token_ids is required with duplex_recorded_embeds")
+                            # This executes *inside* the FSDP root forward, after
+                            # its pre-forward hook has unsharded the embedding
+                            # weight on every rank.
+                            inputs_embeds = rebuild_duplex_inputs_embeds(
+                                duplex_recorded_embeds,
+                                duplex_token_ids,
+                                this.llm.get_input_embeddings(),
+                            )
                         if inputs_embeds is not None:
                             if input_ids is not None:
-                                raise ValueError("Duplex MiniCPMO forward accepts exactly one of input_ids/inputs_embeds")
+                                raise ValueError(
+                                    "Duplex MiniCPMO forward accepts exactly one of input_ids/inputs_embeds"
+                                )
                             return this.llm(
                                 input_ids=None,
                                 inputs_embeds=inputs_embeds,
@@ -1125,23 +1145,6 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
-    def _build_duplex_inputs_embeds(self, recorded_embeds: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-        """Rebuild the mixed audio/text stream without freezing token embeddings.
-
-        ``recorded_embeds`` is authoritative at conditioning positions
-        (``token_ids == -1``). At token positions we deliberately redo the
-        embedding lookup with the current actor weights so gradients reach the
-        embedding table/LoRA path and the training policy cannot silently use
-        stale rollout embeddings.
-        """
-        wrapped = getattr(self.module, "module", self.module)
-        get_input_embeddings = getattr(wrapped, "get_input_embeddings", None)
-        if get_input_embeddings is None:
-            raise TypeError("Duplex actor model must implement get_input_embeddings()")
-        embedding = get_input_embeddings()
-
-        return rebuild_duplex_inputs_embeds(recorded_embeds, token_ids, embedding)
-
     def prepare_model_inputs(self, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -1250,7 +1253,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 recorded = micro_batch["duplex_embeds"].values()
                 token_ids = micro_batch["duplex_token_ids"].values()
                 model_inputs.pop("input_ids")
-                model_inputs["inputs_embeds"] = self._build_duplex_inputs_embeds(recorded, token_ids).unsqueeze(0)
+                model_inputs["duplex_recorded_embeds"] = recorded.unsqueeze(0)
+                model_inputs["duplex_token_ids"] = token_ids.unsqueeze(0)
             if packed_cu_seqlens is not None and pass_packed_cu_seqlens:
                 model_cu_seqlens = packed_cu_seqlens
                 if self.use_ulysses_sp and sp_pad_size:
@@ -1317,7 +1321,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         output_size=(batch_size, max_seq_len, hidden_size),
                     )
                     model_inputs.pop("input_ids")
-                    model_inputs["inputs_embeds"] = self._build_duplex_inputs_embeds(recorded, duplex_ids_padded)
+                    model_inputs["duplex_recorded_embeds"] = recorded
+                    model_inputs["duplex_token_ids"] = duplex_ids_padded
 
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")

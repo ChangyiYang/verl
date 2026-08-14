@@ -9,6 +9,8 @@ TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-2}
 PROJECT_NAME=${PROJECT_NAME:-duplex_rl}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-minicpmo45_full_grpo_gate}
 PYTHON_BIN=${PYTHON_BIN:-python3}
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-1}
+EXPECTED_ROLLOUT_REPLICAS=${EXPECTED_ROLLOUT_REPLICAS:-1}
 
 "${PYTHON_BIN}" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -67,6 +69,7 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
     +actor_rollout_ref.rollout.duplex.init_vision=False \
     +actor_rollout_ref.rollout.duplex.init_tts=False \
     +actor_rollout_ref.rollout.duplex.counterfactual_first_actions=True \
+    +actor_rollout_ref.rollout.duplex.expected_replicas="${EXPECTED_ROLLOUT_REPLICAS}" \
     reward.reward_model.enable=False \
     reward.num_workers=0 \
     trainer.use_v1=False \
@@ -74,7 +77,7 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
     trainer.logger='["console"]' \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
-    trainer.n_gpus_per_node=1 \
+    trainer.n_gpus_per_node="${N_GPUS_PER_NODE}" \
     trainer.nnodes=1 \
     trainer.total_epochs=1 \
     trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \

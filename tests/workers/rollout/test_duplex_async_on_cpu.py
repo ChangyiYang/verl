@@ -8,7 +8,7 @@ from tensordict import TensorDict
 
 from verl.utils.duplex_prompt import extract_duplex_audio_and_system_prompt
 from verl.utils.duplex_reward import score_duplex_windows
-from verl.workers.rollout.duplex_rollout import DuplexRollout, pack_duplex_payloads
+from verl.workers.rollout.duplex_rollout import DuplexRollout, DuplexTrajectory, pack_duplex_payloads
 
 
 class _Resettable:
@@ -39,6 +39,7 @@ def _rollout_for_update():
     rollout = object.__new__(DuplexRollout)
     rollout.module = SimpleNamespace(model=_TinyModel(), decoder=_Resettable(), processor=_Resettable())
     rollout.global_steps = 0
+    rollout.replica_rank = 0
     rollout._update_in_progress = False
     rollout._weights_valid = True
     rollout._released = False
@@ -141,6 +142,49 @@ def test_duplex_weight_update_rejects_shape_mismatch():
         asyncio.run(rollout.update_weights(iter([(name, value.reshape(-1)[:1])]), global_steps=1))
 
     assert not rollout._weights_valid
+
+
+def test_duplex_generate_threads_normalized_sampling_params():
+    rollout = object.__new__(DuplexRollout)
+    rollout.listen_id = 7
+    rollout.speak_id = 8
+    rollout.replica_rank = 0
+    rollout.global_steps = 0
+    rollout._update_in_progress = False
+    rollout._weights_valid = True
+    rollout._released = False
+    rollout._last_audit_payload = None
+    captured = {}
+
+    def fake_rollout_one(wav, system_prompt, force_first_action_id=None, sampling_params=None):
+        captured.update(sampling_params)
+        return DuplexTrajectory(
+            frames=[],
+            token_ids=[],
+            embeds=torch.empty(0, 3),
+            seq_token_ids=torch.empty(0, dtype=torch.long),
+            response_mask=torch.empty(0, dtype=torch.int32),
+            action_positions=torch.empty(0, dtype=torch.long),
+        )
+
+    rollout._rollout_one = fake_rollout_one
+    asyncio.run(
+        rollout.generate(
+            request_id="request",
+            prompt_ids=[],
+            sampling_params={"temperature": 0.0, "top_k": -1, "top_p": 1.0},
+            audio_data=[np.zeros(16000, dtype=np.float32)],
+        )
+    )
+
+    assert captured == {"decode_mode": "greedy", "temperature": 1.0, "top_k": 0, "top_p": 1.0}
+
+
+def test_duplex_sampling_params_fail_closed_instead_of_being_ignored():
+    with pytest.raises(ValueError, match="Unsupported duplex sampling params"):
+        DuplexRollout._normalize_sampling_params(
+            {"temperature": 1.0, "top_k": -1, "top_p": 1.0, "repetition_penalty": 1.1}
+        )
 
 
 def test_async_duplex_window_reward_stays_on_action_positions():

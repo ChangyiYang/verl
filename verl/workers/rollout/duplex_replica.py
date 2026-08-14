@@ -30,10 +30,12 @@ class DuplexReplica(RolloutReplica):
             raise RuntimeError(f"Expected one hybrid worker, got {len(self.workers)}")
 
         worker = self.workers[0]
+        await worker.duplex_set_replica_rank.remote(self.replica_rank)
         self.servers = [worker]
         self._server_handle = worker
         # The load balancer treats addresses as opaque stable identifiers.
         self._server_address = f"duplex://replica-{self.replica_rank}"
+        print(f"[duplex] replica_ready rank={self.replica_rank} address={self._server_address}")
 
     async def sleep(self):
         await self._server_handle.duplex_sleep.remote()

@@ -57,6 +57,11 @@ from verl.workers.utils.losses import ppo_loss
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Expensive end-to-end diagnostic for development and acceptance runs. Keep it
+# enabled while the duplex backend is being validated; production launchers
+# can disable it without weakening the weight-stream integrity checks.
+DUPLEX_WEIGHT_SYNC_AUDIT_ENV = "VERL_DUPLEX_WEIGHT_SYNC_AUDIT"
+
 
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
@@ -787,7 +792,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         await self.rollout.update_weights(
             per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
         )
-        if self.config.rollout.name == "duplex":
+        if self.config.rollout.name == "duplex" and os.getenv(DUPLEX_WEIGHT_SYNC_AUDIT_ENV, "1") == "1":
             self.rollout.audit_against_actor(self.actor.engine.module)
 
         log_gpu_memory_usage("After update_weights", logger=logger)
@@ -835,6 +840,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             clear = getattr(self.rollout, "clear_kv_cache", None)
             if clear is not None:
                 clear()
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def duplex_set_replica_rank(self, replica_rank: int):
+        if not self._is_rollout or self.rollout is None:
+            raise RuntimeError("duplex_set_replica_rank() requires a rollout role")
+        self.rollout.replica_rank = int(replica_rank)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
