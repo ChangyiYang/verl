@@ -1175,6 +1175,11 @@ class MegatronEngine(BaseEngine):
         from .delta_export import quant_delta_entry
 
         gen, _ = self.get_per_tensor_param_shard(quant_spec=quant_spec)
+        if quant_spec is not None and getattr(quant_spec, "mxfp4_predicate", None) is not None:
+            # Packed integers have no spare NaN/sentinel byte for a masked
+            # sparse overlay.  They are refreshed by the checkpoint engine's
+            # values-only MXFP4 sweep after this sparse FP8/BF16 stream.
+            gen = (item for item in gen if not item[0].endswith(("::p", "::q")))
         # ONE snapshot store for both domains: quant groups key as
         # "{megatron_name}::{kind}", bf16 shards as plain megatron names --
         # disjoint namespaces, identical prime/diff/refresh semantics.

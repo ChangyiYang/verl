@@ -150,6 +150,57 @@ class QuantSpec:
     # ranks that do not own the param and see no tensor -- routes the slot
     # into the same wire group. None keeps the legacy fold-to-rollout-dtype.
     fp32_predicate: object | None = None  # Callable[[str], bool] | None
+    # Optional packed MXFP4 codec for routed experts.  The predicate sees the
+    # logical (unpacked BF16) HF weight name.  Selected weights are encoded as
+    # two E2M1 values per int8 byte with one E8M0 scale per row/K32 tile.
+    # Keeping this beside the FP8 definition makes the spec a per-weight codec
+    # plan rather than a model-wide dtype switch.
+    mxfp4_predicate: object | None = None  # Callable[[str], bool] | None
+
+
+def quantize_mxfp4_e2m1(weight: torch.Tensor, *, block_size: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a logical 2-D weight to the DSV4 checkpoint's MXFP4 layout.
+
+    Returns packed int8 codes (low nibble first) and E8M0 power-of-two scales.
+    The arithmetic intentionally matches Megatron Bridge's DSV4 exporter so
+    the sharded and whole-tensor paths produce the same bytes.
+    """
+    if weight.ndim != 2:
+        raise RuntimeError(f"MXFP4 export expects a 2-D weight, got {weight.ndim}D")
+    rows, cols = weight.shape
+    if cols % block_size or cols % 2:
+        raise RuntimeError(
+            f"MXFP4 export requires K divisible by {block_size} and 2, got shape={tuple(weight.shape)}"
+        )
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0 is None:
+        raise RuntimeError("this PyTorch build has no float8_e8m0fnu dtype required by DSV4 MXFP4")
+
+    x = weight.to(torch.float32)
+    scale_cols = cols // block_size
+    packed = torch.empty((rows, cols // 2), dtype=torch.uint8, device=weight.device)
+    scales = torch.empty((rows, scale_cols), dtype=torch.float32, device=weight.device)
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32, device=weight.device
+    )
+    max_chunk_elements = 16_000_000
+    rows_per_chunk = max(1, min(rows, max_chunk_elements // max(cols, 1)))
+    for row_start in range(0, rows, rows_per_chunk):
+        row_end = min(row_start + rows_per_chunk, rows)
+        chunk = x[row_start:row_end].reshape(-1, scale_cols, block_size)
+        amax = chunk.abs().amax(dim=-1)
+        scale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax))
+        scale = torch.exp2(torch.ceil(torch.log2(scale.clamp(min=2.0**-127, max=2.0**127))))
+        scales[row_start:row_end] = scale
+
+        normalized = chunk / scale.unsqueeze(-1)
+        codes = torch.bucketize(normalized.abs(), boundaries).to(torch.uint8)
+        codes = (codes | ((normalized < 0).to(torch.uint8) * 8)).reshape(row_end - row_start, cols)
+        lo = codes[:, 0::2].to(torch.int16)
+        hi = codes[:, 1::2].to(torch.int16)
+        packed[row_start:row_end] = (lo | (hi << 4)).to(torch.uint8)
+
+    return packed.contiguous().view(torch.int8), scales.to(e8m0)
 
 
 def sticky_ue8m0_descale(amax: torch.Tensor, ckpt_scale: torch.Tensor | None) -> torch.Tensor:
@@ -175,7 +226,7 @@ def sticky_ue8m0_descale(amax: torch.Tensor, ckpt_scale: torch.Tensor | None) ->
 _CKPT_SCALES_CACHE: dict = {}
 
 
-def load_ckpt_scales(ckpt_path: str) -> dict:
+def load_ckpt_scales(ckpt_path: str, *, skip_mxfp4_experts: bool = False) -> dict:
     """Read every ``<stem>.scale`` tensor from the checkpoint, keyed by the
     WEIGHT's name (``<stem>.weight``) for direct lookup at quantize time.
 
@@ -183,7 +234,8 @@ def load_ckpt_scales(ckpt_path: str) -> dict:
     process and stays on CPU. safetensors reads only the requested tensors,
     not the full shards.
     """
-    got = _CKPT_SCALES_CACHE.get(ckpt_path)
+    cache_key = (ckpt_path, bool(skip_mxfp4_experts))
+    got = _CKPT_SCALES_CACHE.get(cache_key)
     if got is not None:
         return got
     import json
@@ -199,6 +251,12 @@ def load_ckpt_scales(ckpt_path: str) -> dict:
     by_file: dict[str, list[str]] = {}
     for n, f in wm.items():
         if n.endswith(".scale"):
+            # Standard DSV4 Flash stores routed-expert K32 E8M0 scales here.
+            # They are gigabytes in aggregate and belong to the MXFP4 codec,
+            # not FP8 sticky-scale reconstruction.  Loading/converting them to
+            # fp32 in every trainer process would multiply that footprint by 4.
+            if skip_mxfp4_experts and ".experts." in n:
+                continue
             by_file.setdefault(f, []).append(n)
     out: dict = {}
     stale: list[str] = []
@@ -224,7 +282,7 @@ def load_ckpt_scales(ckpt_path: str) -> dict:
             ckpt_path,
             stale[0],
         )
-    _CKPT_SCALES_CACHE[ckpt_path] = out
+    _CKPT_SCALES_CACHE[cache_key] = out
     return out
 
 
@@ -249,6 +307,16 @@ def quantize_hf_stream(weights, spec: QuantSpec):
     """
     block = list(spec.weight_block_size)
     for name, t in weights:
+        mxfp4_pred = getattr(spec, "mxfp4_predicate", None)
+        if t.dim() == 2 and mxfp4_pred is not None and mxfp4_pred(name):
+            assert t.element_size() > 1, (
+                f"quantize_hf_stream got {t.dtype} for MXFP4 weight {name!r}: "
+                "the upstream export must provide the logical BF16 master"
+            )
+            codes, scales = quantize_mxfp4_e2m1(t.to(torch.bfloat16))
+            yield name, codes
+            yield name + "_scale_inv", scales
+            continue
         if t.dim() != 2 or not spec.should_quantize(name):
             yield name, t
             continue

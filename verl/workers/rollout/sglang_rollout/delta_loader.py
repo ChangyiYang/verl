@@ -55,6 +55,148 @@ from verl.utils.fusion_groups import DEEPSEEK_V4_FUSION_GROUPS
 
 logger = logging.getLogger(__name__)
 
+_MXFP4_REFIT_ATTR = "_verl_delta_mxfp4_refit"
+_MXFP4_PARAM_SPECS = {
+    "w13_weight": (torch.int8, ("w1", "w3")),
+    "w2_weight": (torch.int8, ("w2",)),
+    # SGLang creates serialized block scales as fp32 load buffers, then the
+    # Blackwell MXFP4 post-process converts E8M0 values into its shuffled
+    # one-byte kernel layout.
+    "w13_weight_scale_inv": (torch.float32, ("w1", "w3")),
+    "w2_weight_scale_inv": (torch.float32, ("w2",)),
+}
+
+
+def _is_mxfp4_moe(module: torch.nn.Module) -> bool:
+    qm = getattr(module, "quant_method", None)
+    return (
+        qm is not None
+        and type(qm).__name__.startswith("Mxfp4")
+        and all(hasattr(module, name) for name in _MXFP4_PARAM_SPECS)
+    )
+
+
+def _is_fp4_moe(module: torch.nn.Module) -> bool:
+    """Recognize both transformed and checkpoint-layout DSV4 FP4 experts.
+
+    SGLang selects a dedicated ``Mxfp4*`` method for its FlashInfer MXFP4
+    runners, but its default/Marlin/DeepGEMM paths retain ``Fp8MoEMethod`` and
+    mark that method with ``is_fp4_expert``.  Both represent the same packed
+    E2M1 + E8M0 checkpoint tensors; only the dedicated method needs the
+    stage-and-refit path below.
+    """
+    if _is_mxfp4_moe(module):
+        return True
+    qm = getattr(module, "quant_method", None)
+    return (
+        qm is not None
+        and bool(getattr(qm, "is_fp4_expert", False))
+        and all(hasattr(module, name) for name in _MXFP4_PARAM_SPECS)
+    )
+
+
+def _begin_mxfp4_refit(model: torch.nn.Module) -> None:
+    """Expose fresh checkpoint-layout buffers for a values-only MXFP4 sync.
+
+    Live Blackwell expert params are shuffled for the TRT-LLM kernel.  Loading
+    checkpoint-layout tensors into those bytes directly corrupts both changed
+    and unchanged positions.  A sync therefore stages the rank's local expert
+    set (not a full-model mirror), fills it completely, then folds the shuffled
+    result back into the original Parameter objects at the end of the sync.
+    """
+    if hasattr(model, _MXFP4_REFIT_ATTR):
+        return
+    states = []
+    for module in model.modules():
+        if not _is_mxfp4_moe(module):
+            continue
+        if getattr(module, "_mega_moe_weights_built", False):
+            raise NotImplementedError("delta MXFP4 refit does not support MegaMoE-owned expert buffers")
+        live = {}
+        coverage = {name: set() for name in _MXFP4_PARAM_SPECS}
+        local_experts = int(getattr(module, "_num_local_routed", module.num_local_experts))
+        for attr, (raw_dtype, _shards) in _MXFP4_PARAM_SPECS.items():
+            old = getattr(module, attr)
+            if not isinstance(old, torch.nn.Parameter):
+                raise RuntimeError(f"MXFP4 live {attr} is not a Parameter: {type(old).__name__}")
+            live[attr] = old
+            staged = torch.nn.Parameter(
+                torch.zeros(tuple(old.shape), dtype=raw_dtype, device=old.device), requires_grad=False
+            )
+            for key, value in vars(old).items():
+                setattr(staged, key, value)
+            if attr.endswith("scale_inv"):
+                staged.quant_method = "block"
+
+            original_loader = module.weight_loader
+
+            def _tracking_loader(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                *,
+                _attr=attr,
+                _module=module,
+                _loader=original_loader,
+                _coverage=coverage,
+                _local_experts=local_experts,
+                **kwargs,
+            ):
+                _loader(param, loaded_weight, weight_name, shard_id, expert_id, **kwargs)
+                try:
+                    local_id = _module._map_global_expert_id_to_local_expert_id(expert_id)
+                except AttributeError:
+                    local_id = int(expert_id)
+                if 0 <= int(local_id) < _local_experts:
+                    _coverage[_attr].add((int(local_id), str(shard_id)))
+
+            staged.weight_loader = _tracking_loader
+            setattr(module, attr, staged)
+        states.append((module, live, coverage, local_experts))
+    setattr(model, _MXFP4_REFIT_ATTR, states)
+
+
+def _finish_mxfp4_refit(model: torch.nn.Module) -> None:
+    states = getattr(model, _MXFP4_REFIT_ATTR, None)
+    if states is None:
+        return
+    try:
+        for module, live, coverage, local_experts in states:
+            missing = []
+            for attr, (_dtype, shards) in _MXFP4_PARAM_SPECS.items():
+                expected = {(expert, shard) for expert in range(local_experts) for shard in shards}
+                absent = expected - coverage[attr]
+                if absent:
+                    missing.append(f"{attr}:{len(absent)}")
+            if missing:
+                raise RuntimeError(
+                    "incomplete values-only MXFP4 refit; refusing to shuffle zero/unloaded expert pieces: "
+                    + ", ".join(missing)
+                )
+
+            module.quant_method.process_weights_after_loading(module)
+            for attr, old in live.items():
+                rebuilt = getattr(module, attr)
+                if rebuilt.shape != old.shape or rebuilt.dtype != old.dtype:
+                    raise RuntimeError(
+                        f"MXFP4 refit rebuilt {attr} as {tuple(rebuilt.shape)}/{rebuilt.dtype}, "
+                        f"live storage is {tuple(old.shape)}/{old.dtype}"
+                    )
+                if rebuilt.data_ptr() != old.data_ptr():
+                    old.data.copy_(rebuilt.data)
+                setattr(module, attr, old)
+    finally:
+        # A coverage or post-process failure must not strand checkpoint-layout
+        # staging buffers in the live model.  Restore every original Parameter
+        # before propagating the exception; successful paths already point at
+        # these objects, so this is intentionally idempotent.
+        for module, live, _coverage, _local_experts in states:
+            for attr, old in live.items():
+                setattr(module, attr, old)
+        delattr(model, _MXFP4_REFIT_ATTR)
+
 # Cap on the densified tensors handed to one model.load_weights call, matching
 # SGLang's own delta-apply chunking default.
 CHUNK_BYTES = 512 << 20
@@ -176,6 +318,9 @@ def _check_quant_handshake(model: torch.nn.Module, spec: dict) -> None:
             )
             break
     want = cfg.get("weight_block_size")
+    if str(cfg.get("expert_dtype", "")).lower() == "fp4":
+        mixed = [module for module in model.modules() if _is_fp4_moe(module)]
+        assert mixed, "quant handshake failed: trainer ships MXFP4 routed experts but rollout has no MXFP4 MoE"
     if want is not None:
         want = [int(x) for x in want]
         live = _find_live_quant_config(model)
@@ -239,13 +384,21 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
         )
 
     _check_quant_handshake(model, spec)
+    if str((spec.get("quant_config") or {}).get("expert_dtype", "")).lower() == "fp4":
+        _begin_mxfp4_refit(model)
     if spec["encoding"] == "dense":
         if spec.get("verify"):
             _verify_dense(model, spec["params"], values, bool(spec.get("is_last")), bool(spec.get("values_bytes")))
+            if spec.get("is_last"):
+                _finish_mxfp4_refit(model)
+                if hasattr(model, "post_load_weights"):
+                    model.post_load_weights()
             return
         _apply_dense(model, spec["params"], values, bool(spec.get("values_bytes")))
-        if spec.get("is_last") and hasattr(model, "post_load_weights"):
-            model.post_load_weights()
+        if spec.get("is_last"):
+            _finish_mxfp4_refit(model)
+            if hasattr(model, "post_load_weights"):
+                model.post_load_weights()
         return
 
     encoding = spec["encoding"]
@@ -263,8 +416,10 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
     # sglang's own update_weights_from_tensor path does not trigger this hook,
     # so the delta loader replicates the full-load semantics itself once per
     # sync (the engine marks the sync's final flush with ``is_last``).
-    if spec.get("is_last") and hasattr(model, "post_load_weights"):
-        model.post_load_weights()
+    if spec.get("is_last"):
+        _finish_mxfp4_refit(model)
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
 
 
 def _apply_dense(

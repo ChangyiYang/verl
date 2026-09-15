@@ -549,6 +549,8 @@ def quant_shard_stream(engine, quant_spec):
 
         ``{megatron_name}::c``  fp8 codes        (contributes: always)
         ``{megatron_name}::s``  fp32 scale cells (contributes: per-block owner)
+        ``{megatron_name}::p``  packed MXFP4 codes (whole-expert owner)
+        ``{megatron_name}::q``  MXFP4 E8M0 scales  (whole-expert owner)
         ``{megatron_name}::b``  bf16 passthrough (contributes: always)
         ``{megatron_name}::f``  fp32 passthrough (contributes: always)
 
@@ -564,6 +566,7 @@ def quant_shard_stream(engine, quant_spec):
         local_blockwise_absmax,
         quantize_shard_with_descale,
         sticky_ue8m0_descale,
+        quantize_mxfp4_e2m1,
     )
     from verl.utils.kernel.fp8_kernel import FP8_DTYPE, FP8_MAX, ceil_div
 
@@ -575,6 +578,7 @@ def quant_shard_stream(engine, quant_spec):
     scale_fmt = getattr(quant_spec, "scale_fmt", None)
     ckpt_scales = getattr(quant_spec, "ckpt_scales", None)
     fp32_pred = getattr(quant_spec, "fp32_predicate", None)
+    mxfp4_pred = getattr(quant_spec, "mxfp4_predicate", None)
     block = list(quant_spec.weight_block_size)
     bm, bn = int(block[0]), int(block[1])
     index = engine._mcore_export_index()
@@ -604,7 +608,13 @@ def quant_shard_stream(engine, quant_spec):
             slots = [(n, tuple(int(x) for x in t.shape)) for n, t in outs.items()]
             slot_cache[rec.megatron_name] = slots
 
-        quantizable = [(sname, sshape) for sname, sshape in slots if len(sshape) == 2 and helper_should_quantize(sname)]
+        quantizable = [
+            (sname, sshape)
+            for sname, sshape in slots
+            if len(sshape) == 2
+            and helper_should_quantize(sname)
+            and not (mxfp4_pred is not None and mxfp4_pred(sname))
+        ]
 
         # Deduplicate DP/CP replicas before both value and scale ownership are
         # planned.  Otherwise identical replicas would make every local block
@@ -667,13 +677,45 @@ def quant_shard_stream(engine, quant_spec):
         groups = {
             "c": {"slots": [], "pieces": [], "dtype": FP8_DTYPE, "contributes": owns_replica},
             "s": {"slots": [], "pieces": [], "positions": [], "dtype": torch.float32, "contributes": True},
+            "p": {"slots": [], "pieces": [], "dtype": torch.int8, "contributes": owns_replica},
+            "q": {
+                "slots": [],
+                "pieces": [],
+                # NCCL collectives operate on the scale's raw byte view; the
+                # slot metadata restores E8M0 at the values-only wire edge.
+                "dtype": torch.uint8,
+                "dtype_str": "float8_e8m0fnu",
+                "contributes": owns_replica,
+            },
             "b": {"slots": [], "pieces": [], "dtype": torch.bfloat16, "contributes": owns_replica},
             "f": {"slots": [], "pieces": [], "dtype": torch.float32, "contributes": owns_replica},
         }
         qi = 0
         for sname, sshape in slots:
             t = outs.get(sname)
-            if len(sshape) == 2 and helper_should_quantize(sname):
+            if len(sshape) == 2 and mxfp4_pred is not None and mxfp4_pred(sname):
+                # The target DSV4 topology uses TP=ETP=1: EP owns complete
+                # experts, so every K32 MXFP4 block is local and needs no
+                # distributed amax.  Refuse partial logical tensors rather
+                # than quantizing NaN probe placeholders into plausible bytes.
+                assert _tp_world == 1 and mpu.get_expert_tensor_parallel_world_size() == 1, (
+                    "MXFP4 delta export currently requires TP=ETP=1 so each routed expert is whole-owned"
+                )
+                if t is not None and owns_replica:
+                    assert tuple(t.shape) == tuple(sshape), (
+                        f"MXFP4 probe produced partial shape {tuple(t.shape)} for {sname}, expected {tuple(sshape)}"
+                    )
+                    packed, mxscale = quantize_mxfp4_e2m1(t.to(torch.bfloat16))
+                else:
+                    packed = torch.empty(0, dtype=torch.int8, device=dev)
+                    mxscale = torch.empty(0, dtype=torch.uint8, device=dev)
+                groups["p"]["slots"].append((sname, (int(sshape[0]), int(sshape[1]) // 2)))
+                groups["p"]["pieces"].append(packed.reshape(-1))
+                groups["q"]["slots"].append(
+                    (sname + "_scale_inv", (int(sshape[0]), int(sshape[1]) // 32))
+                )
+                groups["q"]["pieces"].append(mxscale.contiguous().view(torch.uint8).reshape(-1))
+            elif len(sshape) == 2 and helper_should_quantize(sname):
                 if scale_fmt == "ue8m0":
                     descale = sticky_ue8m0_descale(grids[qi], ckpt_scales.get(sname) if ckpt_scales else None)
                 else:
@@ -719,7 +761,8 @@ def quant_shard_stream(engine, quant_spec):
             name = f"{rec.megatron_name}::{kind}"
             sizes = [int(pc.numel()) for pc in g["pieces"]]
             positions = g.get("positions")
-            meta[name] = (g["slots"], sizes, str(g["dtype"]).replace("torch.", ""), positions)
+            dtype_str = g.get("dtype_str", str(g["dtype"]).replace("torch.", ""))
+            meta[name] = (g["slots"], sizes, dtype_str, positions)
             flat = torch.cat(g["pieces"]) if g["pieces"] else torch.empty(0, dtype=g["dtype"], device=dev)
             spec = ShardSpec(
                 full_shape=(int(flat.numel()),),

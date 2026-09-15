@@ -448,6 +448,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             "val_dtype": str(flush.values_gpu.dtype).replace("torch.", ""),
             "spec": {
                 "encoding": self.encoding,
+                "is_last": is_last,
                 "values_bytes": self.quantize_fp8,
                 # sparse flushes carry the quant config too: the receiver's
                 # handshake (incl. the seed-required sentinel guard) must be
@@ -622,16 +623,21 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
         h = self._fp8_helper(engine)
         scale_fmt = h.quant_config.get("scale_fmt")
+        model_config = getattr(engine, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        expert_dtype = str(getattr(hf_config, "expert_dtype", "")).lower()
+        use_mxfp4 = expert_dtype == "fp4"
+        fp8_predicate = self._quant_predicate(h, getattr(model_config, "local_path", None))
         # ue8m0 checkpoints carry per-block headroom that is unrecoverable from
         # the dequantized master; hand the quantizers the checkpoint's own
         # scales so unchanged blocks reproduce the checkpoint's bytes exactly.
         ckpt_scales = None
-        ckpt_path = getattr(getattr(engine, "model_config", None), "local_path", None)
+        ckpt_path = getattr(model_config, "local_path", None)
         if scale_fmt == "ue8m0":
             if ckpt_path:
                 from verl.utils.fp8_sharded import load_ckpt_scales
 
-                ckpt_scales = load_ckpt_scales(ckpt_path)
+                ckpt_scales = load_ckpt_scales(ckpt_path, skip_mxfp4_experts=use_mxfp4)
             else:
                 raise ValueError("ue8m0 delta sync requires model_config.local_path to read checkpoint scales")
         # fp32 wire fidelity for the checkpoint's non-quantized fp32 families
@@ -642,12 +648,21 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             from verl.utils.fp8_ckpt_dtypes import build_ckpt_fp32_predicate
 
             fp32_predicate = build_ckpt_fp32_predicate(ckpt_path)
+        if use_mxfp4:
+            # Surface the mixed codec in every wire handshake.  SGLang derives
+            # the same fact from the checkpoint header (`is_fp4_experts`).
+            self._fp8_quant_cfg["expert_dtype"] = "fp4"
+
+        def _mxfp4_weight(name: str) -> bool:
+            return use_mxfp4 and ".experts." in name and name.endswith(".weight")
+
         return QuantSpec(
             weight_block_size=tuple(h.quant_config.get("weight_block_size", [128, 128])),
-            should_quantize=self._quant_predicate(h, ckpt_path),
+            should_quantize=fp8_predicate,
             scale_fmt=scale_fmt,
             ckpt_scales=ckpt_scales,
             fp32_predicate=fp32_predicate,
+            mxfp4_predicate=_mxfp4_weight if use_mxfp4 else None,
         )
 
     def _quant_predicate(self, helper, checkpoint_path: str | None):
@@ -760,20 +775,29 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         full export assembles per tensor. Same producer as the steady path's
         sweep, so the two sweeps judge seed and steady on identical terms."""
         if spec is not None:
-            full, _ = engine.get_per_tensor_param(quant_spec=spec)
-            self._send_full_seed(
-                full,
+            self._send_full_seed_sharded(
+                engine,
+                spec,
                 global_steps,
+                prime_snapshots=False,
                 verify=True,
-                bytes_wire=True,
-                fp32_predicate=getattr(spec, "fp32_predicate", None),
+                phase="VERIFY",
             )
         else:
             full, _ = engine.get_per_tensor_param()
             self._send_full_seed(full, global_steps, verify=True)
 
     def _send_full_seed_sharded(
-        self, engine, spec, global_steps: int | None = None, hold_last: bool = False
+        self,
+        engine,
+        spec,
+        global_steps: int | None = None,
+        hold_last: bool = False,
+        *,
+        group_kinds: set[str] | None = None,
+        prime_snapshots: bool = True,
+        verify: bool = False,
+        phase: str = "SEED",
     ) -> dict[str, float] | None:
         """Seed from the STEADY shard stream over the values-only wire.
 
@@ -797,13 +821,17 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             meta = None
             for name, flat, sspec in gen:
                 flat = flat.detach().contiguous().view(-1)
+                kind = name.rsplit("::", 1)[-1] if "::" in name else ""
+                if group_kinds is not None and kind not in group_kinds:
+                    continue
                 # prime the steady diff base inline (same layout/pinning as
                 # prime_delta_snapshots)
-                snap = snaps.get(name)
-                if snap is None or snap.numel() != flat.numel():
-                    snap = torch.empty_like(flat, device="cpu", pin_memory=is_cuda_available)
-                    snaps[name] = snap
-                snap.copy_(flat, non_blocking=True)
+                if prime_snapshots and kind not in {"p", "q"}:
+                    snap = snaps.get(name)
+                    if snap is None or snap.numel() != flat.numel():
+                        snap = torch.empty_like(flat, device="cpu", pin_memory=is_cuda_available)
+                        snaps[name] = snap
+                    snap.copy_(flat, non_blocking=True)
                 if meta is None:
                     meta = engine._quant_group_meta
                 slots, sizes, dtype_str, positions = meta[name]
@@ -834,9 +862,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         return self._send_full_seed(
             pairs(),
             global_steps,
+            verify=verify,
             bytes_wire=True,
             fp32_predicate=getattr(spec, "fp32_predicate", None),
             hold_last=hold_last,
+            phase=phase,
         )
 
     def _send_full_seed(
@@ -847,6 +877,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         bytes_wire: bool = False,
         fp32_predicate=None,
         hold_last: bool = False,
+        phase: str | None = None,
     ) -> dict[str, float] | None:
         """First sync: stream the backend's FULL HF export over the values-only wire.
 
@@ -966,7 +997,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         self._release_staging_pool("seed")
         logger.warning(
             "delta-sharded FULL-%s v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
-            "VERIFY" if verify else "SEED",
+            phase or ("VERIFY" if verify else "SEED"),
             global_steps,
             time.time() - t0,
             n_flushes,
@@ -1031,6 +1062,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         # it yields quant-domain entries (codes + scale grids diffed against
         # engine-held snapshots), without one the bf16 shard deltas.
         _spec = self._fp8_spec(engine) if self.quantize_fp8 else None
+        has_mxfp4 = _spec is not None and getattr(_spec, "mxfp4_predicate", None) is not None
         weights, _ = engine.get_per_tensor_param_delta_shard(quant_spec=_spec)
         is_r0 = self.is_master
         n_flushes = 0
@@ -1116,20 +1148,48 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         if is_r0:
             bkt.seal()  # seal the final partial bucket into the pending flush
             if bkt.pending is not None:
-                bkt.emit(is_last=not verify)
-            elif not verify:
+                bkt.emit(is_last=not verify and not has_mxfp4)
+            elif not verify and not has_mxfp4:
                 self._publish_terminal(False)
+        if has_mxfp4:
+            # Packed int8 has no invalid byte value that can serve as a sparse
+            # sentinel.  Refit it values-only at full coverage, after the
+            # sparse FP8/BF16 stream, while the receiver keeps one checkpoint-
+            # layout staging set alive for the duration of this sync.
+            import dataclasses
+
+            fp4_only = dataclasses.replace(
+                _spec,
+                should_quantize=lambda _name: False,
+                ckpt_scales=None,
+                fp32_predicate=None,
+            )
+            fp4_metrics = self._send_full_seed_sharded(
+                engine,
+                fp4_only,
+                global_steps,
+                hold_last=verify,
+                group_kinds={"p", "q"},
+                prime_snapshots=False,
+                phase="MXFP4-REFRESH",
+            )
+            if is_r0 and fp4_metrics:
+                fp4_elems = int(fp4_metrics["checkpoint_engine/changed_elems"])
+                changed_elems += fp4_elems
+                total_elems += fp4_elems
+                wire_bytes += int(fp4_metrics["checkpoint_engine/payload_mbytes"] * (1 << 20))
+                n_flushes += int(fp4_metrics["checkpoint_engine/flushes"])
         if verify:
             # collective on every rank: the full export assembles per tensor.
             if self.quantize_fp8:
                 vspec = self._fp8_spec(engine)
-                full, _ = engine.get_per_tensor_param(quant_spec=vspec)
-                self._send_full_seed(
-                    full,
+                self._send_full_seed_sharded(
+                    engine,
+                    vspec,
                     global_steps,
+                    prime_snapshots=False,
                     verify=True,
-                    bytes_wire=True,
-                    fp32_predicate=getattr(vspec, "fp32_predicate", None),
+                    phase="VERIFY",
                 )
             else:
                 full, _ = engine.get_per_tensor_param()
